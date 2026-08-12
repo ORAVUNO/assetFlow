@@ -124,6 +124,27 @@ def test_connect_port_ignored_when_host_has_port(client, monkeypatch):
     assert captured["url"] == "https://es.example.com:9200"
 
 
+def test_connect_passes_timeout(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(client_mod, "build_client", lambda **kw: captured.update(kw) or object())
+    r = client.post(
+        "/api/connect",
+        json={"host": "h", "username": "u", "password": "p", "request_timeout": 180},
+    )
+    assert r.status_code == 200
+    assert captured["request_timeout"] == 180
+
+
+def test_run_timeout_hint(client, monkeypatch):
+    def boom(cl, q, limit=None):
+        raise Exception("Connection timeout caused by: ReadTimeoutError")
+
+    monkeypatch.setattr(runner_mod, "run_query", boom)
+    r = client.post("/api/run/AI001")
+    assert r.status_code == 502
+    assert "raise the Timeout" in r.json()["detail"]
+
+
 def test_connect_failure_reports_error(client, monkeypatch):
     def boom(cl):
         raise ValueError("auth failed")

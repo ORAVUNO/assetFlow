@@ -36,6 +36,7 @@ class ConnectRequest(BaseModel):
     password: str = ""
     api_key: str = ""
     verify_certs: bool = True
+    request_timeout: int = 60  # seconds; raise for heavy aggregations
 
 
 def _get_client():
@@ -123,6 +124,7 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
                 username=(req.username or None),
                 password=(req.password or None),
                 verify_certs=req.verify_certs,
+                request_timeout=max(1, int(req.request_timeout or 60)),
             )
             info = client_mod.ping(candidate)
         except client_mod.ConnectionConfigError as exc:
@@ -150,7 +152,13 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
         try:
             result = runner_mod.run_query(client, query, limit=limit)
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"query failed: {exc}")
+            detail = f"query failed: {exc}"
+            if "timeout" in str(exc).lower():
+                detail += (
+                    " — this query is heavy; raise the Timeout in the Connection "
+                    "panel (e.g. 180s) and reconnect, or narrow the data range."
+                )
+            raise HTTPException(status_code=502, detail=detail)
         record = cache.save_result(query, result, limit)
         return record
 
@@ -281,6 +289,9 @@ INDEX_HTML = r"""<!doctype html>
     <label>Password
       <input type="password" id="c_pass" autocomplete="off"/>
     </label>
+    <label>Timeout (s)
+      <input type="text" id="c_timeout" value="60" style="min-width:80px"/>
+    </label>
     <label class="chk"><input type="checkbox" id="c_verify" checked/> Verify TLS certificate</label>
     <button id="c_btn" onclick="connect()">Test &amp; connect</button>
   </div>
@@ -326,7 +337,8 @@ async function connect(){
   btn.disabled=true; const label=btn.textContent; btn.textContent='Connecting…'; st.textContent='';
   const body={host:val('c_host'),port:val('c_port'),username:val('c_user'),
               password:document.getElementById('c_pass').value||'',
-              verify_certs:document.getElementById('c_verify').checked};
+              verify_certs:document.getElementById('c_verify').checked,
+              request_timeout:parseInt(val('c_timeout'))||60};
   try{
     const d=await j('/api/connect',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
