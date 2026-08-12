@@ -101,6 +101,29 @@ def test_connect_success(client, monkeypatch):
     assert captured["verify_certs"] is False
 
 
+def test_connect_uses_separate_port_field(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(client_mod, "build_client", lambda **kw: captured.update(kw) or object())
+    r = client.post(
+        "/api/connect",
+        json={"host": "kibana.example.com", "port": "9243", "username": "u", "password": "p"},
+    )
+    assert r.status_code == 200
+    assert captured["url"] == "https://kibana.example.com:9243"
+
+
+def test_connect_port_ignored_when_host_has_port(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(client_mod, "build_client", lambda **kw: captured.update(kw) or object())
+    r = client.post(
+        "/api/connect",
+        json={"host": "es.example.com:9200", "port": "9243", "username": "u", "password": "p"},
+    )
+    assert r.status_code == 200
+    # host already carried a port, so the separate field is ignored
+    assert captured["url"] == "https://es.example.com:9200"
+
+
 def test_connect_failure_reports_error(client, monkeypatch):
     def boom(cl):
         raise ValueError("auth failed")

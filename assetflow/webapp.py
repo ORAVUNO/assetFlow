@@ -29,6 +29,7 @@ class ConnectRequest(BaseModel):
     """Credentials entered in the UI's connection form."""
 
     host: str = ""       # hostname / IP / host:port / full URL
+    port: str = ""       # optional; applied when host has no scheme/port
     url: str = ""        # explicit URL (takes precedence over host)
     cloud_id: str = ""
     username: str = ""
@@ -108,6 +109,11 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
         queries. Credentials are never written to disk.
         """
         target = (req.url or req.host or "").strip()
+        port = req.port.strip()
+        # Apply a separately-entered port only when the host has no scheme and
+        # no port of its own; an explicit URL or host:port always wins.
+        if target and port and "://" not in target and ":" not in target.split("/", 1)[0]:
+            target = f"{target}:{port}"
         url = client_mod.normalize_host(target) if target else None
         try:
             candidate = client_mod.build_client(
@@ -266,6 +272,9 @@ INDEX_HTML = r"""<!doctype html>
     <label>Hostname or IP / URL
       <input type="text" id="c_host" placeholder="10.0.0.5  ·  host:9200  ·  https://host:9200"/>
     </label>
+    <label>Port
+      <input type="text" id="c_port" placeholder="9200" style="min-width:90px"/>
+    </label>
     <label>Username
       <input type="text" id="c_user" autocomplete="off" placeholder="elastic"/>
     </label>
@@ -315,7 +324,7 @@ function val(id){return (document.getElementById(id).value||'').trim();}
 async function connect(){
   const btn=document.getElementById('c_btn'), st=document.getElementById('c_status');
   btn.disabled=true; const label=btn.textContent; btn.textContent='Connecting…'; st.textContent='';
-  const body={host:val('c_host'),username:val('c_user'),
+  const body={host:val('c_host'),port:val('c_port'),username:val('c_user'),
               password:document.getElementById('c_pass').value||'',
               verify_certs:document.getElementById('c_verify').checked};
   try{
