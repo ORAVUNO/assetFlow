@@ -16,7 +16,7 @@
 # =============================================================================
 
 metadata:
-  version: 1
+  version: 2
   description: Preloaded Elastic Asset Intelligence queries for assetFlow.
   query_language: ES|QL
   status_values:
@@ -26,9 +26,63 @@ metadata:
     - not_validated
   categories:
     - Identity Intelligence
-    - Service Changes
+    - User Management Changes
+    - Service Change Intelligence
     - Application Discovery
     - Database Discovery
+    - File Integrity Monitoring
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+# Category-level Asset Intelligence data feeds. Downstream consumers (e.g.
+# Oravuno) should subscribe to a feed rather than to individual query ids; the
+# feed groups related queries into one standardized, refreshable stream.
+# 'query_ids' lists the member queries defined under 'queries:' below.
+# =============================================================================
+
+feeds:
+  - id: FEED-IDENTITY
+    name: Identity Intelligence
+    category: Identity Intelligence
+    description: User-to-device ownership and identity mapping.
+    query_ids: [AI001]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-USER-MGMT
+    name: User Management Changes
+    category: User Management Changes
+    description: Account lifecycle (create/enable/disable/delete) and security group membership change events.
+    query_ids: [AI002, AI003, AI004, AI005, AI006]
+    recommended_refresh_frequency: Hourly
+
+  - id: FEED-SERVICE-CHANGE
+    name: Service Change Intelligence
+    category: Service Change Intelligence
+    description: Service installation, creation, and startup-type change events.
+    query_ids: [AI007, AI008, AI009]
+    recommended_refresh_frequency: Hourly
+
+  - id: FEED-APP-DISCOVERY
+    name: Application Discovery
+    category: Application Discovery
+    description: Application and service footprint across hosts, including software version discovery.
+    query_ids: [AI010, AI011, AI012, AI016]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-DB-DISCOVERY
+    name: Database Discovery
+    category: Database Discovery
+    description: Database engine discovery, host inventory, and version discovery.
+    query_ids: [AI013, AI014, AI015]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-FILE-INTEGRITY
+    name: File Integrity Monitoring
+    category: File Integrity Monitoring
+    description: File create/modify/delete change monitoring. Placeholder feed; query not yet defined.
+    query_ids: [AI017]
+    recommended_refresh_frequency: Hourly
 
 queries:
   # ===========================================================================
@@ -66,7 +120,7 @@ queries:
     recommended_refresh_frequency: Daily
 
   - id: AI002
-    category: Identity Intelligence
+    category: User Management Changes
     name: User Created
     status: validated
     validated: true
@@ -89,7 +143,7 @@ queries:
     recommended_refresh_frequency: Hourly
 
   - id: AI003
-    category: Identity Intelligence
+    category: User Management Changes
     name: User Enabled
     status: validated
     validated: true
@@ -112,7 +166,7 @@ queries:
     recommended_refresh_frequency: Hourly
 
   - id: AI004
-    category: Identity Intelligence
+    category: User Management Changes
     name: User Disabled
     status: validated
     validated: true
@@ -135,7 +189,7 @@ queries:
     recommended_refresh_frequency: Hourly
 
   - id: AI005
-    category: Identity Intelligence
+    category: User Management Changes
     name: User Deleted
     status: validated
     validated: true
@@ -158,7 +212,7 @@ queries:
     recommended_refresh_frequency: Hourly
 
   - id: AI006
-    category: Identity Intelligence
+    category: User Management Changes
     name: Group Membership Changes
     status: validated
     validated: true
@@ -193,7 +247,7 @@ queries:
   # ===========================================================================
 
   - id: AI007
-    category: Service Changes
+    category: Service Change Intelligence
     name: Service Installed
     status: validated
     validated: true
@@ -224,7 +278,7 @@ queries:
     recommended_refresh_frequency: Hourly
 
   - id: AI008
-    category: Service Changes
+    category: Service Change Intelligence
     name: Service Created
     status: validated
     validated: true
@@ -250,7 +304,7 @@ queries:
     recommended_refresh_frequency: Hourly
 
   - id: AI009
-    category: Service Changes
+    category: Service Change Intelligence
     name: Startup Type Changes
     status: partially_validated
     validated: false
@@ -412,3 +466,49 @@ queries:
       version fields are populated, so exact version detection requires further
       investigation before it can be relied upon.
     recommended_refresh_frequency: Daily
+
+  # ---------------------------------------------------------------------------
+  # PLACEHOLDERS (not yet written / not validated)
+  # ---------------------------------------------------------------------------
+
+  - id: AI016
+    category: Application Discovery
+    name: Software Version Discovery
+    status: not_validated
+    validated: false
+    purpose: Identify installed software and their versions across hosts.
+    esql_query: ""   # TODO: query not yet defined - see notes.
+    expected_output_fields:   # Proposed, pending field validation.
+      - host.name
+      - host.ip
+      - package.name
+      - package.version
+    notes: >-
+      Placeholder. No ES|QL defined yet and not validated against live data.
+      Intended to surface installed software versions (e.g. via package.* fields
+      or process.pe.* metadata); the source fields still need to be confirmed in
+      the target environment before a query can be written. expected_output_fields
+      above are proposed, not validated.
+    recommended_refresh_frequency: Daily
+
+  - id: AI017
+    category: File Integrity Monitoring
+    name: File Integrity Monitoring
+    status: not_validated
+    validated: false
+    purpose: Detect create/modify/delete changes to monitored files.
+    esql_query: ""   # TODO: query not yet defined - see notes.
+    expected_output_fields:   # Proposed, pending field validation.
+      - "@timestamp"
+      - host.name
+      - file.path
+      - event.action
+      - user.name
+    notes: >-
+      Placeholder. No ES|QL defined yet and not validated against live data.
+      Requires a file-integrity data source (e.g. Elastic FIM / auditd file
+      events) to be present before a query can be authored. Assigned its own feed
+      (FEED-FILE-INTEGRITY) because it does not belong to the identity, service,
+      application, or database feeds. expected_output_fields above are proposed,
+      not validated.
+    recommended_refresh_frequency: Hourly
