@@ -15,10 +15,12 @@ dependencies = [
     "python-dotenv>=1.0",
     "click>=8.1",
     "rich>=13.7",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "httpx>=0.27"]
 
 [project.scripts]
 assetflow = "assetflow.cli:main"

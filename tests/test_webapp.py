@@ -1,0 +1,81 @@
+"""Web API tests using FastAPI's TestClient with Elasticsearch mocked out."""
+
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from assetflow import client as client_mod
+from assetflow import runner as runner_mod
+from assetflow import webapp
+from assetflow.runner import QueryResult
+
+REGISTRY_PATH = Path(__file__).resolve().parent.parent / "config" / "asset_intelligence_registry.yaml"
+
+FAKE_RESULT = QueryResult(
+    columns=[{"name": "host.name", "type": "keyword"}, {"name": "LoginCount", "type": "long"}],
+    rows=[["host-a", 5], ["host-b", 2]],
+)
+
+
+@pytest.fixture
+def client(monkeypatch, tmp_path):
+    # Isolate the on-disk cache into a temp dir.
+    monkeypatch.chdir(tmp_path)
+    # Never build/contact a real Elasticsearch.
+    monkeypatch.setattr(client_mod, "build_client_from_env", lambda: object())
+    monkeypatch.setattr(
+        client_mod, "ping", lambda c: {"name": "n", "cluster_name": "test", "version": "8.13.0"}
+    )
+    monkeypatch.setattr(runner_mod, "run_query", lambda c, q, limit=None: FAKE_RESULT)
+    webapp._state.update({"client": None, "registry": None})
+    app = webapp.create_app(str(REGISTRY_PATH))
+    return TestClient(app)
+
+
+def test_index_served(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "assetFlow" in r.text
+
+
+def test_registry_endpoint(client):
+    r = client.get("/api/registry")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["queries"]) == 17
+    assert len(data["feeds"]) == 6
+
+
+def test_connection_endpoint(client):
+    r = client.get("/api/connection")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_run_then_cache_then_export(client):
+    run = client.post("/api/run/AI001?limit=10")
+    assert run.status_code == 200
+    assert run.json()["row_count"] == 2
+
+    cached = client.get("/api/cache/AI001")
+    assert cached.status_code == 200
+    assert cached.json()["query_id"] == "AI001"
+
+    csv = client.get("/api/export/AI001.csv")
+    assert csv.status_code == 200
+    assert "host.name" in csv.text
+
+    js = client.get("/api/export/AI001.json")
+    assert js.status_code == 200
+    assert js.json()[0]["host.name"] == "host-a"
+
+
+def test_run_placeholder_rejected(client):
+    r = client.post("/api/run/AI016")  # not_validated, empty ES|QL
+    assert r.status_code == 422
+
+
+def test_cache_missing_is_404(client):
+    r = client.get("/api/cache/AI012")
+    assert r.status_code == 404

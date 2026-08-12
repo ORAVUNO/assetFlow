@@ -64,6 +64,26 @@ assetflow test-connection
 assetflow run AI001 --limit 25
 ```
 
+## Web UI
+
+Prefer clicking to typing? Launch the local web app:
+
+```bash
+assetflow serve            # -> http://127.0.0.1:8000
+```
+
+Open the URL in your browser. You get a sidebar of feeds/queries with status
+badges, the ES|QL for each query, a **Run** button with a row-limit box, and
+results in a sortable, filterable table with **Download CSV/JSON**. Connection
+status (cluster + version) shows top-right.
+
+Queries run live against your Elasticsearch, and the latest result per query is
+cached under `.assetflow_cache/` (gitignored) so reopening the page shows your
+last fetch without re-querying. The server binds to `127.0.0.1` by default, so
+your credentials and data never leave your machine. Change the bind with
+`assetflow serve --host 0.0.0.0 --port 9000` if you need to (localhost is
+recommended).
+
 ## CLI reference
 
 | Command | What it does |

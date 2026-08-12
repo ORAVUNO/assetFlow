@@ -260,5 +260,29 @@ def run_feed(ctx: click.Context, feed_id: str, limit: Optional[int]) -> None:
     console.print(f"\n[dim]ran {ran} of {len(queries)} quer(y/ies) in {feed_id}[/dim]")
 
 
+@main.command()
+@click.option("--host", default="127.0.0.1", help="Interface to bind (default localhost).")
+@click.option("--port", default=8000, type=int, help="Port to listen on.")
+@click.pass_context
+def serve(ctx: click.Context, host: str, port: int) -> None:
+    """Launch the local web UI to browse and view results in the browser."""
+    load_dotenv()
+    try:
+        import uvicorn
+
+        from .webapp import create_app
+    except ImportError:
+        err_console.print(
+            "[red]Web dependencies missing.[/red] Install with: pip install -e ."
+        )
+        sys.exit(2)
+
+    # Validate the registry up front so failures are clear, not buried in logs.
+    _load(ctx.obj["registry_path"])
+    app = create_app(ctx.obj["registry_path"])
+    console.print(f"[green]assetFlow UI[/green] → http://{host}:{port}  (Ctrl+C to stop)")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
 if __name__ == "__main__":  # pragma: no cover
     main()
