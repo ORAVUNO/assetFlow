@@ -12,6 +12,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query as QueryParam
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel
 
 from . import cache
 from . import client as client_mod
@@ -22,6 +23,18 @@ from .runner import QueryResult
 
 # The client is built lazily on first use and reused across requests.
 _state: dict = {"client": None, "registry": None}
+
+
+class ConnectRequest(BaseModel):
+    """Credentials entered in the UI's connection form."""
+
+    host: str = ""       # hostname / IP / host:port / full URL
+    url: str = ""        # explicit URL (takes precedence over host)
+    cloud_id: str = ""
+    username: str = ""
+    password: str = ""
+    api_key: str = ""
+    verify_certs: bool = True
 
 
 def _get_client():
@@ -86,6 +99,32 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
         except Exception as exc:  # connection/auth failures
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
+
+    @app.post("/api/connect")
+    def api_connect(req: "ConnectRequest") -> JSONResponse:
+        """Build a client from credentials entered in the UI and test it.
+
+        On success the client is held in this server's memory for subsequent
+        queries. Credentials are never written to disk.
+        """
+        target = (req.url or req.host or "").strip()
+        url = client_mod.normalize_host(target) if target else None
+        try:
+            candidate = client_mod.build_client(
+                url=url,
+                cloud_id=(req.cloud_id or None),
+                api_key=(req.api_key or None),
+                username=(req.username or None),
+                password=(req.password or None),
+                verify_certs=req.verify_certs,
+            )
+            info = client_mod.ping(candidate)
+        except client_mod.ConnectionConfigError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
+        _state["client"] = candidate
+        return JSONResponse({"ok": True, "resolved_url": url, **info})
 
     @app.post("/api/run/{query_id}")
     def api_run(query_id: str, limit: Optional[int] = QueryParam(default=None, ge=1)) -> dict:
@@ -167,6 +206,16 @@ INDEX_HTML = r"""<!doctype html>
   #conn{margin-left:auto;font-size:12px;color:var(--muted)}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--muted)}
   .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
+  #conntoggle{background:transparent;color:var(--accent);border:1px solid var(--border);
+              padding:5px 12px;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer}
+  .connpanel{display:none;background:var(--panel);border-bottom:1px solid var(--border);padding:14px 18px}
+  .connpanel.open{display:block}
+  .connrow{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+  .connrow label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+  .connrow input[type=text],.connrow input[type=password]{min-width:220px}
+  .connrow .chk{flex-direction:row;align-items:center;gap:6px;color:var(--text)}
+  .cstat{margin-top:10px;font-size:12.5px;min-height:18px}
+  .chint{margin-top:6px;font-size:11.5px;color:var(--muted)}
   .wrap{display:flex;min-height:calc(100vh - 49px)}
   aside{width:300px;flex:none;border-right:1px solid var(--border);background:var(--panel);
         overflow:auto;max-height:calc(100vh - 49px);position:sticky;top:49px}
@@ -210,7 +259,26 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <h1>assetFlow</h1>
   <span id="conn"><span class="dot"></span>checking connection…</span>
+  <button id="conntoggle" onclick="togglePanel()">Connection</button>
 </header>
+<div id="connpanel" class="connpanel">
+  <div class="connrow">
+    <label>Hostname or IP / URL
+      <input type="text" id="c_host" placeholder="10.0.0.5  ·  host:9200  ·  https://host:9200"/>
+    </label>
+    <label>Username
+      <input type="text" id="c_user" autocomplete="off" placeholder="elastic"/>
+    </label>
+    <label>Password
+      <input type="password" id="c_pass" autocomplete="off"/>
+    </label>
+    <label class="chk"><input type="checkbox" id="c_verify" checked/> Verify TLS certificate</label>
+    <button id="c_btn" onclick="connect()">Test &amp; connect</button>
+  </div>
+  <div class="cstat" id="c_status"></div>
+  <div class="chint">Credentials are held in this local server's memory only — never written to disk.
+    You can also preset them in a <code>.env</code> file. Bare hostnames default to <code>https://host:9200</code>.</div>
+</div>
 <div class="wrap">
   <aside id="sidebar"></aside>
   <main id="main"><p class="hint">Select a query on the left.</p></main>
@@ -223,12 +291,44 @@ async function j(url,opts){const r=await fetch(url,opts);const d=await r.json().
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
-async function loadConn(){
+function setConn(ok,d){
   const el=document.getElementById('conn');
+  if(ok){el.innerHTML='<span class="dot ok"></span>connected · '+esc(d.cluster_name||'')+' · v'+esc(d.version||'');}
+  else{el.innerHTML='<span class="dot bad"></span>'+esc((d&&d.error)||'not connected');}
+}
+
+function togglePanel(force){
+  const p=document.getElementById('connpanel');
+  const open = (force===undefined) ? !p.classList.contains('open') : force;
+  p.classList.toggle('open',open);
+}
+
+async function loadConn(){
   try{const d=await j('/api/connection');
-    if(d.ok){el.innerHTML='<span class="dot ok"></span>connected · '+esc(d.cluster_name||'')+' · v'+esc(d.version||'');}
-    else{el.innerHTML='<span class="dot bad"></span>'+esc(d.error||'not connected');}
-  }catch(e){el.innerHTML='<span class="dot bad"></span>'+esc(e.message);}
+    setConn(d.ok,d);
+    if(!d.ok) togglePanel(true);   // auto-open the form when not connected
+  }catch(e){setConn(false,{error:e.message}); togglePanel(true);}
+}
+
+function val(id){return (document.getElementById(id).value||'').trim();}
+
+async function connect(){
+  const btn=document.getElementById('c_btn'), st=document.getElementById('c_status');
+  btn.disabled=true; const label=btn.textContent; btn.textContent='Connecting…'; st.textContent='';
+  const body={host:val('c_host'),username:val('c_user'),
+              password:document.getElementById('c_pass').value||'',
+              verify_certs:document.getElementById('c_verify').checked};
+  try{
+    const d=await j('/api/connect',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(d.ok){
+      st.innerHTML='<span style="color:var(--ok)">✓ Connected · '+esc(d.cluster_name)+' · v'+esc(d.version)+'</span>';
+      setConn(true,d); setTimeout(()=>togglePanel(false),900);
+    }else{
+      st.innerHTML='<span style="color:var(--bad)">✗ '+esc(d.error)+'</span>'; setConn(false,d);
+    }
+  }catch(e){st.innerHTML='<span style="color:var(--bad)">✗ '+esc(e.message)+'</span>';}
+  finally{btn.disabled=false; btn.textContent=label;}
 }
 
 async function loadReg(){

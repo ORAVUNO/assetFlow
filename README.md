@@ -77,6 +77,15 @@ badges, the ES|QL for each query, a **Run** button with a row-limit box, and
 results in a sortable, filterable table with **Download CSV/JSON**. Connection
 status (cluster + version) shows top-right.
 
+**Connecting from the browser:** click **Connection** in the header to open a
+form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;
+you can also paste a full URL), **username**, **password**, toggle **Verify TLS
+certificate**, and hit **Test & connect**. On success the header turns green
+with the cluster name and version. Credentials entered this way are held in the
+local server's memory only and are never written to disk. Setting them in
+`.env` still works and auto-connects on startup — the form is just an
+alternative so you don't have to edit files.
+
 Queries run live against your Elasticsearch, and the latest result per query is
 cached under `.assetflow_cache/` (gitignored) so reopening the page shows your
 last fetch without re-querying. The server binds to `127.0.0.1` by default, so

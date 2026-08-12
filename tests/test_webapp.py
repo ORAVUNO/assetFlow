@@ -79,3 +79,35 @@ def test_run_placeholder_rejected(client):
 def test_cache_missing_is_404(client):
     r = client.get("/api/cache/AI012")
     assert r.status_code == 404
+
+
+def test_connect_success(client, monkeypatch):
+    captured = {}
+
+    def fake_build_client(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(client_mod, "build_client", fake_build_client)
+    r = client.post(
+        "/api/connect",
+        json={"host": "10.0.0.5", "username": "elastic", "password": "pw", "verify_certs": False},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    # bare host was normalized to an https URL with the default port
+    assert captured["url"] == "https://10.0.0.5:9200"
+    assert captured["verify_certs"] is False
+
+
+def test_connect_failure_reports_error(client, monkeypatch):
+    def boom(cl):
+        raise ValueError("auth failed")
+
+    monkeypatch.setattr(client_mod, "build_client", lambda **kw: object())
+    monkeypatch.setattr(client_mod, "ping", boom)
+    r = client.post("/api/connect", json={"host": "h", "username": "u", "password": "p"})
+    assert r.status_code == 200
+    assert r.json()["ok"] is False
+    assert "auth failed" in r.json()["error"]

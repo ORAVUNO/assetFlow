@@ -44,21 +44,39 @@ def _as_bool(value: Optional[str], default: bool) -> bool:
     return value.strip().lower() not in ("false", "0", "no", "off")
 
 
-def build_client_from_env() -> Elasticsearch:
-    """Construct an Elasticsearch client from environment variables.
+def normalize_host(raw: str) -> str:
+    """Turn a hostname/IP (or host:port, or full URL) into a client URL.
 
-    Raises ConnectionConfigError with an actionable message if the required
-    connection target or credentials are absent.
+    A bare host gets ``https://`` and the default port 9200. A value that
+    already includes a scheme is returned unchanged.
     """
-    url = _first_env("ELASTICSEARCH_URL", "ES_URL")
-    cloud_id = _first_env("ELASTIC_CLOUD_ID", "ES_CLOUD_ID")
-    api_key = _first_env("ELASTIC_API_KEY", "ES_API_KEY")
-    username = _first_env("ELASTIC_USERNAME", "ES_USERNAME")
-    password = _first_env("ELASTIC_PASSWORD", "ES_PASSWORD")
-    ca_certs = _first_env("ELASTIC_CA_CERTS", "ES_CA_CERTS")
-    verify_certs = _as_bool(_first_env("ELASTIC_VERIFY_CERTS", "ES_VERIFY_CERTS"), True)
-    timeout = int(_first_env("ELASTIC_REQUEST_TIMEOUT", "ES_REQUEST_TIMEOUT") or "60")
+    raw = (raw or "").strip()
+    if not raw:
+        return raw
+    if "://" in raw:
+        return raw
+    hostpart = raw.split("/", 1)[0]
+    if ":" in hostpart:  # host:port already given
+        return f"https://{raw}"
+    return f"https://{raw}:9200"
 
+
+def build_client(
+    *,
+    url: Optional[str] = None,
+    cloud_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    ca_certs: Optional[str] = None,
+    verify_certs: bool = True,
+    request_timeout: int = 60,
+) -> Elasticsearch:
+    """Construct an Elasticsearch client from explicit settings.
+
+    Raises ConnectionConfigError if a connection target or credentials are
+    missing. This does not contact the cluster — call ``ping`` for that.
+    """
     kwargs: dict = {}
     if cloud_id:
         kwargs["cloud_id"] = cloud_id
@@ -66,8 +84,7 @@ def build_client_from_env() -> Elasticsearch:
         kwargs["hosts"] = [url]
     else:
         raise ConnectionConfigError(
-            "no connection target set — export ELASTICSEARCH_URL or "
-            "ELASTIC_CLOUD_ID (see .env.example)"
+            "no connection target — provide a hostname/IP/URL or a Cloud ID"
         )
 
     if api_key:
@@ -76,16 +93,41 @@ def build_client_from_env() -> Elasticsearch:
         kwargs["basic_auth"] = (username, password)
     else:
         raise ConnectionConfigError(
-            "no credentials set — export ELASTIC_API_KEY, or both "
-            "ELASTIC_USERNAME and ELASTIC_PASSWORD (see .env.example)"
+            "no credentials — provide an API key, or a username and password"
         )
 
     kwargs["verify_certs"] = verify_certs
     if ca_certs:
         kwargs["ca_certs"] = ca_certs
-    kwargs["request_timeout"] = timeout
+    kwargs["request_timeout"] = request_timeout
 
     return Elasticsearch(**kwargs)
+
+
+def build_client_from_env() -> Elasticsearch:
+    """Construct an Elasticsearch client from environment variables.
+
+    Raises ConnectionConfigError with an actionable message if the required
+    connection target or credentials are absent.
+    """
+    try:
+        return build_client(
+            url=_first_env("ELASTICSEARCH_URL", "ES_URL"),
+            cloud_id=_first_env("ELASTIC_CLOUD_ID", "ES_CLOUD_ID"),
+            api_key=_first_env("ELASTIC_API_KEY", "ES_API_KEY"),
+            username=_first_env("ELASTIC_USERNAME", "ES_USERNAME"),
+            password=_first_env("ELASTIC_PASSWORD", "ES_PASSWORD"),
+            ca_certs=_first_env("ELASTIC_CA_CERTS", "ES_CA_CERTS"),
+            verify_certs=_as_bool(_first_env("ELASTIC_VERIFY_CERTS", "ES_VERIFY_CERTS"), True),
+            request_timeout=int(_first_env("ELASTIC_REQUEST_TIMEOUT", "ES_REQUEST_TIMEOUT") or "60"),
+        )
+    except ConnectionConfigError:
+        # Re-raise with env-specific guidance.
+        raise ConnectionConfigError(
+            "no Elasticsearch credentials found — set them in the UI, or export "
+            "ELASTICSEARCH_URL/ELASTIC_CLOUD_ID plus ELASTIC_API_KEY (or "
+            "ELASTIC_USERNAME + ELASTIC_PASSWORD); see .env.example"
+        )
 
 
 def ping(client: Elasticsearch) -> dict:
