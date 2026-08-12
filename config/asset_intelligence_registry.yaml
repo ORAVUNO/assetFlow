@@ -1,0 +1,414 @@
+# =============================================================================
+# Asset Intelligence Query Registry
+# =============================================================================
+# Predefined Asset Intelligence ES|QL query registry for assetFlow.
+#
+# These queries have been validated (or partially validated) against a live
+# Elasticsearch environment. Each entry documents the query, its validation
+# status, the fields it is expected to return, and how often it should be run.
+#
+# Supported statuses:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Query runs, but some fields/behaviour need
+#                              further mapping validation.
+#   - investigation_required : Additional research needed before relying on it.
+#   - not_validated          : Not yet tested against live data.
+# =============================================================================
+
+metadata:
+  version: 1
+  description: Preloaded Elastic Asset Intelligence queries for assetFlow.
+  query_language: ES|QL
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Identity Intelligence
+    - Service Changes
+    - Application Discovery
+    - Database Discovery
+
+queries:
+  # ===========================================================================
+  # IDENTITY INTELLIGENCE
+  # ===========================================================================
+
+  - id: AI001
+    category: Identity Intelligence
+    name: User Device Mapping
+    status: validated
+    validated: true
+    purpose: Map users to devices and identify ownership patterns.
+    esql_query: |
+      FROM logs-*
+      | WHERE user.name IS NOT NULL
+      | WHERE user.name != "SYSTEM"
+      | STATS
+          LoginCount = COUNT(),
+          LastLogin = MAX(@timestamp),
+          SourceIPs = VALUES(source.ip),
+          SourcePorts = VALUES(source.port)
+      BY host.name, host.ip, user.name
+      | SORT host.name ASC, LastLogin DESC
+    expected_output_fields:
+      - host.name
+      - host.ip
+      - user.name
+      - LoginCount
+      - LastLogin
+      - SourceIPs
+      - SourcePorts
+    notes: >-
+      Validated successfully. Provides user ownership, login frequency,
+      source IP visibility, and source port visibility.
+    recommended_refresh_frequency: Daily
+
+  - id: AI002
+    category: Identity Intelligence
+    name: User Created
+    status: validated
+    validated: true
+    purpose: Detect creation of user accounts.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4720"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.TargetUserName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.TargetUserName
+    notes: Detects Windows event code 4720 (a user account was created).
+    recommended_refresh_frequency: Hourly
+
+  - id: AI003
+    category: Identity Intelligence
+    name: User Enabled
+    status: validated
+    validated: true
+    purpose: Detect enabling of user accounts.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4722"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.TargetUserName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.TargetUserName
+    notes: Detects Windows event code 4722 (a user account was enabled).
+    recommended_refresh_frequency: Hourly
+
+  - id: AI004
+    category: Identity Intelligence
+    name: User Disabled
+    status: validated
+    validated: true
+    purpose: Detect disabling of user accounts.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4725"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.TargetUserName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.TargetUserName
+    notes: Detects Windows event code 4725 (a user account was disabled).
+    recommended_refresh_frequency: Hourly
+
+  - id: AI005
+    category: Identity Intelligence
+    name: User Deleted
+    status: validated
+    validated: true
+    purpose: Detect deletion of user accounts.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4726"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.TargetUserName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.TargetUserName
+    notes: Detects Windows event code 4726 (a user account was deleted).
+    recommended_refresh_frequency: Hourly
+
+  - id: AI006
+    category: Identity Intelligence
+    name: Group Membership Changes
+    status: validated
+    validated: true
+    purpose: Detect users added to security groups.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code IN ("4728","4732","4756")
+      | KEEP
+          @timestamp,
+          host.name,
+          event.code,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.TargetUserName,
+          group.name,
+          group.id
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"          # Time
+      - host.name             # Host
+      - winlog.event_data.SubjectUserName  # Actor
+      - winlog.event_data.TargetUserName   # Target User
+      - group.name            # Group
+      - group.id              # Group SID
+      - event.code            # Change Type
+    notes: >-
+      Detects membership additions across global (4728), local (4732), and
+      universal (4756) security groups. event.code identifies the change type.
+    recommended_refresh_frequency: Hourly
+
+  # ===========================================================================
+  # SERVICE CHANGE INTELLIGENCE
+  # ===========================================================================
+
+  - id: AI007
+    category: Service Changes
+    name: Service Installed
+    status: validated
+    validated: true
+    purpose: Detect service installation events.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4697"
+      | KEEP
+          @timestamp,
+          host.name,
+          host.ip,
+          service.name,
+          winlog.event_data.ServiceName,
+          winlog.event_data.ServiceFileName,
+          user.name
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - host.ip
+      - service.name
+      - winlog.event_data.ServiceName
+      - winlog.event_data.ServiceFileName
+      - user.name
+    notes: >-
+      Field validation completed. Detects Windows event code 4697 (a service
+      was installed). ServiceName and ServiceFileName are available.
+    recommended_refresh_frequency: Hourly
+
+  - id: AI008
+    category: Service Changes
+    name: Service Created
+    status: validated
+    validated: true
+    purpose: Detect newly created services.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "7045"
+      | KEEP
+          @timestamp,
+          host.name,
+          host.ip,
+          winlog.event_data.ServiceName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - host.ip
+      - winlog.event_data.ServiceName
+    notes: >-
+      Detects Windows event code 7045 (a new service was installed).
+      Examples observed: WinDivert, BeyondTrust Remote Execution Service,
+      tenable_mw_scan.
+    recommended_refresh_frequency: Hourly
+
+  - id: AI009
+    category: Service Changes
+    name: Startup Type Changes
+    status: partially_validated
+    validated: false
+    purpose: Detect Windows service startup mode changes.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "7040"
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - service.name          # not reliably populated
+      - winlog.event_data.ServiceStartType  # not reliably populated
+    notes: >-
+      Event exists (Windows event code 7040, service start type changed).
+      Related fields require further mapping validation. Fields not reliably
+      populated: service.name, ServiceStartType.
+    recommended_refresh_frequency: Hourly
+
+  # ===========================================================================
+  # APPLICATION DISCOVERY
+  # ===========================================================================
+
+  - id: AI010
+    category: Application Discovery
+    name: Application Discovery By Service
+    status: validated
+    validated: true
+    purpose: Identify applications and services deployed across servers.
+    esql_query: |
+      FROM logs-*
+      | WHERE service.name IS NOT NULL
+      | STATS Hosts = COUNT_DISTINCT(host.name)
+      BY service.name
+      | SORT Hosts DESC
+    expected_output_fields:
+      - service.name          # Application
+      - Hosts                 # Host Count
+    notes: >-
+      Aggregates distinct host counts per service. Examples observed:
+      Elastic Agent, GoogleUpdaterService, Zabbix Agent 2.
+    recommended_refresh_frequency: Daily
+
+  - id: AI011
+    category: Application Discovery
+    name: Host Application Mapping
+    status: validated
+    validated: true
+    purpose: Identify applications running on each host.
+    esql_query: |
+      FROM logs-*
+      | WHERE service.name IS NOT NULL
+      | STATS
+          Applications = VALUES(service.name)
+      BY host.name
+      | SORT host.name ASC
+    expected_output_fields:
+      - host.name
+      - Applications
+    notes: Lists the set of services observed per host.
+    recommended_refresh_frequency: Daily
+
+  - id: AI012
+    category: Application Discovery
+    name: Application Footprint
+    status: validated
+    validated: true
+    purpose: Identify all servers running a given service.
+    esql_query: |
+      FROM logs-*
+      | WHERE service.name IS NOT NULL
+      | STATS
+          HostCount = COUNT_DISTINCT(host.name),
+          Hosts = VALUES(host.name)
+      BY service.name
+      | SORT HostCount DESC
+    expected_output_fields:
+      - service.name
+      - HostCount
+      - Hosts
+    notes: Inverse of host mapping; lists every host running each service.
+    recommended_refresh_frequency: Daily
+
+  # ===========================================================================
+  # DATABASE DISCOVERY
+  # ===========================================================================
+
+  - id: AI013
+    category: Database Discovery
+    name: Database Process Discovery
+    status: partially_validated
+    validated: false
+    purpose: Identify database technologies deployed on servers.
+    esql_query: |
+      FROM logs-*
+      | WHERE process.name RLIKE "(?i).*sqlservr.*|.*oracle.*"
+      | KEEP
+          host.name,
+          host.ip,
+          process.name,
+          process.executable
+      | SORT host.name ASC
+    expected_output_fields:
+      - host.name
+      - host.ip
+      - process.name
+      - process.executable
+    notes: >-
+      Validated findings: sqlservr.exe detected, oracle.exe detected.
+      Regex pattern matching may need broadening for additional DB engines.
+    recommended_refresh_frequency: Daily
+
+  - id: AI014
+    category: Database Discovery
+    name: Database Host Inventory
+    status: partially_validated
+    validated: false
+    purpose: Build inventory of database hosts.
+    esql_query: |
+      FROM logs-*
+      | WHERE process.name RLIKE "(?i).*sqlservr.*|.*oracle.*"
+      | STATS
+          DatabaseProcesses = VALUES(process.name)
+      BY host.name, host.ip
+      | SORT host.name ASC
+    expected_output_fields:
+      - host.name
+      - host.ip
+      - DatabaseProcesses
+    notes: >-
+      Aggregates discovered database processes per host. Depends on the same
+      process.name matching as AI013 and inherits its partial validation.
+    recommended_refresh_frequency: Daily
+
+  - id: AI015
+    category: Database Discovery
+    name: Database Version Discovery
+    status: investigation_required
+    validated: false
+    purpose: Identify exact DB versions.
+    esql_query: |
+      FROM logs-*
+      | WHERE process.name RLIKE "(?i).*sqlservr.*|.*oracle.*"
+      | KEEP
+          host.name,
+          host.ip,
+          process.name,
+          process.executable
+      | SORT host.name ASC
+    expected_output_fields:
+      - host.name
+      - host.ip
+      - process.name
+      - process.executable
+    notes: >-
+      Version cannot yet be read directly. SQL Server executable observed:
+      C:\Program Files\Microsoft SQL Server\MSSQL14.MSSQLSERVER\MSSQL\Binn\sqlservr.exe.
+      Possible version inference: MSSQL14 -> SQL Server 2017 (derived from the
+      executable path). However, no validated package.version or process.pe.*
+      version fields are populated, so exact version detection requires further
+      investigation before it can be relied upon.
+    recommended_refresh_frequency: Daily
