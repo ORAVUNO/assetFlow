@@ -200,13 +200,26 @@ def test_connection() -> None:
 @click.argument("query_id")
 @click.option("--limit", type=int, default=None, help="Cap the number of rows returned.")
 @click.option(
+    "--range",
+    "time_range",
+    type=click.Choice(["24h", "7d", "30d", "90d"]),
+    default=None,
+    help="Bound the query to recent data (adds a @timestamp filter).",
+)
+@click.option(
     "--output",
     type=click.Choice(["table", "json", "csv"]),
     default="table",
     help="Output format.",
 )
 @click.pass_context
-def run(ctx: click.Context, query_id: str, limit: Optional[int], output: str) -> None:
+def run(
+    ctx: click.Context,
+    query_id: str,
+    limit: Optional[int],
+    time_range: Optional[str],
+    output: str,
+) -> None:
     """Execute one query against Elasticsearch and print the results."""
     reg = _load(ctx.obj["registry_path"])
     try:
@@ -217,7 +230,7 @@ def run(ctx: click.Context, query_id: str, limit: Optional[int], output: str) ->
 
     client = _connect()
     try:
-        result = run_query(client, q, limit=limit)
+        result = run_query(client, q, limit=limit, time_range=time_range)
     except ValueError as exc:
         err_console.print(f"[yellow]{exc}[/yellow]")
         sys.exit(2)

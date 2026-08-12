@@ -135,7 +135,11 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
         return JSONResponse({"ok": True, "resolved_url": url, **info})
 
     @app.post("/api/run/{query_id}")
-    def api_run(query_id: str, limit: Optional[int] = QueryParam(default=None, ge=1)) -> dict:
+    def api_run(
+        query_id: str,
+        limit: Optional[int] = QueryParam(default=None, ge=1),
+        range: Optional[str] = QueryParam(default=None),
+    ) -> dict:
         try:
             query = reg.get_query(query_id)
         except KeyError:
@@ -150,7 +154,7 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
         except client_mod.ConnectionConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         try:
-            result = runner_mod.run_query(client, query, limit=limit)
+            result = runner_mod.run_query(client, query, limit=limit, time_range=range)
         except Exception as exc:
             detail = f"query failed: {exc}"
             if "timeout" in str(exc).lower():
@@ -159,7 +163,7 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
                     "panel (e.g. 180s) and reconnect, or narrow the data range."
                 )
             raise HTTPException(status_code=502, detail=detail)
-        record = cache.save_result(query, result, limit)
+        record = cache.save_result(query, result, limit, time_range=range)
         return record
 
     @app.get("/api/cache/{query_id}")
@@ -380,7 +384,15 @@ function select(id){
     '<pre>'+esc(q.esql_query.trim()||'(no ES|QL — placeholder)')+'</pre>'+
     '<div class="controls">'+
       (q.is_runnable
-        ? '<button id="runbtn">Run</button><label class="hint">limit <input type="number" id="limit" min="1" value="100"></label>'
+        ? '<button id="runbtn">Run</button>'+
+          '<label class="hint">limit <input type="number" id="limit" min="1" value="100"></label>'+
+          '<label class="hint">range <select id="range">'+
+            '<option value="all">All time</option>'+
+            '<option value="24h">Last 24h</option>'+
+            '<option value="7d">Last 7 days</option>'+
+            '<option value="30d">Last 30 days</option>'+
+            '<option value="90d">Last 90 days</option>'+
+          '</select></label>'
         : '<span class="hint">This query is a placeholder with no ES|QL and cannot be run.</span>')+
       '<span class="meta" id="runmeta">'+esc(cached)+'</span>'+
     '</div>'+
@@ -398,9 +410,14 @@ async function loadCache(id){
 async function run(){
   const btn=document.getElementById('runbtn'); const res=document.getElementById('results');
   const limit=document.getElementById('limit').value;
+  const range=document.getElementById('range').value;
+  const params=new URLSearchParams();
+  if(limit) params.set('limit',limit);
+  if(range && range!=='all') params.set('range',range);
+  const qs=params.toString();
   btn.disabled=true; btn.textContent='Running…'; res.innerHTML='';
   try{
-    const rec=await j('/api/run/'+CURRENT.id+(limit?('?limit='+encodeURIComponent(limit)):''),{method:'POST'});
+    const rec=await j('/api/run/'+CURRENT.id+(qs?('?'+qs):''),{method:'POST'});
     document.getElementById('runmeta').textContent='fetched '+new Date(rec.ran_at).toLocaleString();
     render(rec);
     const q=REG.queries.find(x=>x.id===CURRENT.id); if(q) q.cached_at=rec.ran_at;
@@ -413,6 +430,7 @@ function render(rec){
   const res=document.getElementById('results');
   res.innerHTML=
     '<div class="meta">'+rec.row_count+' row(s)'+(rec.limit?(' · limit '+rec.limit):'')+
+      (rec.time_range?(' · range '+esc(rec.time_range)):'')+
       ' · <a class="dl" href="/api/export/'+rec.query_id+'.csv">Download CSV</a>'+
       ' · <a class="dl" href="/api/export/'+rec.query_id+'.json">Download JSON</a></div>'+
     '<input type="text" id="filter" placeholder="filter rows…"/>'+

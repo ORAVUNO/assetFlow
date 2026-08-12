@@ -86,6 +86,12 @@ local server's memory only and are never written to disk. Setting them in
 `.env` still works and auto-connects on startup — the form is just an
 alternative so you don't have to edit files.
 
+Each query also has a **time-range** dropdown (All time / 24h / 7d / 30d / 90d)
+next to Run. Picking a range injects a `@timestamp` lower-bound filter right
+after `FROM` at run time — the query in the registry is unchanged. Use it to
+bound heavy all-index aggregations (e.g. AI001) so they finish quickly instead
+of timing out.
+
 Queries run live against your Elasticsearch, and the latest result per query is
 cached under `.assetflow_cache/` (gitignored) so reopening the page shows your
 last fetch without re-querying. The server binds to `127.0.0.1` by default, so
@@ -102,7 +108,7 @@ recommended).
 | `assetflow list [--status S] [--category C] [--feed F]` | List queries with optional filters. |
 | `assetflow show <ID>` | Show one query's full definition and ES|QL. |
 | `assetflow test-connection` | Verify Elasticsearch connectivity. |
-| `assetflow run <ID> [--limit N] [--output table\|json\|csv]` | Execute one query and print results. |
+| `assetflow run <ID> [--limit N] [--range 24h\|7d\|30d\|90d] [--output table\|json\|csv]` | Execute one query and print results. |
 | `assetflow run-feed <FEED_ID> [--limit N]` | Execute every runnable query in a feed. |
 
 Point at a registry elsewhere with the global `--registry` option, e.g.

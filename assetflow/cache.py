@@ -30,7 +30,12 @@ def _cache_path(query_id: str) -> Path:
     return cache_dir() / f"{safe}.json"
 
 
-def save_result(query: Query, result: QueryResult, limit: Optional[int]) -> dict:
+def save_result(
+    query: Query,
+    result: QueryResult,
+    limit: Optional[int],
+    time_range: Optional[str] = None,
+) -> dict:
     """Persist a query result and return the stored record."""
     record = {
         "query_id": query.id,
@@ -38,6 +43,7 @@ def save_result(query: Query, result: QueryResult, limit: Optional[int]) -> dict
         "status": query.status.value,
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "limit": limit,
+        "time_range": time_range,
         "row_count": result.row_count,
         "columns": result.columns,
         "rows": result.rows,

@@ -27,7 +27,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(
         client_mod, "ping", lambda c: {"name": "n", "cluster_name": "test", "version": "8.13.0"}
     )
-    monkeypatch.setattr(runner_mod, "run_query", lambda c, q, limit=None: FAKE_RESULT)
+    monkeypatch.setattr(runner_mod, "run_query", lambda c, q, limit=None, time_range=None: FAKE_RESULT)
     webapp._state.update({"client": None, "registry": None})
     app = webapp.create_app(str(REGISTRY_PATH))
     return TestClient(app)
@@ -136,7 +136,7 @@ def test_connect_passes_timeout(client, monkeypatch):
 
 
 def test_run_timeout_hint(client, monkeypatch):
-    def boom(cl, q, limit=None):
+    def boom(cl, q, limit=None, time_range=None):
         raise Exception("Connection timeout caused by: ReadTimeoutError")
 
     monkeypatch.setattr(runner_mod, "run_query", boom)

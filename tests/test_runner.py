@@ -3,7 +3,7 @@
 import pytest
 
 from assetflow.models import Query, Status
-from assetflow.runner import QueryResult, run_esql, run_query
+from assetflow.runner import QueryResult, apply_time_range, run_esql, run_query
 
 
 class FakeEsql:
@@ -61,6 +61,30 @@ def test_run_query_rejects_placeholder():
     )
     with pytest.raises(ValueError, match="no ES|QL"):
         run_query(client, placeholder)
+
+
+def test_apply_time_range_inserts_after_from():
+    esql = 'FROM logs-*\n| WHERE user.name IS NOT NULL\n| STATS c = COUNT() BY host.name'
+    out = apply_time_range(esql, "7d")
+    lines = out.splitlines()
+    assert lines[0].startswith("FROM")
+    assert lines[1] == "| WHERE @timestamp >= NOW() - 7 days"
+    assert "| WHERE user.name IS NOT NULL" in out
+
+
+def test_apply_time_range_noop_for_all():
+    esql = "FROM logs-*\n| STATS c = COUNT()"
+    assert apply_time_range(esql, "all") == esql
+    assert apply_time_range(esql, None) == esql
+    assert apply_time_range(esql, "") == esql
+
+
+def test_run_query_applies_range():
+    client = FakeClient(SAMPLE_BODY)
+    q = Query(id="AI001", category="Identity Intelligence", name="x", status=Status.validated,
+              purpose="x", esql_query="FROM logs-*\n| STATS c = COUNT()", validated=True)
+    run_query(client, q, time_range="24h")
+    assert "NOW() - 24 hours" in client.esql.last_query
 
 
 def test_run_query_runs_real_query():
