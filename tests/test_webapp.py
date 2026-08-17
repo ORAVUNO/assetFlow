@@ -103,6 +103,25 @@ def test_platform_and_adapter_export(client):
     assert client.get("/api/export-all.xml").status_code == 400
 
 
+def test_merged_view_and_export(client):
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")  # host-keyed (host.name column)
+    d = client.get(f"/api/adapters/{A}/merged").json()
+    assert "main" in d and "sheets" in d
+    assert "AI001" in d["main"]["contributing"]
+    assert d["main"]["host_count"] >= 1
+    # sheets group by feed and mark fetched vs not
+    ai001 = None
+    for sh in d["sheets"]:
+        for q in sh["queries"]:
+            if q["query_id"] == "AI001":
+                ai001 = q
+    assert ai001 is not None and ai001["has_data"] is True
+
+    csv = client.get(f"/api/adapters/{A}/merged.csv")
+    assert csv.status_code == 200 and "host.name" in csv.text
+    assert client.get(f"/api/adapters/{A}/merged.json").status_code == 200
+
+
 def test_run_placeholder_rejected(client):
     assert client.post(f"/api/adapters/{A}/run/AI016").status_code == 422
 

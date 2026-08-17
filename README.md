@@ -105,6 +105,25 @@ Adapter and platform exports come in two formats: **JSON** (one structured file
 Excel/Sheets). Exports read from the local database, so they reflect your most
 recent saved fetch of each query.
 
+## Unified view (asset correlation)
+
+Each adapter has an **All Fetched Results** entry (top of its sidebar) that
+builds a unified, host-keyed view from everything saved for that adapter:
+
+- **Main table (golden records)** — one row per host, correlated across every
+  saved query that carries a `host.name` column. Each cell summarizes what a
+  query captured for that host (e.g. its users, applications, services,
+  databases). Downloadable as CSV/JSON.
+- **Sheets (mini tables)** — the per-query saved results, grouped by feed
+  (Login Activity, Applications, Services, Databases, …). Queries not yet run
+  are shown as *not fetched*.
+
+Queries that aren't host-keyed (e.g. service-aggregated `AI010`/`AI012`) can't
+be a host row; they're listed as *not host-keyed* and appear only as sheets.
+This is the intra-adapter merge; cross-adapter reconciliation (merging the same
+host/asset seen by multiple adapters) builds on the same shape in a later
+round.
+
 **Connecting from the browser:** click **Connection** in the header to open a
 form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;
 you can also paste a full URL), **username**, **password**, toggle **Verify TLS

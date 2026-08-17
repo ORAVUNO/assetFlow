@@ -20,6 +20,7 @@ from . import adapters as adapters_mod
 from . import client as client_mod
 from . import db
 from . import export as export_mod
+from . import merge as merge_mod
 from .runner import QueryResult
 
 _state: dict = {"manager": None}
@@ -200,6 +201,53 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
         _get_adapter(adapter_id)
         return {"runs": db.history(adapter_id, query_id)}
 
+    @app.get("/api/adapters/{adapter_id}/merged")
+    def api_merged(adapter_id: str) -> dict:
+        a = _get_adapter(adapter_id)
+        recs = db.latest_all(adapter_id, include_data=True)
+        by_qid = {r["query_id"]: r for r in recs}
+        main = merge_mod.build_host_view(recs)
+        sheets = []
+        for feed in a.registry.feeds:
+            queries = []
+            for qid in feed.query_ids:
+                q = a.registry.get_query(qid)
+                rec = by_qid.get(qid)
+                queries.append(
+                    {
+                        "query_id": qid,
+                        "name": q.name,
+                        "status": q.status.value,
+                        "has_data": rec is not None,
+                        "row_count": rec["row_count"] if rec else 0,
+                        "ran_at": rec["ran_at"] if rec else None,
+                        "columns": rec["columns"] if rec else [],
+                        "rows": rec["rows"] if rec else [],
+                    }
+                )
+            sheets.append({"feed_id": feed.id, "feed_name": feed.name, "queries": queries})
+        return {"main": main, "sheets": sheets}
+
+    @app.get("/api/adapters/{adapter_id}/merged.{fmt}")
+    def api_merged_export(adapter_id: str, fmt: str) -> Response:
+        _get_adapter(adapter_id)
+        recs = db.latest_all(adapter_id, include_data=True)
+        main = merge_mod.build_host_view(recs)
+        result = QueryResult(columns=main["columns"], rows=main["rows"])
+        if fmt == "csv":
+            return Response(
+                content=result.to_csv(),
+                media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{adapter_id}-unified.csv"'},
+            )
+        if fmt == "json":
+            return Response(
+                content=result.to_json(),
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="{adapter_id}-unified.json"'},
+            )
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+
     def _blocks(adapter_id: Optional[str]) -> list:
         adapters = [_get_adapter(adapter_id)] if adapter_id else manager.list()
         blocks = []
@@ -349,6 +397,12 @@ INDEX_HTML = r"""<!doctype html>
        border:1px solid color-mix(in srgb,var(--bad) 30%,transparent);border-radius:8px;padding:10px 12px}
   .hint{color:var(--muted)} .fields{font-size:12px;color:var(--muted)}
   a.dl{font-size:12px} .savedtag{color:var(--ok);font-size:11px;margin-left:6px}
+  .ov .qid{color:var(--accent)}
+  .tfilter{margin:4px 0 6px;min-width:220px}
+  .minihdr{margin:14px 0 4px;font-size:13px;font-weight:600}
+  .minihdr.dim{color:var(--muted);font-weight:500}
+  .sheethdr{margin:18px 0 2px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  .mini table{font-size:12px}
 </style>
 </head>
 <body>
@@ -444,9 +498,75 @@ async function openAdapter(id){
   CURRENT=null;
 }
 
+/* generic sortable/filterable table mounted into any container */
+function mountTable(container, cols, rows, opts){
+  opts=opts||{}; let sort={col:null,dir:1};
+  container.innerHTML=(opts.filter===false?'':'<input type="text" class="tfilter" placeholder="filter…"/>')+
+    '<div class="tablewrap"></div>';
+  const tw=container.querySelector('.tablewrap'), fin=container.querySelector('.tfilter');
+  function draw(){
+    let rs=rows.slice();
+    const f=fin?fin.value.toLowerCase():'';
+    if(f) rs=rs.filter(r=>r.some(v=>String(v==null?'':v).toLowerCase().includes(f)));
+    if(sort.col!==null){const i=sort.col; rs.sort((a,b)=>{
+      const x=a[i],y=b[i]; if(x==null)return 1; if(y==null)return -1;
+      const nx=parseFloat(x),ny=parseFloat(y);
+      if(!isNaN(nx)&&!isNaN(ny))return (nx-ny)*sort.dir;
+      return String(x).localeCompare(String(y))*sort.dir;});}
+    tw.innerHTML='<table><thead><tr>'+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
+      (sort.col===i?(sort.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr></thead><tbody>'+
+      rs.map(r=>'<tr>'+r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+    tw.querySelectorAll('th').forEach(th=>th.onclick=()=>{
+      const i=+th.dataset.i; if(sort.col===i)sort.dir*=-1; else{sort.col=i;sort.dir=1;} draw();});
+  }
+  if(fin) fin.oninput=draw;
+  draw();
+}
+
+async function openMerged(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovAll'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Building unified view…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/merged'); }
+  catch(e){ m.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  const main=d.main;
+  let h='<h2>All Fetched Results — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Unified host view: one row per host, correlated across host-keyed queries. Detail sheets follow.</div>'+
+    '<div class="meta">'+main.host_count+' host(s) · contributing: '+esc(main.contributing.join(', ')||'none')+
+    (main.excluded.length?(' · not host-keyed (sheets only): '+esc(main.excluded.join(', '))):'')+
+    ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/merged.csv">Download CSV</a>'+
+    ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/merged.json">Download JSON</a></div>'+
+    '<div id="maintable"></div>'+
+    '<div class="sheethdr">Sheets (mini tables)</div>';
+  d.sheets.forEach(sh=>{
+    h+='<div class="minihdr" style="text-transform:uppercase;color:var(--muted);font-size:11px;margin-top:14px">'+esc(sh.feed_name)+'</div>';
+    sh.queries.forEach(q=>{
+      if(q.has_data){
+        h+='<div class="minihdr">'+esc(q.query_id)+' — '+esc(q.name)+' <span class="hint">('+q.row_count+' rows)</span></div>'+
+           '<div class="mini" data-q="'+q.query_id+'"></div>';
+      }else{
+        h+='<div class="minihdr dim">'+esc(q.query_id)+' — '+esc(q.name)+' <span class="hint">(not fetched)</span></div>';
+      }
+    });
+  });
+  m.innerHTML=h;
+  const mt=document.getElementById('maintable');
+  if(main.rows.length) mountTable(mt, main.columns.map(c=>c.name), main.rows, {});
+  else mt.innerHTML='<p class="hint">No host-keyed results saved yet. Run a host query (e.g. AI001) first.</p>';
+  d.sheets.forEach(sh=>sh.queries.forEach(q=>{ if(q.has_data){
+    const el=document.querySelector('.mini[data-q="'+q.query_id+'"]');
+    if(el) mountTable(el, q.columns.map(c=>c.name), q.rows, {filter:false});
+  }}));
+}
+
 function renderSidebar(){
   const qById={}; DETAIL.queries.forEach(q=>qById[q.id]=q);
   const side=document.getElementById('sidebar'); side.innerHTML='';
+  const ovh=document.createElement('div'); ovh.className='feed'; ovh.textContent='OVERVIEW'; side.appendChild(ovh);
+  const all=document.createElement('div'); all.className='q ov'; all.id='ovAll';
+  all.innerHTML='<span class="qid">★ All Fetched Results</span>';
+  all.onclick=openMerged; side.appendChild(all);
   DETAIL.feeds.forEach(f=>{
     const h=document.createElement('div'); h.className='feed'; h.textContent=f.name; side.appendChild(h);
     f.query_ids.forEach(qid=>{
