@@ -6,3 +6,4 @@ click>=8.1
 rich>=13.7
 fastapi>=0.110
 uvicorn>=0.27
+SQLAlchemy>=2.0

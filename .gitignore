@@ -14,7 +14,13 @@ dist/
 venv/
 env/
 
-# Cached query results
+# Local database (real fetched telemetry stays on the machine)
+*.db
+*.sqlite
+*.sqlite3
+assetflow.db
+
+# Legacy cached query results
 .assetflow_cache/
 
 # Test / tooling

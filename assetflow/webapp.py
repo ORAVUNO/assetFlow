@@ -1,9 +1,9 @@
-"""Local web UI for browsing feeds/queries and viewing fetched results.
+"""Local web UI: pick an adapter (grouped by category), open its panel, fetch.
 
 Run with ``assetflow serve``. Binds to 127.0.0.1 by default, so the app, your
-credentials, and your data stay on your machine. The page talks to a small
-JSON API defined here; queries run live against Elasticsearch and the latest
-result per query is cached to disk (see cache.py).
+credentials, and your data stay on your machine. Fetched results are persisted
+to a local SQLite database (see db.py); the newest run per (adapter, query) is
+the panel's cached view, older runs are history.
 """
 
 from __future__ import annotations
@@ -14,38 +14,39 @@ from fastapi import FastAPI, HTTPException, Query as QueryParam
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from . import cache
+from . import adapters as adapters_mod
 from . import client as client_mod
-from . import runner as runner_mod
-from .models import Registry
-from .registry import load_registry
+from . import db
 from .runner import QueryResult
 
-# The client is built lazily on first use and reused across requests.
-_state: dict = {"client": None, "registry": None}
+_state: dict = {"manager": None}
 
 
 class ConnectRequest(BaseModel):
-    """Credentials entered in the UI's connection form."""
-
-    host: str = ""       # hostname / IP / host:port / full URL
-    port: str = ""       # optional; applied when host has no scheme/port
-    url: str = ""        # explicit URL (takes precedence over host)
+    host: str = ""
+    port: str = ""
+    url: str = ""
     cloud_id: str = ""
     username: str = ""
     password: str = ""
     api_key: str = ""
     verify_certs: bool = True
-    request_timeout: int = 60  # seconds; raise for heavy aggregations
+    request_timeout: int = 60
 
 
-def _get_client():
-    if _state["client"] is None:
-        _state["client"] = client_mod.build_client_from_env()
-    return _state["client"]
+def _manager() -> adapters_mod.AdapterManager:
+    return _state["manager"]
 
 
-def _query_public(reg: Registry, query) -> dict:
+def _get_adapter(adapter_id: str) -> adapters_mod.Adapter:
+    try:
+        return _manager().get(adapter_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown adapter {adapter_id}")
+
+
+def _query_public(adapter: adapters_mod.Adapter, query) -> dict:
+    last = db.latest_fetch(adapter.info.id, query.id, include_data=False)
     return {
         "id": query.id,
         "name": query.name,
@@ -58,26 +59,62 @@ def _query_public(reg: Registry, query) -> dict:
         "expected_output_fields": query.expected_output_fields,
         "recommended_refresh_frequency": query.recommended_refresh_frequency,
         "is_runnable": query.is_runnable,
-        "cached_at": cache.cached_at(query.id),
+        "last_fetch": last,  # None or {ran_at, row_count, ...}
     }
 
 
-def create_app(registry_path: Optional[str] = None) -> FastAPI:
-    reg = load_registry(registry_path)
-    _state["registry"] = reg
+def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None) -> FastAPI:
+    db.init_engine(db_url)
+    manager = adapters_mod.default_manager(registry_path)
+    _state["manager"] = manager
+
+    # Best-effort auto-connect each adapter from environment variables.
+    for adapter in manager.list():
+        if isinstance(adapter, adapters_mod.ElasticsearchAdapter):
+            adapter.try_connect_from_env()
+
     app = FastAPI(title="assetFlow", docs_url=None, redoc_url=None)
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         return INDEX_HTML
 
-    @app.get("/api/registry")
-    def api_registry() -> dict:
+    @app.get("/api/adapters")
+    def api_adapters() -> dict:
+        cats = manager.by_category()
         return {
-            "metadata": {
-                "version": reg.metadata.version,
-                "description": reg.metadata.description,
-            },
+            "categories": [
+                {
+                    "name": cat,
+                    "adapters": [
+                        {
+                            "id": a.info.id,
+                            "name": a.info.name,
+                            "kind": a.info.kind,
+                            "description": a.info.description,
+                            "connected": a.connected,
+                            "query_count": len(a.registry.queries),
+                            "feed_count": len(a.registry.feeds),
+                        }
+                        for a in adapters
+                    ],
+                }
+                for cat, adapters in cats.items()
+            ]
+        }
+
+    @app.get("/api/adapters/{adapter_id}")
+    def api_adapter(adapter_id: str) -> dict:
+        a = _get_adapter(adapter_id)
+        reg = a.registry
+        return {
+            "id": a.info.id,
+            "name": a.info.name,
+            "category": a.info.category,
+            "description": a.info.description,
+            "kind": a.info.kind,
+            "connected": a.connected,
+            "conn_info": a.conn_info,
             "feeds": [
                 {
                     "id": f.id,
@@ -89,35 +126,19 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
                 }
                 for f in reg.feeds
             ],
-            "queries": [_query_public(reg, q) for q in reg.queries],
+            "queries": [_query_public(a, q) for q in reg.queries],
         }
 
-    @app.get("/api/connection")
-    def api_connection() -> JSONResponse:
-        try:
-            info = client_mod.ping(_get_client())
-            return JSONResponse({"ok": True, **info})
-        except client_mod.ConnectionConfigError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
-        except Exception as exc:  # connection/auth failures
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
-
-    @app.post("/api/connect")
-    def api_connect(req: "ConnectRequest") -> JSONResponse:
-        """Build a client from credentials entered in the UI and test it.
-
-        On success the client is held in this server's memory for subsequent
-        queries. Credentials are never written to disk.
-        """
+    @app.post("/api/adapters/{adapter_id}/connect")
+    def api_connect(adapter_id: str, req: ConnectRequest) -> JSONResponse:
+        a = _get_adapter(adapter_id)
         target = (req.url or req.host or "").strip()
         port = req.port.strip()
-        # Apply a separately-entered port only when the host has no scheme and
-        # no port of its own; an explicit URL or host:port always wins.
         if target and port and "://" not in target and ":" not in target.split("/", 1)[0]:
             target = f"{target}:{port}"
         url = client_mod.normalize_host(target) if target else None
         try:
-            candidate = client_mod.build_client(
+            info = a.connect(
                 url=url,
                 cloud_id=(req.cloud_id or None),
                 api_key=(req.api_key or None),
@@ -126,59 +147,63 @@ def create_app(registry_path: Optional[str] = None) -> FastAPI:
                 verify_certs=req.verify_certs,
                 request_timeout=max(1, int(req.request_timeout or 60)),
             )
-            info = client_mod.ping(candidate)
         except client_mod.ConnectionConfigError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
-        _state["client"] = candidate
         return JSONResponse({"ok": True, "resolved_url": url, **info})
 
-    @app.post("/api/run/{query_id}")
+    @app.post("/api/adapters/{adapter_id}/run/{query_id}")
     def api_run(
+        adapter_id: str,
         query_id: str,
         limit: Optional[int] = QueryParam(default=None, ge=1),
         range: Optional[str] = QueryParam(default=None),
     ) -> dict:
+        a = _get_adapter(adapter_id)
         try:
-            query = reg.get_query(query_id)
+            query = a.registry.get_query(query_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"unknown query {query_id}")
         if not query.is_runnable:
             raise HTTPException(
                 status_code=422,
-                detail=f"{query.id} has no ES|QL (status {query.status.value}); nothing to run",
+                detail=f"{query.id} has no query defined (status {query.status.value})",
             )
+        if not a.connected:
+            raise HTTPException(status_code=400, detail="adapter is not connected")
         try:
-            client = _get_client()
-        except client_mod.ConnectionConfigError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        try:
-            result = runner_mod.run_query(client, query, limit=limit, time_range=range)
+            result = a.run(query, limit=limit, time_range=range)
         except Exception as exc:
             detail = f"query failed: {exc}"
             if "timeout" in str(exc).lower():
                 detail += (
                     " — this query is heavy; raise the Timeout in the Connection "
-                    "panel (e.g. 180s) and reconnect, or narrow the data range."
+                    "panel (e.g. 180s) and reconnect, or pick a smaller time range."
                 )
             raise HTTPException(status_code=502, detail=detail)
-        record = cache.save_result(query, result, limit, time_range=range)
-        return record
+        return db.save_fetch(a.info.id, query, result, limit, range)
 
-    @app.get("/api/cache/{query_id}")
-    def api_cache(query_id: str) -> dict:
-        record = cache.load_result(query_id)
-        if record is None:
-            raise HTTPException(status_code=404, detail="no cached result; run the query first")
-        return record
+    @app.get("/api/adapters/{adapter_id}/latest/{query_id}")
+    def api_latest(adapter_id: str, query_id: str) -> dict:
+        _get_adapter(adapter_id)
+        rec = db.latest_fetch(adapter_id, query_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="no saved result; run the query first")
+        return rec
 
-    @app.get("/api/export/{query_id}.{fmt}")
-    def api_export(query_id: str, fmt: str) -> Response:
-        record = cache.load_result(query_id)
-        if record is None:
-            raise HTTPException(status_code=404, detail="no cached result; run the query first")
-        result = QueryResult(columns=record["columns"], rows=record["rows"])
+    @app.get("/api/adapters/{adapter_id}/history/{query_id}")
+    def api_history(adapter_id: str, query_id: str) -> dict:
+        _get_adapter(adapter_id)
+        return {"runs": db.history(adapter_id, query_id)}
+
+    @app.get("/api/adapters/{adapter_id}/export/{query_id}.{fmt}")
+    def api_export(adapter_id: str, query_id: str, fmt: str) -> Response:
+        _get_adapter(adapter_id)
+        rec = db.latest_fetch(adapter_id, query_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="no saved result; run the query first")
+        result = QueryResult(columns=rec["columns"], rows=rec["rows"])
         if fmt == "csv":
             return Response(
                 content=result.to_csv(),
@@ -218,22 +243,42 @@ INDEX_HTML = r"""<!doctype html>
   *{box-sizing:border-box}
   body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
        background:var(--bg);color:var(--text)}
-  header{display:flex;align-items:center;gap:12px;padding:12px 18px;background:var(--panel);
+  header{display:flex;align-items:center;gap:10px;padding:12px 18px;background:var(--panel);
          border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
-  header h1{font-size:16px;margin:0;font-weight:650}
+  header h1{font-size:16px;margin:0;font-weight:650;cursor:pointer}
+  #crumb{color:var(--muted);font-size:14px}
   #conn{margin-left:auto;font-size:12px;color:var(--muted)}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--muted)}
   .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
   #conntoggle{background:transparent;color:var(--accent);border:1px solid var(--border);
               padding:5px 12px;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer}
-  .connpanel{display:none;background:var(--panel);border-bottom:1px solid var(--border);padding:14px 18px}
-  .connpanel.open{display:block}
+  .hidden{display:none !important}
+  /* connection panel */
+  .connpanel{background:var(--panel);border-bottom:1px solid var(--border);padding:14px 18px}
   .connrow{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
   .connrow label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
-  .connrow input[type=text],.connrow input[type=password]{min-width:220px}
+  .connrow input[type=text],.connrow input[type=password]{min-width:200px}
   .connrow .chk{flex-direction:row;align-items:center;gap:6px;color:var(--text)}
   .cstat{margin-top:10px;font-size:12.5px;min-height:18px}
   .chint{margin-top:6px;font-size:11.5px;color:var(--muted)}
+  input,select{padding:7px 9px;border:1px solid var(--border);border-radius:7px;
+               background:var(--panel);color:var(--text)}
+  button{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
+         padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  /* gallery */
+  #gallery{padding:22px}
+  .gcat{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+        margin:18px 0 10px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:11px;padding:16px;
+        cursor:pointer;transition:border-color .12s,transform .12s}
+  .card:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .card p{margin:6px 0 12px;color:var(--muted);font-size:12.5px;min-height:34px}
+  .card .foot{display:flex;justify-content:space-between;align-items:center;font-size:11.5px;color:var(--muted)}
+  .kind{font-size:10px;padding:1px 7px;border-radius:20px;background:var(--code);color:var(--muted);font-weight:600}
+  /* workspace */
   .wrap{display:flex;min-height:calc(100vh - 49px)}
   aside{width:300px;flex:none;border-right:1px solid var(--border);background:var(--panel);
         overflow:auto;max-height:calc(100vh - 49px);position:sticky;top:49px}
@@ -253,14 +298,7 @@ INDEX_HTML = r"""<!doctype html>
   pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px;
       overflow:auto;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
   .controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0}
-  button{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
-         padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  button.ghost{background:transparent;color:var(--accent);border:1px solid var(--border)}
-  input[type=number]{width:90px;padding:7px;border:1px solid var(--border);border-radius:7px;
-                     background:var(--panel);color:var(--text)}
-  input[type=text]{padding:7px 10px;border:1px solid var(--border);border-radius:7px;
-                   background:var(--panel);color:var(--text);min-width:200px}
+  input[type=number]{width:90px}
   .meta{font-size:12px;color:var(--muted);margin:6px 0}
   .tablewrap{overflow:auto;border:1px solid var(--border);border-radius:8px;margin-top:10px}
   table{border-collapse:collapse;width:100%;font-size:12.5px}
@@ -270,157 +308,153 @@ INDEX_HTML = r"""<!doctype html>
   .err{color:var(--bad);background:color-mix(in srgb,var(--bad) 10%,transparent);
        border:1px solid color-mix(in srgb,var(--bad) 30%,transparent);border-radius:8px;padding:10px 12px}
   .hint{color:var(--muted)} .fields{font-size:12px;color:var(--muted)}
-  a.dl{font-size:12px}
+  a.dl{font-size:12px} .savedtag{color:var(--ok);font-size:11px;margin-left:6px}
 </style>
 </head>
 <body>
 <header>
-  <h1>assetFlow</h1>
-  <span id="conn"><span class="dot"></span>checking connection…</span>
-  <button id="conntoggle" onclick="togglePanel()">Connection</button>
+  <h1 onclick="showGallery()">assetFlow</h1>
+  <span id="crumb"></span>
+  <span id="conn" class="hidden"><span class="dot"></span></span>
+  <button id="conntoggle" class="hidden" onclick="togglePanel()">Connection</button>
 </header>
-<div id="connpanel" class="connpanel">
+
+<div id="connpanel" class="connpanel hidden">
   <div class="connrow">
     <label>Hostname or IP / URL
       <input type="text" id="c_host" placeholder="10.0.0.5  ·  host:9200  ·  https://host:9200"/>
     </label>
-    <label>Port
-      <input type="text" id="c_port" placeholder="9200" style="min-width:90px"/>
-    </label>
-    <label>Username
-      <input type="text" id="c_user" autocomplete="off" placeholder="elastic"/>
-    </label>
-    <label>Password
-      <input type="password" id="c_pass" autocomplete="off"/>
-    </label>
-    <label>Timeout (s)
-      <input type="text" id="c_timeout" value="60" style="min-width:80px"/>
-    </label>
+    <label>Port <input type="text" id="c_port" placeholder="9200" style="min-width:90px"/></label>
+    <label>Username <input type="text" id="c_user" autocomplete="off" placeholder="elastic"/></label>
+    <label>Password <input type="password" id="c_pass" autocomplete="off"/></label>
+    <label>Timeout (s) <input type="text" id="c_timeout" value="60" style="min-width:80px"/></label>
     <label class="chk"><input type="checkbox" id="c_verify" checked/> Verify TLS certificate</label>
     <button id="c_btn" onclick="connect()">Test &amp; connect</button>
   </div>
   <div class="cstat" id="c_status"></div>
   <div class="chint">Credentials are held in this local server's memory only — never written to disk.
-    You can also preset them in a <code>.env</code> file. Bare hostnames default to <code>https://host:9200</code>.</div>
+    Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.</div>
 </div>
-<div class="wrap">
+
+<section id="gallery"></section>
+
+<div id="workspace" class="wrap hidden">
   <aside id="sidebar"></aside>
-  <main id="main"><p class="hint">Select a query on the left.</p></main>
+  <main id="main"></main>
 </div>
+
 <script>
-let REG=null, CURRENT=null, LASTROWS=null, SORT={col:null,dir:1};
+let ADAPTER=null, DETAIL=null, CURRENT=null, LASTROWS=null, SORT={col:null,dir:1};
 
 async function j(url,opts){const r=await fetch(url,opts);const d=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(d.detail||('HTTP '+r.status)); return d;}
-
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-
-function setConn(ok,d){
-  const el=document.getElementById('conn');
-  if(ok){el.innerHTML='<span class="dot ok"></span>connected · '+esc(d.cluster_name||'')+' · v'+esc(d.version||'');}
-  else{el.innerHTML='<span class="dot bad"></span>'+esc((d&&d.error)||'not connected');}
-}
-
-function togglePanel(force){
-  const p=document.getElementById('connpanel');
-  const open = (force===undefined) ? !p.classList.contains('open') : force;
-  p.classList.toggle('open',open);
-}
-
-async function loadConn(){
-  try{const d=await j('/api/connection');
-    setConn(d.ok,d);
-    if(!d.ok) togglePanel(true);   // auto-open the form when not connected
-  }catch(e){setConn(false,{error:e.message}); togglePanel(true);}
-}
-
 function val(id){return (document.getElementById(id).value||'').trim();}
 
-async function connect(){
-  const btn=document.getElementById('c_btn'), st=document.getElementById('c_status');
-  btn.disabled=true; const label=btn.textContent; btn.textContent='Connecting…'; st.textContent='';
-  const body={host:val('c_host'),port:val('c_port'),username:val('c_user'),
-              password:document.getElementById('c_pass').value||'',
-              verify_certs:document.getElementById('c_verify').checked,
-              request_timeout:parseInt(val('c_timeout'))||60};
-  try{
-    const d=await j('/api/connect',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(d.ok){
-      st.innerHTML='<span style="color:var(--ok)">✓ Connected · '+esc(d.cluster_name)+' · v'+esc(d.version)+'</span>';
-      setConn(true,d); setTimeout(()=>togglePanel(false),900);
-    }else{
-      st.innerHTML='<span style="color:var(--bad)">✗ '+esc(d.error)+'</span>'; setConn(false,d);
-    }
-  }catch(e){st.innerHTML='<span style="color:var(--bad)">✗ '+esc(e.message)+'</span>';}
-  finally{btn.disabled=false; btn.textContent=label;}
+/* ---------- gallery ---------- */
+async function loadGallery(){
+  const g=document.getElementById('gallery'); g.innerHTML='<p class="hint">Loading adapters…</p>';
+  const d=await j('/api/adapters'); let h='';
+  d.categories.forEach(cat=>{
+    h+='<div class="gcat">'+esc(cat.name)+'</div><div class="cards">';
+    cat.adapters.forEach(a=>{
+      h+='<div class="card" onclick="openAdapter(\''+a.id+'\')">'+
+         '<h3>'+esc(a.name)+' <span class="kind">'+esc(a.kind)+'</span></h3>'+
+         '<p>'+esc(a.description)+'</p>'+
+         '<div class="foot"><span>'+a.query_count+' queries · '+a.feed_count+' feeds</span>'+
+         '<span>'+(a.connected?'<span class="dot ok"></span>connected':'<span class="dot"></span>not connected')+'</span></div>'+
+         '</div>';
+    });
+    h+='</div>';
+  });
+  g.innerHTML=h;
+}
+function showGallery(){
+  document.getElementById('workspace').classList.add('hidden');
+  document.getElementById('connpanel').classList.add('hidden');
+  document.getElementById('conn').classList.add('hidden');
+  document.getElementById('conntoggle').classList.add('hidden');
+  document.getElementById('crumb').textContent='';
+  document.getElementById('gallery').classList.remove('hidden');
+  ADAPTER=null; loadGallery();
 }
 
-async function loadReg(){
-  REG=await j('/api/registry');
-  const qById={}; REG.queries.forEach(q=>qById[q.id]=q);
+/* ---------- workspace ---------- */
+async function openAdapter(id){
+  ADAPTER=id;
+  DETAIL=await j('/api/adapters/'+id);
+  document.getElementById('gallery').classList.add('hidden');
+  document.getElementById('workspace').classList.remove('hidden');
+  document.getElementById('conn').classList.remove('hidden');
+  document.getElementById('conntoggle').classList.remove('hidden');
+  document.getElementById('crumb').textContent='› '+DETAIL.name;
+  setConn(DETAIL.connected, DETAIL.conn_info||{});
+  togglePanel(!DETAIL.connected);
+  renderSidebar();
+  document.getElementById('main').innerHTML='<p class="hint">Select a query on the left.</p>';
+  CURRENT=null;
+}
+
+function renderSidebar(){
+  const qById={}; DETAIL.queries.forEach(q=>qById[q.id]=q);
   const side=document.getElementById('sidebar'); side.innerHTML='';
-  REG.feeds.forEach(f=>{
+  DETAIL.feeds.forEach(f=>{
     const h=document.createElement('div'); h.className='feed'; h.textContent=f.name; side.appendChild(h);
     f.query_ids.forEach(qid=>{
       const q=qById[qid]; if(!q) return;
       const row=document.createElement('div'); row.className='q'; row.dataset.id=q.id;
       row.innerHTML='<span><span class="qid">'+esc(q.id)+'</span> <span class="qname">'+esc(q.name)+'</span></span>'+
-                    '<span class="badge b-'+q.status+'">'+q.status.replace(/_/g,' ')+'</span>';
+        '<span class="badge b-'+q.status+'">'+q.status.replace(/_/g,' ')+'</span>';
       row.onclick=()=>select(q.id); side.appendChild(row);
     });
   });
 }
 
 function select(id){
-  CURRENT=REG.queries.find(q=>q.id===id); LASTROWS=null; SORT={col:null,dir:1};
+  CURRENT=DETAIL.queries.find(q=>q.id===id); LASTROWS=null; SORT={col:null,dir:1};
   document.querySelectorAll('.q').forEach(e=>e.classList.toggle('active',e.dataset.id===id));
   const q=CURRENT, m=document.getElementById('main');
-  const cached=q.cached_at?('last fetched '+new Date(q.cached_at).toLocaleString()):'not fetched yet';
+  const last=q.last_fetch?('saved '+new Date(q.last_fetch.ran_at).toLocaleString()+' · '+q.last_fetch.row_count+' rows'):'not fetched yet';
   m.innerHTML=
     '<h2>'+esc(q.id)+' — '+esc(q.name)+' <span class="badge b-'+q.status+'">'+q.status.replace(/_/g,' ')+'</span></h2>'+
     '<div class="sub">'+esc(q.purpose)+'</div>'+
     (q.expected_output_fields.length?'<div class="fields">Fields: '+q.expected_output_fields.map(esc).join(', ')+'</div>':'')+
-    '<pre>'+esc(q.esql_query.trim()||'(no ES|QL — placeholder)')+'</pre>'+
+    '<pre>'+esc(q.esql_query.trim()||'(no query — placeholder)')+'</pre>'+
     '<div class="controls">'+
       (q.is_runnable
         ? '<button id="runbtn">Run</button>'+
           '<label class="hint">limit <input type="number" id="limit" min="1" value="100"></label>'+
           '<label class="hint">range <select id="range">'+
-            '<option value="all">All time</option>'+
-            '<option value="24h">Last 24h</option>'+
-            '<option value="7d">Last 7 days</option>'+
-            '<option value="30d">Last 30 days</option>'+
-            '<option value="90d">Last 90 days</option>'+
-          '</select></label>'
-        : '<span class="hint">This query is a placeholder with no ES|QL and cannot be run.</span>')+
-      '<span class="meta" id="runmeta">'+esc(cached)+'</span>'+
+            '<option value="all">All time</option><option value="24h">Last 24h</option>'+
+            '<option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>'+
+            '<option value="90d">Last 90 days</option></select></label>'
+        : '<span class="hint">Placeholder — no query defined yet.</span>')+
+      '<span class="meta" id="runmeta">'+esc(last)+'</span>'+
     '</div>'+
     '<div id="results"></div>';
   if(q.is_runnable){
     document.getElementById('runbtn').onclick=run;
-    if(q.cached_at) loadCache(q.id);
+    if(q.last_fetch) loadSaved(q.id);
   }
 }
 
-async function loadCache(id){
-  try{const rec=await j('/api/cache/'+id); render(rec);}catch(e){/* none */}
+async function loadSaved(id){
+  try{const rec=await j('/api/adapters/'+ADAPTER+'/latest/'+id); render(rec);}catch(e){}
 }
 
 async function run(){
-  const btn=document.getElementById('runbtn'); const res=document.getElementById('results');
-  const limit=document.getElementById('limit').value;
-  const range=document.getElementById('range').value;
+  const btn=document.getElementById('runbtn'), res=document.getElementById('results');
+  const limit=document.getElementById('limit').value, range=document.getElementById('range').value;
   const params=new URLSearchParams();
   if(limit) params.set('limit',limit);
   if(range && range!=='all') params.set('range',range);
   const qs=params.toString();
   btn.disabled=true; btn.textContent='Running…'; res.innerHTML='';
   try{
-    const rec=await j('/api/run/'+CURRENT.id+(qs?('?'+qs):''),{method:'POST'});
-    document.getElementById('runmeta').textContent='fetched '+new Date(rec.ran_at).toLocaleString();
+    const rec=await j('/api/adapters/'+ADAPTER+'/run/'+CURRENT.id+(qs?('?'+qs):''),{method:'POST'});
+    document.getElementById('runmeta').innerHTML='fetched '+new Date(rec.ran_at).toLocaleString()+
+      '<span class="savedtag">✓ saved to database</span>';
     render(rec);
-    const q=REG.queries.find(x=>x.id===CURRENT.id); if(q) q.cached_at=rec.ran_at;
   }catch(e){res.innerHTML='<div class="err">'+esc(e.message)+'</div>';}
   finally{btn.disabled=false; btn.textContent='Run';}
 }
@@ -431,8 +465,8 @@ function render(rec){
   res.innerHTML=
     '<div class="meta">'+rec.row_count+' row(s)'+(rec.limit?(' · limit '+rec.limit):'')+
       (rec.time_range?(' · range '+esc(rec.time_range)):'')+
-      ' · <a class="dl" href="/api/export/'+rec.query_id+'.csv">Download CSV</a>'+
-      ' · <a class="dl" href="/api/export/'+rec.query_id+'.json">Download JSON</a></div>'+
+      ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/export/'+rec.query_id+'.csv">Download CSV</a>'+
+      ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/export/'+rec.query_id+'.json">Download JSON</a></div>'+
     '<input type="text" id="filter" placeholder="filter rows…"/>'+
     '<div class="tablewrap" id="tw"></div>';
   document.getElementById('filter').oninput=drawTable;
@@ -456,7 +490,37 @@ function drawTable(){
     const i=+th.dataset.i; if(SORT.col===i)SORT.dir*=-1; else{SORT.col=i;SORT.dir=1;} drawTable();});
 }
 
-loadConn(); loadReg();
+/* ---------- connection ---------- */
+function setConn(ok,d){
+  const el=document.getElementById('conn');
+  if(ok){el.innerHTML='<span class="dot ok"></span>connected · '+esc((d&&d.cluster_name)||'')+' · v'+esc((d&&d.version)||'');}
+  else{el.innerHTML='<span class="dot bad"></span>'+esc((d&&d.error)||'not connected');}
+}
+function togglePanel(force){
+  const p=document.getElementById('connpanel');
+  const open=(force===undefined)?p.classList.contains('hidden'):force;
+  p.classList.toggle('hidden',!open);
+}
+async function connect(){
+  if(!ADAPTER) return;
+  const btn=document.getElementById('c_btn'), st=document.getElementById('c_status');
+  btn.disabled=true; const label=btn.textContent; btn.textContent='Connecting…'; st.textContent='';
+  const body={host:val('c_host'),port:val('c_port'),username:val('c_user'),
+              password:document.getElementById('c_pass').value||'',
+              verify_certs:document.getElementById('c_verify').checked,
+              request_timeout:parseInt(val('c_timeout'))||60};
+  try{
+    const d=await j('/api/adapters/'+ADAPTER+'/connect',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(d.ok){
+      st.innerHTML='<span style="color:var(--ok)">✓ Connected · '+esc(d.cluster_name)+' · v'+esc(d.version)+'</span>';
+      setConn(true,d); setTimeout(()=>togglePanel(false),900);
+    }else{ st.innerHTML='<span style="color:var(--bad)">✗ '+esc(d.error)+'</span>'; setConn(false,d);}
+  }catch(e){st.innerHTML='<span style="color:var(--bad)">✗ '+esc(e.message)+'</span>';}
+  finally{btn.disabled=false; btn.textContent=label;}
+}
+
+showGallery();
 </script>
 </body>
 </html>

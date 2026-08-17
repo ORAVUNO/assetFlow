@@ -1,13 +1,23 @@
 # assetFlow
 
-Preloaded **Elastic Asset Intelligence** ES|QL query registry, plus a small
-Python CLI to connect to your live Elasticsearch and fetch data.
+Asset-intelligence tool that fetches assets from pluggable **adapters** (data
+sources), shows them in a local web UI, and persists every fetch to a local
+database. Elasticsearch is the first adapter; more sources plug in beside it,
+grouped by category, so results from many sources can later be merged.
 
-- **Registry:** `config/asset_intelligence_registry.yaml` — 17 queries grouped
-  into 6 category-level data feeds (Identity, User Management, Service Change,
-  Application Discovery, Database Discovery, File Integrity).
-- **Runner:** the `assetflow` CLI validates the registry, connects to
-  Elasticsearch with your credentials, and executes the ES|QL queries.
+- **Adapters:** each adapter has its own metadata, query registry, and live
+  connection. The UI lists adapters by category; you open one adapter's panel
+  to connect and fetch. Today: **Elasticsearch** (category *SIEM / Log
+  Analytics*).
+- **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
+  adapter's 17 ES|QL queries grouped into 6 feeds (Identity, User Management,
+  Service Change, Application Discovery, Database Discovery, File Integrity).
+- **Database:** fetched results are saved to a local SQLite file
+  (`assetflow.db`, gitignored). The newest run per query is the panel's saved
+  view; older runs form the history. Real telemetry never leaves your machine.
+  Point `DATABASE_URL` at Postgres to scale later — no code changes.
+- **CLI:** `assetflow` validates the registry, connects, runs queries, and
+  serves the web UI.
 
 ## Requirements
 
@@ -72,10 +82,14 @@ Prefer clicking to typing? Launch the local web app:
 assetflow serve            # -> http://127.0.0.1:8000
 ```
 
-Open the URL in your browser. You get a sidebar of feeds/queries with status
-badges, the ES|QL for each query, a **Run** button with a row-limit box, and
-results in a sortable, filterable table with **Download CSV/JSON**. Connection
-status (cluster + version) shows top-right.
+Open the URL in your browser. You land on the **adapter gallery** — adapters
+grouped by category, each showing its connection status. Click one to open its
+**workspace**: a sidebar of feeds/queries with status badges, the query text,
+a **Run** button with row-limit and time-range controls, and results in a
+sortable, filterable table with **Download CSV/JSON**. The breadcrumb
+(`assetFlow › Elasticsearch`) shows which adapter you're in; click **assetFlow**
+to return to the gallery. Every run is **saved to the database** automatically
+and reloaded when you reopen that query.
 
 **Connecting from the browser:** click **Connection** in the header to open a
 form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;

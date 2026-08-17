@@ -290,10 +290,16 @@ def serve(ctx: click.Context, host: str, port: int) -> None:
         )
         sys.exit(2)
 
+    import os
+
+    from . import db as db_mod
+
     # Validate the registry up front so failures are clear, not buried in logs.
     _load(ctx.obj["registry_path"])
     app = create_app(ctx.obj["registry_path"])
+    db_url = os.getenv("DATABASE_URL") or db_mod.DEFAULT_DB_URL
     console.print(f"[green]assetFlow UI[/green] → http://{host}:{port}  (Ctrl+C to stop)")
+    console.print(f"[dim]results saved to {db_url}[/dim]")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
