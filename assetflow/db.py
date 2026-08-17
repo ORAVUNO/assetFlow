@@ -16,7 +16,7 @@ import os
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import DateTime, Integer, String, Text, create_engine, desc, select
+from sqlalchemy import DateTime, Integer, String, Text, create_engine, desc, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .models import Query
@@ -121,6 +121,33 @@ def latest_fetch(adapter: str, query_id: str, include_data: bool = True) -> Opti
         )
         run = s.scalars(stmt).first()
         return run.to_record(include_data) if run else None
+
+
+def latest_all(adapter: Optional[str] = None, include_data: bool = True) -> List[dict]:
+    """Latest fetch for every (adapter, query) — optionally scoped to one adapter.
+
+    Used to build adapter-wide and platform-wide exports.
+    """
+    with _session() as s:
+        grouped = select(
+            FetchRun.adapter.label("a"),
+            FetchRun.query_id.label("q"),
+            func.max(FetchRun.ran_at).label("m"),
+        )
+        if adapter:
+            grouped = grouped.where(FetchRun.adapter == adapter)
+        grouped = grouped.group_by(FetchRun.adapter, FetchRun.query_id).subquery()
+        stmt = (
+            select(FetchRun)
+            .join(
+                grouped,
+                (FetchRun.adapter == grouped.c.a)
+                & (FetchRun.query_id == grouped.c.q)
+                & (FetchRun.ran_at == grouped.c.m),
+            )
+            .order_by(FetchRun.adapter, FetchRun.query_id)
+        )
+        return [r.to_record(include_data) for r in s.scalars(stmt).all()]
 
 
 def history(adapter: str, query_id: str, limit: int = 25) -> List[dict]:

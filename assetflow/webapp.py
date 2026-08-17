@@ -14,9 +14,12 @@ from fastapi import FastAPI, HTTPException, Query as QueryParam
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
+from datetime import datetime, timezone
+
 from . import adapters as adapters_mod
 from . import client as client_mod
 from . import db
+from . import export as export_mod
 from .runner import QueryResult
 
 _state: dict = {"manager": None}
@@ -197,6 +200,39 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
         _get_adapter(adapter_id)
         return {"runs": db.history(adapter_id, query_id)}
 
+    def _blocks(adapter_id: Optional[str]) -> list:
+        adapters = [_get_adapter(adapter_id)] if adapter_id else manager.list()
+        blocks = []
+        for a in adapters:
+            info = {"id": a.info.id, "name": a.info.name, "category": a.info.category}
+            blocks.append((info, db.latest_all(a.info.id, include_data=True)))
+        return blocks
+
+    def _bundle_response(scope: str, blocks: list, fmt: str, stem: str) -> Response:
+        date = datetime.now(timezone.utc).strftime("%Y%m%d")
+        if fmt == "json":
+            return Response(
+                content=export_mod.build_json(scope, blocks),
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="{stem}-{date}.json"'},
+            )
+        if fmt == "zip":
+            return Response(
+                content=export_mod.build_zip(scope, blocks),
+                media_type="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="{stem}-{date}.zip"'},
+            )
+        raise HTTPException(status_code=400, detail="format must be json or zip")
+
+    @app.get("/api/export-all.{fmt}")
+    def api_export_platform(fmt: str) -> Response:
+        return _bundle_response("platform", _blocks(None), fmt, "assetflow-export")
+
+    @app.get("/api/adapters/{adapter_id}/export-all.{fmt}")
+    def api_export_adapter(adapter_id: str, fmt: str) -> Response:
+        _get_adapter(adapter_id)
+        return _bundle_response(f"adapter:{adapter_id}", _blocks(adapter_id), fmt, f"{adapter_id}-export")
+
     @app.get("/api/adapters/{adapter_id}/export/{query_id}.{fmt}")
     def api_export(adapter_id: str, query_id: str, fmt: str) -> Response:
         _get_adapter(adapter_id)
@@ -266,6 +302,10 @@ INDEX_HTML = r"""<!doctype html>
   button{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
          padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
   button:disabled{opacity:.5;cursor:not-allowed}
+  /* export links */
+  .exp{font-size:12px;color:var(--muted)} .exp a{color:var(--accent);font-weight:600;text-decoration:none}
+  .exp a:hover{text-decoration:underline}
+  .gbar{display:flex;align-items:center;gap:8px;padding:2px 2px 6px;font-size:13px;color:var(--muted)}
   /* gallery */
   #gallery{padding:22px}
   .gcat{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
@@ -315,6 +355,7 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <h1 onclick="showGallery()">assetFlow</h1>
   <span id="crumb"></span>
+  <span id="adapterexport" class="exp hidden"></span>
   <span id="conn" class="hidden"><span class="dot"></span></span>
   <button id="conntoggle" class="hidden" onclick="togglePanel()">Connection</button>
 </header>
@@ -354,7 +395,10 @@ function val(id){return (document.getElementById(id).value||'').trim();}
 /* ---------- gallery ---------- */
 async function loadGallery(){
   const g=document.getElementById('gallery'); g.innerHTML='<p class="hint">Loading adapters…</p>';
-  const d=await j('/api/adapters'); let h='';
+  const d=await j('/api/adapters');
+  let h='<div class="gbar">Export all saved data (every adapter): '+
+        '<span class="exp"><a href="/api/export-all.json">JSON</a> · '+
+        '<a href="/api/export-all.zip">ZIP</a></span></div>';
   d.categories.forEach(cat=>{
     h+='<div class="gcat">'+esc(cat.name)+'</div><div class="cards">';
     cat.adapters.forEach(a=>{
@@ -374,6 +418,7 @@ function showGallery(){
   document.getElementById('connpanel').classList.add('hidden');
   document.getElementById('conn').classList.add('hidden');
   document.getElementById('conntoggle').classList.add('hidden');
+  document.getElementById('adapterexport').classList.add('hidden');
   document.getElementById('crumb').textContent='';
   document.getElementById('gallery').classList.remove('hidden');
   ADAPTER=null; loadGallery();
@@ -387,6 +432,10 @@ async function openAdapter(id){
   document.getElementById('workspace').classList.remove('hidden');
   document.getElementById('conn').classList.remove('hidden');
   document.getElementById('conntoggle').classList.remove('hidden');
+  const ax=document.getElementById('adapterexport');
+  ax.innerHTML='export this adapter: <a href="/api/adapters/'+id+'/export-all.json">JSON</a> · '+
+               '<a href="/api/adapters/'+id+'/export-all.zip">ZIP</a>';
+  ax.classList.remove('hidden');
   document.getElementById('crumb').textContent='› '+DETAIL.name;
   setConn(DETAIL.connected, DETAIL.conn_info||{});
   togglePanel(!DETAIL.connected);

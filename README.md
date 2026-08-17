@@ -91,6 +91,20 @@ sortable, filterable table with **Download CSV/JSON**. The breadcrumb
 to return to the gallery. Every run is **saved to the database** automatically
 and reloaded when you reopen that query.
 
+**Exporting saved data** happens at three levels:
+
+- **Per query** — the Download CSV / JSON links under a query's results.
+- **Per adapter** — the *export this adapter* links in the workspace header
+  bundle every saved query for that adapter.
+- **Whole platform** — the *Export all saved data* links on the gallery bundle
+  every saved query across every adapter.
+
+Adapter and platform exports come in two formats: **JSON** (one structured file
+— scope, timestamp, and each query's columns + rows) and **ZIP** (a
+`manifest.json` plus one `<adapter>/<query>.csv` per saved query, for
+Excel/Sheets). Exports read from the local database, so they reflect your most
+recent saved fetch of each query.
+
 **Connecting from the browser:** click **Connection** in the header to open a
 form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;
 you can also paste a full URL), **username**, **password**, toggle **Verify TLS

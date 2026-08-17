@@ -75,6 +75,34 @@ def test_run_saves_and_exports(client):
     assert client.get(f"/api/adapters/{A}/export/AI001.json").json()[0]["host.name"] == "host-a"
 
 
+def test_platform_and_adapter_export(client):
+    import io
+    import json
+    import zipfile
+
+    # populate a couple of saved results
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")
+    client.post(f"/api/adapters/{A}/run/AI002?limit=5")
+
+    # platform JSON
+    pj = client.get("/api/export-all.json")
+    assert pj.status_code == 200
+    body = pj.json()
+    assert body["scope"] == "platform"
+    qids = {q["query_id"] for a in body["adapters"] for q in a["queries"]}
+    assert {"AI001", "AI002"} <= qids
+
+    # adapter ZIP
+    az = client.get(f"/api/adapters/{A}/export-all.zip")
+    assert az.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(az.content))
+    assert "manifest.json" in zf.namelist()
+    assert f"{A}/AI001.csv" in zf.namelist()
+
+    # bad format
+    assert client.get("/api/export-all.xml").status_code == 400
+
+
 def test_run_placeholder_rejected(client):
     assert client.post(f"/api/adapters/{A}/run/AI016").status_code == 422
 
