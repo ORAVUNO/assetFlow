@@ -123,7 +123,15 @@ def test_merged_view_and_export(client):
 
 
 def test_run_placeholder_rejected(client):
-    assert client.post(f"/api/adapters/{A}/run/AI016").status_code == 422
+    # All shipped queries are now runnable, so force one non-runnable to exercise
+    # the 422 "no query defined" branch.
+    q = webapp._manager().get(A).registry.get_query("AI016")
+    original = q.esql_query
+    q.esql_query = ""
+    try:
+        assert client.post(f"/api/adapters/{A}/run/AI016").status_code == 422
+    finally:
+        q.esql_query = original
 
 
 def test_latest_missing_is_404(client):

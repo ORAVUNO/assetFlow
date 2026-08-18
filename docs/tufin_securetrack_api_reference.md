@@ -15,8 +15,8 @@ Tufin adapter's endpoint paths and field mappings (`config/tufin_registry.yaml`,
 | TUF003 | `GET /devices/{id}/rules` | also `GET /revisions/{id}/rules` for a specific revision |
 | TUF004 | `GET /devices/{id}/network_objects` | also `GET /revisions/{id}/network_objects`, `GET /network_objects/search` |
 | TUF005 | `GET /devices/{id}/services` | `min`/`max` port range, numeric `protocol` |
-| TUF006 | `GET /zones` | also `GET /devices/{id}/zones`, `GET /revisions/{id}/zones` |
-| TUF007 | `GET /devices/{device_id}/cleanups` | also `GET /devices/{device_id}/shadowing_rules` |
+| TUF006 | `GET /devices/{id}/zones` | R25-2 has no global `/zones`; device zones are used (host-keyed) |
+| TUF007 | `GET /devices/{device_id}/cleanups?code=C01` | requires the category code; C01 = fully shadowed rules (nested under `shadowed_rule`) |
 | TUF008 | `GET /devices/{id}/revisions` + `GET /revisions/{id}/rules` + `GET /change_authorization` | change detail: diff consecutive revisions, attach authorization verdict |
 
 ## Key DTO fields (R25-2)

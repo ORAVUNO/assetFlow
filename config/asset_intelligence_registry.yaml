@@ -490,43 +490,49 @@ queries:
   - id: AI016
     category: Application Discovery
     name: Software Version Discovery
-    status: not_validated
+    status: partially_validated
     validated: false
     purpose: Identify installed software and their versions across hosts.
-    esql_query: ""   # TODO: query not yet defined - see notes.
-    expected_output_fields:   # Proposed, pending field validation.
+    esql_query: |
+      FROM logs-*
+      | WHERE package.name IS NOT NULL
+      | KEEP host.name, host.ip, package.name, package.version
+      | SORT host.name ASC
+    expected_output_fields:
       - host.name
       - host.ip
       - package.name
       - package.version
     notes: >-
-      Placeholder. No ES|QL defined yet and not validated against live data.
-      Intended to surface installed software versions (e.g. via package.* fields
-      or process.pe.* metadata); the source fields still need to be confirmed in
-      the target environment before a query can be written. expected_output_fields
-      above are proposed, not validated.
+      Lists installed software and versions per host from package.* fields,
+      populated by a software/package inventory source (e.g. the Elastic system
+      package dataset or an endpoint agent). Returns no rows if package.* isn't
+      ingested — confirm the fields exist in the target environment.
     recommended_refresh_frequency: Daily
 
   - id: AI017
     category: File Integrity Monitoring
     name: File Integrity Monitoring
-    status: not_validated
+    status: partially_validated
     validated: false
     purpose: Detect create/modify/delete changes to monitored files.
-    esql_query: ""   # TODO: query not yet defined - see notes.
-    expected_output_fields:   # Proposed, pending field validation.
+    esql_query: |
+      FROM logs-*
+      | WHERE file.path IS NOT NULL AND event.action IS NOT NULL
+      | WHERE event.action RLIKE "(?i).*(creat|delet|modif|chang|renam|overwrit).*"
+      | KEEP @timestamp, host.name, file.path, event.action, user.name
+      | SORT @timestamp DESC
+    expected_output_fields:
       - "@timestamp"
       - host.name
       - file.path
       - event.action
       - user.name
     notes: >-
-      Placeholder. No ES|QL defined yet and not validated against live data.
-      Requires a file-integrity data source (e.g. Elastic FIM / auditd file
-      events) to be present before a query can be authored. Assigned its own feed
-      (FEED-FILE-INTEGRITY) because it does not belong to the identity, service,
-      application, or database feeds. expected_output_fields above are proposed,
-      not validated.
+      File create/modify/delete/rename events, filtered on event.action. Requires
+      a file-integrity data source (Elastic FIM, auditd file events, or Sysmon
+      file events). Returns no rows if no FIM data is ingested. Assigned its own
+      feed (FEED-FILE-INTEGRITY).
     recommended_refresh_frequency: Hourly
 
   # ===========================================================================
@@ -536,8 +542,8 @@ queries:
   - id: AI018
     category: Authentication & Access Changes
     name: Privileged Logon
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect logons granted special/administrative privileges.
     esql_query: |
       FROM logs-*
@@ -562,8 +568,8 @@ queries:
   - id: AI019
     category: Authentication & Access Changes
     name: Account Lockout
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect user account lockouts.
     esql_query: |
       FROM logs-*
@@ -585,8 +591,8 @@ queries:
   - id: AI020
     category: Authentication & Access Changes
     name: Password Reset
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect administrative password resets on accounts.
     esql_query: |
       FROM logs-*
@@ -610,8 +616,8 @@ queries:
   - id: AI021
     category: Authentication & Access Changes
     name: Failed Logon
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect failed logon attempts (brute-force / credential misuse signal).
     esql_query: |
       FROM logs-*
@@ -642,8 +648,8 @@ queries:
   - id: AI022
     category: Security Configuration Changes
     name: Scheduled Task Created
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect scheduled task creation (a common persistence mechanism).
     esql_query: |
       FROM logs-*
@@ -667,8 +673,8 @@ queries:
   - id: AI023
     category: Security Configuration Changes
     name: Audit Policy Changed
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect changes to the system audit policy (log tampering signal).
     esql_query: |
       FROM logs-*
@@ -692,8 +698,8 @@ queries:
   - id: AI024
     category: Security Configuration Changes
     name: Event Log Cleared
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect security event log clearing (anti-forensics signal).
     esql_query: |
       FROM logs-*
@@ -715,8 +721,8 @@ queries:
   - id: AI025
     category: Security Configuration Changes
     name: Host Firewall Rule Changed
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     purpose: Detect Windows firewall rule add/modify/delete changes.
     esql_query: |
       FROM logs-*

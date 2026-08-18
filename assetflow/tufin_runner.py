@@ -366,40 +366,51 @@ def _collect_services(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
 
 
 def _collect_cleanups(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
-    columns = ["host.name", "cleanup.type", "rule.uid", "count", "comment"]
+    # R25-2: /devices/{id}/cleanups requires a cleanup category ``code`` and only
+    # supports C01 (fully shadowed rules); results nest under shadowed_rule.
+    columns = ["host.name", "cleanup.type", "rule.uid", "rule.name", "comment"]
 
     def paths_for(device_id: str, name: str, device: dict) -> Tuple[str, ...]:
         return (
-            f"devices/{device_id}/cleanups.json",
-            f"devices/{device_id}/cleanups",
+            f"devices/{device_id}/cleanups.json?code=C01",
+            f"devices/{device_id}/cleanups?code=C01",
         )
 
     def row_for(item: dict, device_id: str, name: str) -> List[Any]:
         return [
             name,
-            textish(_first(item, "cleanup_type", "type", "name")),
-            textish(_first(item, "rule_uid", "uid", "rule_id")),
-            textish(_first(item, "count", "instances_number")),
+            "fully_shadowed",
+            textish(_first(item, "uid", "id", "rule_id", "order", "number")),
+            textish(_first(item, "name", "comment")),
             textish(_first(item, "comment", "description")),
         ]
 
     return _collect_per_device(
-        client, scan, paths_for, ("cleanups", "cleanup", "rule_cleanups"), columns, row_for
+        client, scan, paths_for,
+        ("shadowed_rule", "shadowed_rules", "cleanup", "cleanups", "rule"),
+        columns, row_for,
     )
 
 
 def _collect_zones(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
-    columns = ["zone.id", "zone.name", "domain", "comment"]
-    payload = _first_payload(client, ("zones.json", "zones"))
-    rows = []
-    for zone in unwrap_items(payload, ("zones", "zone")):
-        rows.append([
+    # R25-2 has no global /zones; zones are per device (PolicyZoneListDTO).
+    columns = ["host.name", "zone.id", "zone.name", "global"]
+
+    def paths_for(device_id: str, name: str, device: dict) -> Tuple[str, ...]:
+        return (
+            f"devices/{device_id}/zones.json",
+            f"devices/{device_id}/zones",
+        )
+
+    def row_for(zone: dict, device_id: str, name: str) -> List[Any]:
+        return [
+            name,
             str(_first(zone, "id", "uid")),
             textish(_first(zone, "name", "display_name")),
-            textish(_first(zone, "domain", "domain_name")),
-            textish(_first(zone, "comment", "description")),
-        ])
-    return columns, rows
+            textish(_first(zone, "global")),
+        ]
+
+    return _collect_per_device(client, scan, paths_for, ("zones", "zone"), columns, row_for)
 
 
 # With no time range, how many of the most recent revisions to diff per device

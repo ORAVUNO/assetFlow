@@ -143,6 +143,32 @@ def test_rules_flatten_nested_fields():
     assert row["action"] == "accept"
 
 
+def test_cleanups_require_code_and_unwrap_shadowed_rule():
+    mapping = dict(DEVICES)
+    mapping["devices/1/cleanups.json?code=C01"] = {
+        "cleanup_set": {"shadowed_rules_cleanup": {"shadowed_rules": {"shadowed_rule": [
+            {"uid": "r5", "name": "dead rule", "comment": "shadowed by r1"},
+        ]}}}
+    }
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("cleanups"))
+    row = dict(zip(result.column_names, result.rows[0]))
+    assert row["host.name"] == "HQ-Perimeter-FW"
+    assert row["rule.uid"] == "r5"
+    assert row["cleanup.type"] == "fully_shadowed"
+
+
+def test_zones_are_per_device():
+    mapping = dict(DEVICES)
+    mapping["devices/1/zones.json"] = {"zones": {"zones": [
+        {"id": "7", "name": "DMZ", "global": False},
+    ]}}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("zones"))
+    assert result.column_names[0] == "host.name"
+    row = dict(zip(result.column_names, result.rows[0]))
+    assert row["host.name"] == "HQ-Perimeter-FW"
+    assert row["zone.name"] == "DMZ" and row["zone.id"] == "7"
+
+
 def test_limit_caps_rows():
     mapping = dict(DEVICES)
     mapping["devices/1/revisions.json"] = {
