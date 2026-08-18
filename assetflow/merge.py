@@ -1,0 +1,114 @@
+"""Correlate saved query results into a unified, host-keyed view.
+
+This is the intra-adapter merge (layer 2): take every saved result that carries
+a ``host.name`` column and fold it into one **golden record per host** — the
+"main table" of the *All Fetched Results* view. Results without ``host.name``
+(e.g. service-aggregated queries) can't be a host row and are reported as
+``excluded`` so the UI shows them as standalone sheets instead.
+
+Each merged cell summarizes what a query captured for that host: the distinct
+values of the query's most identifying column (a ``*.name``/``*Name`` field, or
+the sole value column), or a plain record count when there's no obvious one.
+Cross-adapter reconciliation (layer 3) will build on the same shape later.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional
+
+HOST_KEY = "host.name"
+HOST_IP = "host.ip"
+_SAMPLE_CAP = 6
+
+
+def _col_index(columns: List[dict], name: str) -> Optional[int]:
+    for i, c in enumerate(columns):
+        if c.get("name") == name:
+            return i
+    return None
+
+
+def _salient_index(columns: List[dict], value_idxs: List[int]) -> Optional[int]:
+    """Pick the most identifying value column to summarize (or None)."""
+    named = [(i, columns[i].get("name", "")) for i in value_idxs]
+    for test in (lambda n: n.endswith(".name"), lambda n: "Name" in n):
+        for i, n in named:
+            if test(n):
+                return i
+    if len(value_idxs) == 1:  # a single value column (often a VALUES() list)
+        return value_idxs[0]
+    return None
+
+
+def _collect(values: set, cell) -> None:
+    if isinstance(cell, list):
+        for x in cell:
+            if x not in (None, ""):
+                values.add(str(x))
+    elif cell not in (None, ""):
+        values.add(str(cell))
+
+
+def build_host_view(records: List[dict]) -> dict:
+    """Merge host-keyed saved results into golden records.
+
+    ``records`` are db fetch records (with ``columns`` and ``rows``). Returns
+    ``{columns, rows, host_count, contributing, excluded}``.
+    """
+    contributing: List[str] = []
+    excluded: List[str] = []
+    labels: List[str] = []
+    hosts: dict = {}  # host.name -> {"ip": set, "attrs": {label: {"count","values"}}}
+
+    for rec in records:
+        cols = rec.get("columns", [])
+        hn = _col_index(cols, HOST_KEY)
+        if hn is None:
+            excluded.append(rec.get("query_id", "?"))
+            continue
+        contributing.append(rec.get("query_id", "?"))
+        label = f"{rec.get('query_id', '?')} {rec.get('name', '')}".strip()
+        labels.append(label)
+        hip = _col_index(cols, HOST_IP)
+        value_idxs = [i for i, c in enumerate(cols) if c.get("name") not in (HOST_KEY, HOST_IP)]
+        salient = _salient_index(cols, value_idxs)
+
+        for row in rec.get("rows", []):
+            if hn >= len(row) or row[hn] in (None, ""):
+                continue
+            host = str(row[hn])
+            h = hosts.setdefault(host, {"ip": set(), "attrs": {}})
+            if hip is not None and hip < len(row):
+                _collect(h["ip"], row[hip])
+            attr = h["attrs"].setdefault(label, {"count": 0, "values": set()})
+            attr["count"] += 1
+            if salient is not None and salient < len(row):
+                _collect(attr["values"], row[salient])
+
+    columns = [{"name": HOST_KEY}, {"name": HOST_IP}] + [{"name": lbl} for lbl in labels]
+    rows = []
+    for host in sorted(hosts):
+        h = hosts[host]
+        row = [host, ", ".join(sorted(h["ip"]))]
+        for lbl in labels:
+            attr = h["attrs"].get(lbl)
+            if not attr:
+                row.append("")
+                continue
+            vals = sorted(attr["values"])
+            if vals:
+                cell = f"{len(vals)}: " + ", ".join(vals[:_SAMPLE_CAP])
+                if len(vals) > _SAMPLE_CAP:
+                    cell += " …"
+            else:
+                cell = str(attr["count"])
+            row.append(cell)
+        rows.append(row)
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "host_count": len(rows),
+        "contributing": contributing,
+        "excluded": excluded,
+    }
