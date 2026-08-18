@@ -360,6 +360,59 @@ def test_change_log_dedupes_across_fetches_and_modes(tmp_path):
     assert db.change_log("elasticsearch")["rows"] == []
 
 
+def test_db_schedule_crud_and_due(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from assetflow import db
+    db.init_engine(f"sqlite:///{tmp_path}/s.db")
+
+    rec = db.add_schedule("tufin", "*", interval_seconds=600, time_range="incremental", limit=50)
+    sid = rec["id"]
+    assert rec["query_id"] == "*" and rec["enabled"] is True
+    assert [s["id"] for s in db.list_schedules("tufin")] == [sid]
+
+    # A brand-new schedule (never run) is due immediately.
+    assert any(s["id"] == sid for s in db.due_schedules())
+
+    # After running, it is not due until the interval elapses.
+    now = datetime.now(timezone.utc)
+    db.mark_schedule_ran(sid, now)
+    assert not any(s["id"] == sid for s in db.due_schedules(now + timedelta(seconds=60)))
+    assert any(s["id"] == sid for s in db.due_schedules(now + timedelta(seconds=601)))
+
+    # Disable removes it from the due set; delete removes it entirely.
+    db.set_schedule_enabled(sid, False)
+    assert not db.due_schedules(now + timedelta(seconds=601))
+    assert db.delete_schedule(sid) is True
+    assert db.list_schedules("tufin") == []
+
+
+def test_scheduler_tick_runs_due_schedule(tmp_path, monkeypatch):
+    from assetflow import db, scheduler as scheduler_mod, adapters as adapters_mod
+    from assetflow import tufin_client as tufin_client_mod
+    db.init_engine(f"sqlite:///{tmp_path}/tick.db")
+
+    manager = adapters_mod.default_manager()
+    a = manager.get("tufin")
+    # Connect the tufin adapter against a fake client that serves one device.
+    fake = FakeClient(DEVICES)
+    monkeypatch.setattr(tufin_client_mod, "build_client", lambda **kw: fake)
+    monkeypatch.setattr(tufin_client_mod, "ping", lambda cl: {"summary": "ok"})
+    a.connect_form({"host": "h", "username": "u", "password": "p"})
+
+    db.add_schedule("tufin", "TUF001", interval_seconds=600)  # device inventory
+    outcomes = scheduler_mod.tick_once(manager)
+    assert any(o["status"] == "ran" for o in outcomes)
+    # The device fetch was saved by the scheduler.
+    assert db.latest_fetch("tufin", "TUF001")["row_count"] == 1
+
+    # Disconnected adapter schedules are skipped (and stay due), not run.
+    from datetime import datetime, timedelta, timezone
+    future = datetime.now(timezone.utc) + timedelta(seconds=3600)
+    a._client = None
+    outs = scheduler_mod.tick_once(manager, future)
+    assert outs and all(o["status"] == "skipped-disconnected" for o in outs)
+
+
 def test_db_change_watermark_roundtrip(tmp_path):
     from assetflow import db
     db.init_engine(f"sqlite:///{tmp_path}/w.db")

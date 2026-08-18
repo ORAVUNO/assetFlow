@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Integer,
     String,
@@ -142,6 +143,52 @@ _CHANGE_COLUMNS = [
 ]
 
 
+def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """SQLite hands back naive datetimes; treat stored times as UTC."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+class Schedule(Base):
+    """A recurring fetch: run ``query_id`` (or '*' for every runnable query) on
+    an adapter every ``interval_seconds``. Executed by the background scheduler
+    while the web app is running."""
+
+    __tablename__ = "schedules"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(64), index=True)
+    query_id: Mapped[str] = mapped_column(String(64), default="*")  # '*' = all runnable
+    interval_seconds: Mapped[int] = mapped_column(Integer)
+    time_range: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    limit_n: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def to_record(self) -> dict:
+        last = _aware(self.last_run_at)
+        nxt = None
+        if last is not None:
+            nxt = last + timedelta(seconds=self.interval_seconds)
+        return {
+            "id": self.id,
+            "adapter": self.adapter,
+            "query_id": self.query_id,
+            "interval_seconds": self.interval_seconds,
+            "time_range": self.time_range,
+            "limit": self.limit_n,
+            "enabled": self.enabled,
+            "last_run_at": last.isoformat() if last else None,
+            "next_run_at": nxt.isoformat() if nxt else None,
+        }
+
+    def is_due(self, now: datetime) -> bool:
+        last = _aware(self.last_run_at)
+        return last is None or (now - last).total_seconds() >= self.interval_seconds
+
+
 _engine = None
 _Session: Optional[sessionmaker] = None
 
@@ -228,6 +275,82 @@ def latest_all(adapter: Optional[str] = None, include_data: bool = True) -> List
             .order_by(FetchRun.adapter, FetchRun.query_id)
         )
         return [r.to_record(include_data) for r in s.scalars(stmt).all()]
+
+
+def add_schedule(
+    adapter: str,
+    query_id: str,
+    interval_seconds: int,
+    time_range: Optional[str] = None,
+    limit: Optional[int] = None,
+    enabled: bool = True,
+) -> dict:
+    with _session() as s:
+        sch = Schedule(
+            adapter=adapter,
+            query_id=query_id or "*",
+            interval_seconds=max(1, int(interval_seconds)),
+            time_range=time_range,
+            limit_n=limit,
+            enabled=enabled,
+            created_at=datetime.now(timezone.utc),
+        )
+        s.add(sch)
+        s.commit()
+        return sch.to_record()
+
+
+def list_schedules(adapter: Optional[str] = None) -> List[dict]:
+    with _session() as s:
+        stmt = select(Schedule)
+        if adapter:
+            stmt = stmt.where(Schedule.adapter == adapter)
+        return [sc.to_record() for sc in s.scalars(stmt.order_by(Schedule.id))]
+
+
+def delete_schedule(schedule_id: int) -> bool:
+    with _session() as s:
+        sch = s.get(Schedule, schedule_id)
+        if sch is None:
+            return False
+        s.delete(sch)
+        s.commit()
+        return True
+
+
+def set_schedule_enabled(schedule_id: int, enabled: bool) -> Optional[dict]:
+    with _session() as s:
+        sch = s.get(Schedule, schedule_id)
+        if sch is None:
+            return None
+        sch.enabled = enabled
+        s.commit()
+        return sch.to_record()
+
+
+def due_schedules(now: Optional[datetime] = None) -> List[dict]:
+    """Enabled schedules whose interval has elapsed — as run-ready records."""
+    now = now or datetime.now(timezone.utc)
+    with _session() as s:
+        out = []
+        for sc in s.scalars(select(Schedule).where(Schedule.enabled.is_(True))):
+            if sc.is_due(now):
+                out.append({
+                    "id": sc.id,
+                    "adapter": sc.adapter,
+                    "query_id": sc.query_id,
+                    "time_range": sc.time_range,
+                    "limit": sc.limit_n,
+                })
+        return out
+
+
+def mark_schedule_ran(schedule_id: int, when: Optional[datetime] = None) -> None:
+    with _session() as s:
+        sch = s.get(Schedule, schedule_id)
+        if sch is not None:
+            sch.last_run_at = when or datetime.now(timezone.utc)
+            s.commit()
 
 
 def record_changes(adapter: str, result) -> int:

@@ -20,6 +20,8 @@ from . import adapters as adapters_mod
 from . import db
 from . import export as export_mod
 from . import merge as merge_mod
+from . import scheduler as scheduler_mod
+from . import service as service_mod
 from .runner import QueryResult
 
 _state: dict = {"manager": None}
@@ -36,6 +38,15 @@ class ConnectRequest(BaseModel):
     base_path: str = ""  # Tufin SecureTrack API base path
     verify_certs: bool = True
     request_timeout: int = 60
+
+
+class ScheduleRequest(BaseModel):
+    adapter: str
+    query_id: str = "*"       # "*" = every runnable query for the adapter
+    interval_seconds: int = 600
+    time_range: str = ""
+    limit: Optional[int] = None
+    enabled: bool = True
 
 
 def _manager() -> adapters_mod.AdapterManager:
@@ -68,7 +79,11 @@ def _query_public(adapter: adapters_mod.Adapter, query) -> dict:
     }
 
 
-def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None) -> FastAPI:
+def create_app(
+    registry_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+    start_scheduler: bool = False,
+) -> FastAPI:
     db.init_engine(db_url)
     manager = adapters_mod.default_manager(registry_path)
     _state["manager"] = manager
@@ -76,6 +91,9 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
     # Best-effort auto-connect each adapter from environment variables.
     for adapter in manager.list():
         adapter.try_auto_connect()
+
+    if start_scheduler:
+        _state["scheduler"] = scheduler_mod.Scheduler(manager).start()
 
     app = FastAPI(title="assetFlow", docs_url=None, redoc_url=None)
 
@@ -171,12 +189,48 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
                     "panel (e.g. 180s) and reconnect, or pick a smaller time range."
                 )
             raise HTTPException(status_code=502, detail=detail)
-        rec = db.save_fetch(a.info.id, query, result, limit, range)
-        # Change-detail rows also feed the deduplicated, cumulative change log,
-        # keyed by the globally-unique revision id (safe across modes/refetches).
-        if getattr(query, "resource", "") == "change_detail":
-            rec["new_changes"] = db.record_changes(a.info.id, result)
+        # Persist the fetch (and, for change_detail, dedupe into the change log).
+        return service_mod.save_result(a, query, result, limit, range)
+
+    @app.post("/api/adapters/{adapter_id}/run-all")
+    def api_run_all(
+        adapter_id: str,
+        limit: Optional[int] = QueryParam(default=None, ge=1),
+        range: Optional[str] = QueryParam(default=None),
+    ) -> dict:
+        a = _get_adapter(adapter_id)
+        if not a.connected:
+            raise HTTPException(status_code=400, detail="adapter is not connected")
+        return service_mod.run_all(a, limit=limit, time_range=range)
+
+    @app.get("/api/schedules")
+    def api_schedules() -> dict:
+        return {"schedules": db.list_schedules()}
+
+    @app.post("/api/schedules")
+    def api_schedule_create(req: ScheduleRequest) -> dict:
+        _get_adapter(req.adapter)  # 404 if the adapter is unknown
+        return db.add_schedule(
+            adapter=req.adapter,
+            query_id=(req.query_id or "*"),
+            interval_seconds=max(1, int(req.interval_seconds)),
+            time_range=(req.time_range or None),
+            limit=req.limit,
+            enabled=req.enabled,
+        )
+
+    @app.post("/api/schedules/{schedule_id}/toggle")
+    def api_schedule_toggle(schedule_id: int, enabled: bool = QueryParam(...)) -> dict:
+        rec = db.set_schedule_enabled(schedule_id, enabled)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="unknown schedule")
         return rec
+
+    @app.delete("/api/schedules/{schedule_id}")
+    def api_schedule_delete(schedule_id: int) -> dict:
+        if not db.delete_schedule(schedule_id):
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        return {"ok": True}
 
     @app.get("/api/adapters/{adapter_id}/latest/{query_id}")
     def api_latest(adapter_id: str, query_id: str) -> dict:
@@ -329,8 +383,12 @@ INDEX_HTML = r"""<!doctype html>
   #conn{margin-left:auto;font-size:12px;color:var(--muted)}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--muted)}
   .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
-  #conntoggle{background:transparent;color:var(--accent);border:1px solid var(--border);
+  #conntoggle,#fetchall,#schedbtn{background:transparent;color:var(--accent);border:1px solid var(--border);
               padding:5px 12px;font-size:12px;font-weight:600;border-radius:7px;cursor:pointer}
+  #fetchall{color:var(--accent-fg);background:var(--accent);border-color:var(--accent)}
+  .schedrow{display:flex;align-items:center;gap:10px;padding:6px 0;font-size:12.5px;border-top:1px solid var(--border)}
+  .schedrow .sdel{color:var(--bad);cursor:pointer;font-weight:600}
+  .schedrow .stog{cursor:pointer;color:var(--accent);font-weight:600}
   .hidden{display:none !important}
   /* connection panel */
   .connpanel{background:var(--panel);border-bottom:1px solid var(--border);padding:14px 18px}
@@ -406,6 +464,8 @@ INDEX_HTML = r"""<!doctype html>
   <span id="crumb"></span>
   <span id="adapterexport" class="exp hidden"></span>
   <span id="conn" class="hidden"><span class="dot"></span></span>
+  <button id="fetchall" class="hidden" onclick="runAll()">Fetch all</button>
+  <button id="schedbtn" class="hidden" onclick="toggleSched()">Schedules</button>
   <button id="conntoggle" class="hidden" onclick="togglePanel()">Connection</button>
 </header>
 
@@ -425,6 +485,26 @@ INDEX_HTML = r"""<!doctype html>
   <div class="cstat" id="c_status"></div>
   <div class="chint" id="c_hint">Credentials are held in this local server's memory only — never written to disk.
     Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.</div>
+</div>
+
+<div id="schedpanel" class="connpanel hidden">
+  <div class="connrow">
+    <label>Query <select id="s_query"></select></label>
+    <label>Every <input type="text" id="s_interval" value="10" style="min-width:70px"/> min</label>
+    <label>Mode <select id="s_range">
+      <option value="">All time</option>
+      <option value="incremental">Since last check</option>
+      <option value="24h">Last 24h</option>
+      <option value="7d">Last 7 days</option>
+      <option value="30d">Last 30 days</option>
+      <option value="90d">Last 90 days</option>
+    </select></label>
+    <label>Limit <input type="text" id="s_limit" placeholder="(none)" style="min-width:80px"/></label>
+    <button onclick="addSchedule()">Add schedule</button>
+  </div>
+  <div id="s_list"></div>
+  <div class="chint">Schedules run in the background while the app is running, and only while the adapter is connected.
+    Pick <b>All endpoints</b> + <b>Since last check</b> for continuous change monitoring.</div>
 </div>
 
 <section id="gallery"></section>
@@ -466,8 +546,11 @@ async function loadGallery(){
 function showGallery(){
   document.getElementById('workspace').classList.add('hidden');
   document.getElementById('connpanel').classList.add('hidden');
+  document.getElementById('schedpanel').classList.add('hidden');
   document.getElementById('conn').classList.add('hidden');
   document.getElementById('conntoggle').classList.add('hidden');
+  document.getElementById('fetchall').classList.add('hidden');
+  document.getElementById('schedbtn').classList.add('hidden');
   document.getElementById('adapterexport').classList.add('hidden');
   document.getElementById('crumb').textContent='';
   document.getElementById('gallery').classList.remove('hidden');
@@ -482,6 +565,8 @@ async function openAdapter(id){
   document.getElementById('workspace').classList.remove('hidden');
   document.getElementById('conn').classList.remove('hidden');
   document.getElementById('conntoggle').classList.remove('hidden');
+  document.getElementById('fetchall').classList.remove('hidden');
+  document.getElementById('schedbtn').classList.remove('hidden');
   const ax=document.getElementById('adapterexport');
   ax.innerHTML='export this adapter: <a href="/api/adapters/'+id+'/export-all.json">JSON</a> · '+
                '<a href="/api/adapters/'+id+'/export-all.zip">ZIP</a>';
@@ -694,6 +779,66 @@ function drawTable(){
   const tw=document.getElementById('tw'); tw.innerHTML=h;
   tw.querySelectorAll('th').forEach(th=>th.onclick=()=>{
     const i=+th.dataset.i; if(SORT.col===i)SORT.dir*=-1; else{SORT.col=i;SORT.dir=1;} drawTable();});
+}
+
+/* ---------- fetch all ---------- */
+async function runAll(){
+  if(!ADAPTER) return;
+  const btn=document.getElementById('fetchall'); const label=btn.textContent;
+  btn.disabled=true; btn.textContent='Fetching all…';
+  try{
+    const d=await j('/api/adapters/'+ADAPTER+'/run-all?limit=200',{method:'POST'});
+    const nc=d.results.reduce((s,r)=>s+(r.new_changes||0),0);
+    alert('Fetched all endpoints for '+DETAIL.name+':\n'+d.ran+' ran, '+d.failed+' failed'+
+          (nc?('\n'+nc+' new change(s) recorded'):''));
+    DETAIL=await j('/api/adapters/'+ADAPTER); renderSidebar();  // refresh saved badges
+  }catch(e){ alert('Fetch all failed: '+e.message); }
+  finally{ btn.disabled=false; btn.textContent=label; }
+}
+
+/* ---------- schedules ---------- */
+function toggleSched(){
+  const p=document.getElementById('schedpanel');
+  const open=p.classList.contains('hidden');
+  p.classList.toggle('hidden',!open);
+  if(open){ fillSchedQuery(); loadSchedules(); }
+}
+function fillSchedQuery(){
+  const sel=document.getElementById('s_query');
+  let h='<option value="*">All endpoints</option>';
+  (DETAIL.queries||[]).forEach(q=>{ if(q.is_runnable) h+='<option value="'+q.id+'">'+esc(q.id+' — '+q.name)+'</option>'; });
+  sel.innerHTML=h;
+}
+async function loadSchedules(){
+  const list=document.getElementById('s_list');
+  let d; try{ d=await j('/api/schedules'); }catch(e){ list.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  const mine=d.schedules.filter(s=>s.adapter===ADAPTER);
+  if(!mine.length){ list.innerHTML='<div class="chint">No schedules yet.</div>'; return; }
+  list.innerHTML=mine.map(s=>{
+    const mins=Math.round(s.interval_seconds/60);
+    const q=(s.query_id==='*'?'All endpoints':s.query_id);
+    const mode=s.time_range?s.time_range:'all time';
+    const nxt=s.next_run_at?new Date(s.next_run_at).toLocaleTimeString():'due now';
+    return '<div class="schedrow"><span>'+esc(q)+' · every '+mins+'m · '+esc(mode)+
+      (s.limit?(' · limit '+s.limit):'')+' · '+(s.enabled?('next '+esc(nxt)):'<i>disabled</i>')+'</span>'+
+      '<span class="stog" onclick="toggleSchedule('+s.id+','+(!s.enabled)+')">'+(s.enabled?'disable':'enable')+'</span>'+
+      '<span class="sdel" onclick="deleteSchedule('+s.id+')">delete</span></div>';
+  }).join('');
+}
+async function addSchedule(){
+  const mins=parseFloat(val('s_interval'))||10;
+  const body={adapter:ADAPTER, query_id:val('s_query')||'*',
+              interval_seconds:Math.max(60,Math.round(mins*60)),
+              time_range:val('s_range'), limit:(parseInt(val('s_limit'))||null)};
+  try{ await j('/api/schedules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+       loadSchedules(); }
+  catch(e){ alert('Could not add schedule: '+e.message); }
+}
+async function toggleSchedule(id,enabled){
+  try{ await j('/api/schedules/'+id+'/toggle?enabled='+enabled,{method:'POST'}); loadSchedules(); }catch(e){ alert(e.message); }
+}
+async function deleteSchedule(id){
+  try{ await j('/api/schedules/'+id,{method:'DELETE'}); loadSchedules(); }catch(e){ alert(e.message); }
 }
 
 /* ---------- connection ---------- */

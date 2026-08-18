@@ -153,6 +153,25 @@ your credentials and data never leave your machine. Change the bind with
 `assetflow serve --host 0.0.0.0 --port 9000` if you need to (localhost is
 recommended).
 
+## Fetch all & scheduling
+
+Two controls in an adapter's workspace header (next to **Connection**):
+
+- **Fetch all** — runs *every* runnable query for the adapter once, saves each,
+  and reports how many ran/failed (and any new change-log entries). Placeholders
+  are skipped; one query failing doesn't stop the rest.
+- **Schedules** — opens a panel to run fetches automatically on an interval. Pick
+  a query (or **All endpoints**), an interval in minutes, a **Mode** (All time /
+  Since last check / 24h / 7d / 30d / 90d), and an optional row limit. Schedules
+  are saved in the database (`schedules` table) and run by a background worker
+  while `assetflow serve` is up — **only while the adapter is connected** (they
+  resume automatically once it reconnects). Enable/disable or delete each from
+  the same panel.
+
+For continuous Tufin change monitoring, schedule **All endpoints** (or just the
+Change Detail query) with **Since last check** every 5–15 minutes: each run
+appends deduplicated changes to the change log with no gaps or repeats.
+
 ## Tufin SecureTrack adapter
 
 The second adapter fetches **network security policy** asset intelligence from
