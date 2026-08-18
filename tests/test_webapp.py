@@ -122,6 +122,28 @@ def test_merged_view_and_export(client):
     assert client.get(f"/api/adapters/{A}/merged.json").status_code == 200
 
 
+def test_unified_inventory(client):
+    # host-keyed fetch feeds the cross-adapter inventory
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")
+    d = client.get("/api/inventory").json()
+    cols = [c["name"] for c in d["columns"]]
+    assert cols[:4] == ["host.name", "host.ip", "seen_by", "adapter_count"]
+    assert "Elasticsearch" in cols
+    assert d["asset_count"] >= 1
+    # only one adapter has data here, so nothing is multi-adapter
+    assert d["multi_adapter_count"] == 0
+    assert any(a["id"] == "elasticsearch" for a in d["adapters"])
+
+    hosts = {r[0] for r in d["rows"]}
+    assert {"host-a", "host-b"} <= hosts
+
+    # exports
+    csv = client.get("/api/inventory.csv")
+    assert csv.status_code == 200 and "seen_by" in csv.text
+    assert client.get("/api/inventory.json").status_code == 200
+    assert client.get("/api/inventory.xml").status_code == 400
+
+
 def test_run_placeholder_rejected(client):
     # All shipped queries are now runnable, so force one non-runnable to exercise
     # the 422 "no query defined" branch.

@@ -133,9 +133,23 @@ builds a unified, host-keyed view from everything saved for that adapter:
 
 Queries that aren't host-keyed (e.g. service-aggregated `AI010`/`AI012`) can't
 be a host row; they're listed as *not host-keyed* and appear only as sheets.
-This is the intra-adapter merge; cross-adapter reconciliation (merging the same
-host/asset seen by multiple adapters) builds on the same shape in a later
-round.
+This is the intra-adapter merge.
+
+### Unified inventory (across all adapters)
+
+The **★ Unified inventory** button on the adapter gallery is the cross-adapter
+view: it folds every adapter's host-keyed results into **one asset per host** and
+shows *which adapters saw it*. This is where the same host reported by more than
+one source is reconciled — e.g. a server that appears in both Elasticsearch and
+Tufin SecureTrack becomes a single row.
+
+- **One row per asset (host)**, with `host.name`, `host.ip`, a **Seen by** list
+  of the adapters that reported it, an **adapter count**, and one column per
+  adapter summarizing what that adapter captured for the host.
+- **Assets seen by multiple adapters surface first** and are highlighted, so
+  overlap between sources is immediately visible.
+- Downloadable as CSV/JSON, and available over the API at `/api/inventory`
+  (`/api/inventory.csv`, `/api/inventory.json`).
 
 **Connecting from the browser:** click **Connection** in the header to open a
 form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;

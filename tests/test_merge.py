@@ -53,3 +53,65 @@ def test_empty_records():
     view = merge.build_host_view([])
     assert view["host_count"] == 0
     assert view["columns"] == [{"name": "host.name"}, {"name": "host.ip"}]
+
+
+# -- cross-adapter unified inventory (layer 3) ------------------------------
+
+
+def _block(aid, name, records):
+    return ({"id": aid, "name": name, "category": "c"}, records)
+
+
+def test_unified_inventory_flags_multi_adapter_assets():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping",
+            ["host.name", "host.ip", "user.name"],
+            [["WIN-DC01", "10.0.0.5", "administrator"],
+             ["WIN-APP07", "10.0.2.31", "jsmith"]]),
+    ])
+    tufin = _block("tufin", "Tufin SecureTrack", [
+        rec("TUF001", "Device Inventory",
+            ["host.name", "host.ip", "vendor"],
+            [["WIN-DC01", "10.0.0.5", "Check Point"]]),
+    ])
+    inv = merge.build_unified_inventory([es, tufin])
+
+    names = [c["name"] for c in inv["columns"]]
+    assert names[:4] == ["host.name", "host.ip", "seen_by", "adapter_count"]
+    # one column per contributing adapter, in input order
+    assert names[4:] == ["Elasticsearch", "Tufin SecureTrack"]
+
+    assert inv["asset_count"] == 2
+    assert inv["multi_adapter_count"] == 1
+
+    by_host = {r[0]: r for r in inv["rows"]}
+    # WIN-DC01 seen by both adapters -> surfaces first, adapter_count == 2
+    assert inv["rows"][0][0] == "WIN-DC01"
+    dc = by_host["WIN-DC01"]
+    ci = names.index("adapter_count")
+    assert dc[ci] == 2
+    assert "Elasticsearch" in dc[names.index("seen_by")]
+    assert "Tufin SecureTrack" in dc[names.index("seen_by")]
+    # single-adapter asset
+    app = by_host["WIN-APP07"]
+    assert app[ci] == 1
+    assert app[names.index("Tufin SecureTrack")] == ""
+
+
+def test_unified_inventory_skips_non_host_keyed():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI010", "App by Service", ["service.name", "Hosts"], [["Elastic Agent", 12]]),
+    ])
+    inv = merge.build_unified_inventory([es])
+    assert inv["asset_count"] == 0
+    # no adapter contributed a host, so no per-adapter columns
+    assert [c["name"] for c in inv["columns"]] == [
+        "host.name", "host.ip", "seen_by", "adapter_count",
+    ]
+    assert inv["adapters"] == []
+
+
+def test_unified_inventory_empty():
+    inv = merge.build_unified_inventory([])
+    assert inv["asset_count"] == 0
+    assert inv["multi_adapter_count"] == 0

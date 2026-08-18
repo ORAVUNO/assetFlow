@@ -14,7 +14,7 @@ Cross-adapter reconciliation (layer 3) will build on the same shape later.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 HOST_KEY = "host.name"
 HOST_IP = "host.ip"
@@ -111,4 +111,101 @@ def build_host_view(records: List[dict]) -> dict:
         "host_count": len(rows),
         "contributing": contributing,
         "excluded": excluded,
+    }
+
+
+def build_unified_inventory(blocks: List[Tuple[dict, List[dict]]]) -> dict:
+    """Correlate host-keyed results across **all** adapters into one inventory.
+
+    This is layer 3 — cross-adapter reconciliation. Where ``build_host_view``
+    merges a single adapter's queries into a golden record per host, this folds
+    every adapter's host-keyed results into one **asset per host** and records
+    *which adapters* saw it. Assets seen by more than one adapter are surfaced
+    first, so overlap between sources (e.g. a host present in both Elasticsearch
+    and Tufin) is immediately visible.
+
+    ``blocks`` is ``[(adapter_info, records), ...]`` where ``adapter_info`` is
+    ``{"id", "name", ...}`` and ``records`` are db fetch records (with
+    ``columns`` and ``rows``) — the same shape the exporters consume.
+
+    Returns ``{columns, rows, asset_count, multi_adapter_count, adapters}``.
+    The columns are ``host.name``, ``host.ip``, ``seen_by`` (the adapter names
+    that saw the asset), ``adapter_count``, then one column per contributing
+    adapter summarizing what that adapter captured for the host.
+    """
+    adapter_order: List[Tuple[str, str]] = []  # (id, name), host-keyed contributors
+    seen_ids: set = set()
+    # host.name -> {"ip": set, "by": {adapter_id: {"name", "queries": set, "values": set}}}
+    hosts: dict = {}
+
+    for info, records in blocks:
+        aid = info.get("id", "?")
+        aname = info.get("name", aid)
+        contributed = False
+        for rec in records:
+            cols = rec.get("columns", [])
+            hn = _col_index(cols, HOST_KEY)
+            if hn is None:
+                continue
+            hip = _col_index(cols, HOST_IP)
+            value_idxs = [
+                i for i, c in enumerate(cols) if c.get("name") not in (HOST_KEY, HOST_IP)
+            ]
+            salient = _salient_index(cols, value_idxs)
+            qid = rec.get("query_id", "?")
+            for row in rec.get("rows", []):
+                if hn >= len(row) or row[hn] in (None, ""):
+                    continue
+                contributed = True
+                host = str(row[hn])
+                h = hosts.setdefault(host, {"ip": set(), "by": {}})
+                if hip is not None and hip < len(row):
+                    _collect(h["ip"], row[hip])
+                entry = h["by"].setdefault(
+                    aid, {"name": aname, "queries": set(), "values": set()}
+                )
+                entry["queries"].add(qid)
+                if salient is not None and salient < len(row):
+                    _collect(entry["values"], row[salient])
+        if contributed and aid not in seen_ids:
+            seen_ids.add(aid)
+            adapter_order.append((aid, aname))
+
+    columns = (
+        [{"name": HOST_KEY}, {"name": HOST_IP}, {"name": "seen_by"}, {"name": "adapter_count"}]
+        + [{"name": aname} for _, aname in adapter_order]
+    )
+
+    rows: List[list] = []
+    multi = 0
+    # Most-shared assets first (they matter most), then by host name.
+    for host in sorted(hosts, key=lambda h: (-len(hosts[h]["by"]), h)):
+        h = hosts[host]
+        by = h["by"]
+        if len(by) > 1:
+            multi += 1
+        seen_names = [aname for aid, aname in adapter_order if aid in by]
+        row = [host, ", ".join(sorted(h["ip"])), ", ".join(seen_names), len(by)]
+        for aid, _ in adapter_order:
+            entry = by.get(aid)
+            if not entry:
+                row.append("")
+                continue
+            vals = sorted(entry["values"])
+            if vals:
+                cell = f"{len(vals)}: " + ", ".join(vals[:_SAMPLE_CAP])
+                if len(vals) > _SAMPLE_CAP:
+                    cell += " …"
+            else:
+                n = len(entry["queries"])
+                cell = f"{n} " + ("query" if n == 1 else "queries")
+            row.append(cell)
+        rows.append(row)
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "asset_count": len(rows),
+        "multi_adapter_count": multi,
+        "adapters": [{"id": aid, "name": aname} for aid, aname in adapter_order],
     }

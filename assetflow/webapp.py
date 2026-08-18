@@ -365,6 +365,30 @@ def create_app(
             )
         raise HTTPException(status_code=400, detail="format must be json or zip")
 
+    @app.get("/api/inventory")
+    def api_inventory() -> dict:
+        """Cross-adapter unified inventory: one asset per host, with the adapters
+        that saw it. Assets seen by multiple adapters surface first."""
+        return merge_mod.build_unified_inventory(_blocks(None))
+
+    @app.get("/api/inventory.{fmt}")
+    def api_inventory_export(fmt: str) -> Response:
+        inv = merge_mod.build_unified_inventory(_blocks(None))
+        result = QueryResult(columns=inv["columns"], rows=inv["rows"])
+        if fmt == "csv":
+            return Response(
+                content=result.to_csv(),
+                media_type="text/csv",
+                headers={"Content-Disposition": 'attachment; filename="assetflow-unified-inventory.csv"'},
+            )
+        if fmt == "json":
+            return Response(
+                content=result.to_json(),
+                media_type="application/json",
+                headers={"Content-Disposition": 'attachment; filename="assetflow-unified-inventory.json"'},
+            )
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+
     @app.get("/api/export-all.{fmt}")
     def api_export_platform(fmt: str) -> Response:
         return _bundle_response("platform", _blocks(None), fmt, "assetflow-export")
@@ -500,6 +524,11 @@ INDEX_HTML = r"""<!doctype html>
   .minihdr.dim{color:var(--muted);font-weight:500}
   .sheethdr{margin:18px 0 2px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
   .mini table{font-size:12px}
+  /* unified inventory */
+  tr.multi td{background:color-mix(in srgb,var(--accent) 12%,transparent) !important;font-weight:600}
+  .invbtn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
+          padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .backlink{color:var(--accent);cursor:pointer;font-weight:600}
 </style>
 </head>
 <body>
@@ -573,9 +602,10 @@ function val(id){return (document.getElementById(id).value||'').trim();}
 async function loadGallery(){
   const g=document.getElementById('gallery'); g.innerHTML='<p class="hint">Loading adapters…</p>';
   const d=await j('/api/adapters');
-  let h='<div class="gbar">Export all saved data (every adapter): '+
+  let h='<div class="gbar"><button class="invbtn" onclick="openInventory()">★ Unified inventory</button>'+
+        '<span style="margin-left:auto">Export all saved data (every adapter): '+
         '<span class="exp"><a href="/api/export-all.json">JSON</a> · '+
-        '<a href="/api/export-all.zip">ZIP</a></span></div>';
+        '<a href="/api/export-all.zip">ZIP</a></span></span></div>';
   d.categories.forEach(cat=>{
     h+='<div class="gcat">'+esc(cat.name)+'</div><div class="cards">';
     cat.adapters.forEach(a=>{
@@ -603,6 +633,35 @@ function showGallery(){
   document.getElementById('crumb').textContent='';
   document.getElementById('gallery').classList.remove('hidden');
   ADAPTER=null; loadGallery();
+}
+
+/* ---------- unified inventory (cross-adapter, layer 3) ---------- */
+async function openInventory(){
+  const g=document.getElementById('gallery');
+  g.innerHTML='<p class="hint">Correlating assets across adapters…</p>';
+  let d; try{ d=await j('/api/inventory'); }
+  catch(e){ g.innerHTML='<div class="err">'+esc(e.message)+'</div>'+
+    '<p><span class="backlink" onclick="showGallery()">← Back to adapters</span></p>'; return; }
+  const names=d.adapters.map(a=>a.name);
+  let h='<div class="gbar"><span class="backlink" onclick="showGallery()">← Back to adapters</span></div>'+
+    '<h2 style="margin:6px 0 2px">Unified Inventory</h2>'+
+    '<div class="sub">One row per asset (host), correlated across every adapter. '+
+    'Rows highlighted in blue are assets seen by more than one adapter.</div>'+
+    '<div class="meta">'+d.asset_count+' asset(s) · '+d.multi_adapter_count+
+    ' seen by multiple adapters · adapters: '+esc(names.join(', ')||'none')+
+    ' · <a class="dl" href="/api/inventory.csv">Download CSV</a>'+
+    ' · <a class="dl" href="/api/inventory.json">Download JSON</a></div>'+
+    '<div id="invtable"></div>';
+  g.innerHTML=h;
+  const t=document.getElementById('invtable');
+  if(d.rows.length){
+    const cols=d.columns.map(c=>c.name);
+    const ci=cols.indexOf('adapter_count');
+    mountTable(t, cols, d.rows, {rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':'')});
+  }else{
+    t.innerHTML='<p class="hint">No host-keyed results saved yet. Open an adapter, connect, '+
+      'and fetch a host query (e.g. AI001) — assets appear here as adapters report them.</p>';
+  }
 }
 
 /* ---------- workspace ---------- */
@@ -685,7 +744,8 @@ function mountTable(container, cols, rows, opts){
       return String(x).localeCompare(String(y))*sort.dir;});}
     tw.innerHTML='<table><thead><tr>'+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
       (sort.col===i?(sort.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr></thead><tbody>'+
-      rs.map(r=>'<tr>'+r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+      rs.map(r=>'<tr'+(opts.rowClass?(' class="'+esc(opts.rowClass(r))+'"'):'')+'>'+
+        r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
     tw.querySelectorAll('th').forEach(th=>th.onclick=()=>{
       const i=+th.dataset.i; if(sort.col===i)sort.dir*=-1; else{sort.col=i;sort.dir=1;} draw();});
   }
