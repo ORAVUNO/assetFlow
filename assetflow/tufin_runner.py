@@ -402,28 +402,138 @@ def _collect_zones(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
     return columns, rows
 
 
-def _collect_audit_logs(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
-    columns = ["host.name", "event.id", "@timestamp", "changed_by", "source.ip", "event.type", "message"]
+# How many of the most recent revisions per device to diff (consecutive pairs).
+DEFAULT_CHANGE_REVISIONS = 2
+
+
+def _rule_key(rule: dict) -> str:
+    return str(_first(rule, "uid", "id", "rule_id", "order", "number"))
+
+
+def _rule_fingerprint(rule: dict) -> str:
+    """Identity of a rule's *effect* — used to tell a modification from a no-op.
+
+    The rule name/comment is deliberately excluded so a pure rename does not
+    read as a traffic change (mirrors the original Tufin change detector).
+    """
+    parts = [
+        textish(_first(rule, "source", "src", "sources")),
+        textish(_first(rule, "destination", "dst", "destinations")),
+        textish(_first(rule, "service", "services", "protocol")),
+        textish(_first(rule, "action")),
+        textish(_first(rule, "disabled")),
+    ]
+    return " | ".join(parts)
+
+
+def _rule_compact(rule: dict) -> str:
+    """A short human-readable rule summary for before/after cells."""
+    src = textish(_first(rule, "source", "src", "sources")) or "any"
+    dst = textish(_first(rule, "destination", "dst", "destinations")) or "any"
+    svc = textish(_first(rule, "service", "services", "protocol")) or "any"
+    act = textish(_first(rule, "action")) or "?"
+    return f"{src} → {dst} : {svc} ({act})"
+
+
+def _revisions_sorted(client, device_id: str) -> List[dict]:
+    payload = _first_payload(
+        client,
+        (f"devices/{device_id}/revisions.json", f"devices/{device_id}/revisions"),
+    )
+    revs = unwrap_items(payload, ("revisions", "revision"))
+
+    def order(rev: dict):
+        raw = _first(rev, "id", "revisionId", "number")
+        try:
+            return (0, int(raw))
+        except (TypeError, ValueError):
+            return (1, str(raw))
+
+    return sorted(revs, key=order)
+
+
+def _revision_rules(client, revision_id: str) -> Dict[str, dict]:
+    payload = _first_payload(
+        client,
+        (f"revisions/{revision_id}/rules.json", f"revisions/{revision_id}/rules"),
+    )
+    return {_rule_key(r): r for r in unwrap_items(payload, ("rules", "rule"))}
+
+
+def _authorization(client, old_id: str, new_id: str) -> Tuple[str, str]:
+    """Best-effort ``/change_authorization`` verdict for a revision pair.
+
+    Returns ``(status, requester)``; empty strings when the endpoint is
+    unavailable (it requires 'Authorize Revisions with Tickets' enabled).
+    """
     payload = _first_payload(
         client,
         (
-            "audit_logs.json?count=100",
-            "audit_logs?count=100",
-            "change_logs.json?count=100",
-            "changes.json?count=100",
+            f"change_authorization?old_version={old_id}&new_version={new_id}",
+            f"change_authorization/?old_version={old_id}&new_version={new_id}",
         ),
     )
-    rows = []
-    for log in unwrap_items(payload, ("audit_logs", "audit_log", "changes", "change", "events", "event", "logs", "log")):
-        rows.append([
-            textish(_first(log, "device_name", "ci_name")),
-            str(_first(log, "event_id", "id", "uid")),
-            textish(_first(log, "event_time", "time", "timestamp", "date")),
-            textish(_first(log, "actor", "user", "changed_by", "admin")),
-            textish(_first(log, "source_ip", "client_ip")),
-            textish(_first(log, "event_type", "type", "action")),
-            textish(_first(log, "message", "description", "comment")),
-        ])
+    if not isinstance(payload, dict):
+        return "", ""
+    root = payload.get("change_authorization", payload)
+    status = textish(_first(root, "status"))
+    tickets = root.get("tickets")
+    requester = ""
+    items = unwrap_items(tickets, ("ticket",)) if isinstance(tickets, (dict, list)) else []
+    for t in items:
+        requester = textish(_first(t, "requester_display_name", "requester_email"))
+        if requester:
+            break
+    return status, requester
+
+
+def _collect_change_detail(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
+    """Diff each device's most recent revisions into per-change rows.
+
+    Answers *what changed, who changed it, when* — and, when SecureChange
+    ticket authorization is enabled, whether the change was authorized (with the
+    requester). The API exposes revision *snapshots*, so the change list is
+    computed by comparing consecutive revisions' rulebases.
+    """
+    columns = [
+        "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
+        "rule.uid", "before", "after", "authorized", "requester",
+    ]
+    rows: List[List[Any]] = []
+    for device in _fetch_devices(client)[:scan]:
+        device_id, name = _device_key(device)
+        revisions = _revisions_sorted(client, device_id)
+        if len(revisions) < 2:
+            continue
+        window = revisions[-(DEFAULT_CHANGE_REVISIONS):]
+        for older, newer in zip(window, window[1:]):
+            old_id = str(_first(older, "id", "revisionId"))
+            new_id = str(_first(newer, "id", "revisionId"))
+            before_rules = _revision_rules(client, old_id)
+            after_rules = _revision_rules(client, new_id)
+            if not before_rules and not after_rules:
+                continue
+            when = _join_datetime(newer)
+            admin = textish(_first(newer, "admin", "admin_name", "changed_by", "user"))
+            status, requester = _authorization(client, old_id, new_id)
+
+            def emit(change_type: str, uid: str, before: dict, after: dict) -> None:
+                rows.append([
+                    name, new_id, when, admin, change_type, uid,
+                    _rule_compact(before) if before else "",
+                    _rule_compact(after) if after else "",
+                    status, requester,
+                ])
+
+            for uid, after in after_rules.items():
+                before = before_rules.get(uid)
+                if before is None:
+                    emit("added", uid, {}, after)
+                elif _rule_fingerprint(before) != _rule_fingerprint(after):
+                    emit("modified", uid, before, after)
+            for uid, before in before_rules.items():
+                if uid not in after_rules:
+                    emit("removed", uid, before, {})
     return columns, rows
 
 
@@ -435,7 +545,7 @@ _COLLECTORS: Dict[str, Callable[[Any, int], Tuple[List[str], List[List[Any]]]]] 
     "services": _collect_services,
     "cleanups": _collect_cleanups,
     "zones": _collect_zones,
-    "audit_logs": _collect_audit_logs,
+    "change_detail": _collect_change_detail,
 }
 
 

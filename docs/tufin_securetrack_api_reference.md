@@ -17,7 +17,7 @@ Tufin adapter's endpoint paths and field mappings (`config/tufin_registry.yaml`,
 | TUF005 | `GET /devices/{id}/services` | `min`/`max` port range, numeric `protocol` |
 | TUF006 | `GET /zones` | also `GET /devices/{id}/zones`, `GET /revisions/{id}/zones` |
 | TUF007 | `GET /devices/{device_id}/cleanups` | also `GET /devices/{device_id}/shadowing_rules` |
-| TUF008 | `GET /audit_logs` (varies) | availability depends on TOS version / product |
+| TUF008 | `GET /devices/{id}/revisions` + `GET /revisions/{id}/rules` + `GET /change_authorization` | change detail: diff consecutive revisions, attach authorization verdict |
 
 ## Key DTO fields (R25-2)
 
@@ -44,11 +44,15 @@ Tufin adapter's endpoint paths and field mappings (`config/tufin_registry.yaml`,
 `name`, `id`/`uid`, `protocol` (numeric), `min`/`max` (port range),
 `@xsi.type`, `comment`.
 
+### ChangeAuthorizationDTO (`/change_authorization?old_version=&new_version=`)
+Used by TUF008. `status` (authorized/unauthorized), `tickets.ticket[]`
+(WorkflowTicketDTO: `id`, `requester_display_name`, `requester_email`,
+`expiration_date`, `ticket_status`), and `change_authorization_bindings[]` with
+`unauthorized_opened_access` / `unauthorized_closed_access` rule lists. Requires
+"Authorize Revisions with Tickets" enabled in SecureTrack.
+
 ## High-value endpoints NOT yet in the registry (follow-ups)
 
-- **`GET /change_authorization`** — determine whether the changes between two
-  revisions are **authorized** (and `POST /change_authorization/policyTrafficComparison`).
-  This is the natural home for the original demo's "approval status" goal.
 - **Rule usage / last-hit** and `GET /devices/{id}/rules/{rule_id}/documentation`
   (rule documentation, business justification, owner, expiration).
 - **Topology**: `GET /devices/{id}/interfaces`, `/bindings`,

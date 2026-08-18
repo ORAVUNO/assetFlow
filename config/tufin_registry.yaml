@@ -46,7 +46,7 @@ metadata:
     - Network Objects & Services
     - Segmentation & Topology
     - Policy Hygiene
-    - Audit & Change Events
+    - Change Detection
 
 # =============================================================================
 # FEEDS
@@ -94,10 +94,10 @@ feeds:
     query_ids: [TUF007]
     recommended_refresh_frequency: Weekly
 
-  - id: FEED-TUF-AUDIT
-    name: Audit & Change Events
-    category: Audit & Change Events
-    description: SecureTrack audit / change-log events with actor, source IP, and change type (when exposed).
+  - id: FEED-TUF-CHANGE-DETAIL
+    name: Change Detection
+    category: Change Detection
+    description: Per-change detail computed by diffing consecutive revisions — what changed, who, when, and whether it was authorized.
     query_ids: [TUF008]
     recommended_refresh_frequency: Every 5-15 minutes
 
@@ -264,26 +264,36 @@ queries:
     recommended_refresh_frequency: Weekly
 
   - id: TUF008
-    category: Audit & Change Events
-    name: Audit / Change Events
-    status: not_validated
+    category: Change Detection
+    name: Change Detail (Revision Diff)
+    status: investigation_required
     validated: false
-    resource: audit_logs
+    resource: change_detail
     purpose: >-
-      Retrieve SecureTrack audit / change-log events with actor, source IP, and
-      change type — the richest change signal when the log endpoint is exposed.
+      Compute per-change detail by diffing each device's most recent revisions:
+      what rule changed (added/modified/removed) with before → after, who made
+      the change and when, and — when SecureChange ticket authorization is
+      enabled — whether the change was authorized and who requested it.
     expected_output_fields:
-      - host.name
-      - event.id
-      - "@timestamp"
-      - changed_by
-      - source.ip
-      - event.type
-      - message
+      - host.name              # device
+      - revision.id            # the new revision
+      - "@timestamp"           # revision date + time
+      - changed_by             # RevisionDTO.admin
+      - change_type            # added / modified / removed
+      - rule.uid
+      - before                 # rule effect before the change
+      - after                  # rule effect after the change
+      - authorized             # ChangeAuthorizationDTO.status (if enabled)
+      - requester              # SecureChange ticket requester_display_name
     notes: >-
-      Attempts audit_logs / change_logs / changes endpoints; availability varies
-      by TOS version, product (SecureTrack vs SecureChange), and permissions.
-      Audit-log events carry the actor, actor role, source IP, and auth method,
-      which is richer than a revision snapshot. Left not_validated until an
-      endpoint is confirmed in the target environment.
+      SecureTrack exposes revision *snapshots*, not a field-level changelog, so
+      "what changed" is computed: for each device the two most recent revisions
+      are fetched (GET /devices/{id}/revisions), their rulebases pulled (GET
+      /revisions/{id}/rules) and diffed by rule uid (a rename alone is not a
+      change — the fingerprint excludes the rule name). The authorized/requester
+      columns come from GET /change_authorization?old_version=&new_version=,
+      which requires "Authorize Revisions with Tickets" enabled in SecureTrack;
+      when it is off those columns are blank. Heavier than the other resources
+      (several REST calls per device), so the device scan is capped. This is the
+      change-intelligence headline — pair it with TUF002 (raw revision history).
     recommended_refresh_frequency: Every 5-15 minutes

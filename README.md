@@ -179,7 +179,7 @@ right alongside the Elasticsearch host-keyed queries.
 | TUF005 | Services | Network Objects & Services | `devices/{id}/services.json` |
 | TUF006 | Zones (segmentation) | Segmentation & Topology | `zones.json` |
 | TUF007 | Rule cleanups (shadowed/unused) | Policy Hygiene | `devices/{id}/cleanups.json` |
-| TUF008 | Audit / change events | Audit & Change Events | `audit_logs.json` (varies by TOS version) |
+| TUF008 | **Change detail — what changed, who, when, authorized** | Change Detection | `devices/{id}/revisions` + `revisions/{id}/rules` + `change_authorization` |
 
 ### Rich per-revision change intelligence (the headline)
 
@@ -199,12 +199,18 @@ the API exposes, per revision:
 - **`policy_package`**, **`authorization_status`**, the revision **comment**,
   plus the revision id and its per-device order number.
 
-The **time-range** control (24h/7d/30d/90d) bounds a revisions/audit fetch to
-recent changes, filtered on the revision timestamp. For an even richer signal,
-`TUF008` reads SecureTrack **audit-log** events, which additionally carry the
-actor role, **source IP**, auth method, and change type — though the log
-endpoint's availability depends on the TOS version and enabled products
-(SecureTrack vs SecureChange).
+The **time-range** control (24h/7d/30d/90d) bounds a revisions fetch to recent
+changes, filtered on the revision timestamp.
+
+`TUF002` gives the revision *history* (a snapshot per revision). To see **what
+actually changed** in each revision, `TUF008` (**Change Detail**) diffs each
+device's two most recent revisions rule-by-rule and emits one row per change —
+`change_type` (added/modified/removed) with a `before → after` summary, plus the
+acting admin and timestamp. When SecureChange ticket authorization is enabled
+(`/change_authorization`), it also fills in whether each change was
+**authorized** and who **requested** it. (SecureTrack exposes revision
+snapshots, not a field-level changelog, so this "what changed" view is computed
+by comparison; a pure rule rename is intentionally *not* counted as a change.)
 
 ### Other asset-intelligence data available from Tufin
 

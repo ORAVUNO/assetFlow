@@ -172,6 +172,72 @@ def test_unknown_resource_raises():
         tufin_runner_mod.run_query(FakeClient({}), _q("nonsense"))
 
 
+def test_change_detail_diffs_revisions_with_authorization():
+    # Device 1 has two revisions; rev 1051 -> 1052 adds a rule, modifies one
+    # (service change), and removes one. change_authorization returns the verdict.
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {
+        "revisions": [
+            {"id": "1051", "date": "2026-07-25", "time": "08:00:00", "admin": "bob.admin"},
+            {"id": "1052", "date": "2026-07-26", "time": "19:42:11", "admin": "jane.admin"},
+        ]
+    }
+    mapping["revisions/1051/rules.json"] = {
+        "rules": [
+            {"uid": "r10", "source": "10.0.0.0/24", "destination": "db", "service": "tcp/8443", "action": "accept"},
+            {"uid": "r20", "source": "any", "destination": "net", "service": "tcp/22", "action": "drop"},
+        ]
+    }
+    mapping["revisions/1052/rules.json"] = {
+        "rules": [
+            {"uid": "r10", "source": "10.0.0.0/24", "destination": "db", "service": "tcp/443", "action": "accept"},
+            {"uid": "r30", "source": "196.10.15.20", "destination": "vpn", "service": "tcp/3389", "action": "accept"},
+        ]
+    }
+    mapping["change_authorization?old_version=1051&new_version=1052"] = {
+        "change_authorization": {
+            "status": "unauthorized",
+            "tickets": {"ticket": [{"id": 55, "requester_display_name": "Alice Requester"}]},
+        }
+    }
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    rows = [dict(zip(result.column_names, r)) for r in result.rows]
+    by_type = {(r["change_type"], r["rule.uid"]): r for r in rows}
+
+    assert ("modified", "r10") in by_type
+    assert ("added", "r30") in by_type
+    assert ("removed", "r20") in by_type
+
+    modified = by_type[("modified", "r10")]
+    assert "tcp/8443" in modified["before"] and "tcp/443" in modified["after"]
+    assert modified["changed_by"] == "jane.admin"
+    assert modified["revision.id"] == "1052"
+    assert modified["authorized"] == "unauthorized"
+    assert modified["requester"] == "Alice Requester"
+
+
+def test_change_detail_ignores_pure_rename():
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {
+        "revisions": [
+            {"id": "1", "date": "2026-01-01", "time": "00:00:00", "admin": "a"},
+            {"id": "2", "date": "2026-01-02", "time": "00:00:00", "admin": "a"},
+        ]
+    }
+    # Same effect, only the name changed -> not a traffic change.
+    mapping["revisions/1/rules.json"] = {"rules": [{"uid": "r1", "name": "old name", "source": "a", "destination": "b", "service": "tcp/80", "action": "accept"}]}
+    mapping["revisions/2/rules.json"] = {"rules": [{"uid": "r1", "name": "new name", "source": "a", "destination": "b", "service": "tcp/80", "action": "accept"}]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    assert result.row_count == 0
+
+
+def test_change_detail_single_revision_skipped():
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {"revisions": [{"id": "1", "date": "2026-01-01"}]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    assert result.row_count == 0
+
+
 # --------------------------------------------------------------------------- #
 # Adapter wiring
 # --------------------------------------------------------------------------- #
