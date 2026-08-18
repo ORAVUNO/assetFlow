@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from . import adapters as adapters_mod
+from . import credstore as credstore_mod
 from . import db
 from . import export as export_mod
 from . import merge as merge_mod
@@ -39,6 +40,7 @@ class ConnectRequest(BaseModel):
     base_path: str = ""  # Tufin SecureTrack API base path
     verify_certs: bool = True
     request_timeout: int = 60
+    remember: bool = False  # opt-in: save this connection to .env on success
 
 
 class ScheduleRequest(BaseModel):
@@ -138,6 +140,7 @@ def create_app(
             "kind": a.info.kind,
             "connected": a.connected,
             "conn_info": a.conn_info,
+            "has_saved": credstore_mod.has_saved(a.managed_env_keys()),
             "feeds": [
                 {
                     "id": f.id,
@@ -155,11 +158,25 @@ def create_app(
     @app.post("/api/adapters/{adapter_id}/connect")
     def api_connect(adapter_id: str, req: ConnectRequest) -> JSONResponse:
         a = _get_adapter(adapter_id)
+        form = req.model_dump()
         try:
-            info = a.connect_form(req.model_dump())
+            info = a.connect_form(form)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
-        return JSONResponse({"ok": True, **info})
+        saved = False
+        if req.remember:
+            try:
+                credstore_mod.save(a.managed_env_keys(), a.env_for_form(form))
+                saved = True
+            except Exception:
+                saved = False  # persistence is best-effort; the connection stands
+        return JSONResponse({"ok": True, "saved": saved, **info})
+
+    @app.delete("/api/adapters/{adapter_id}/saved-connection")
+    def api_forget_connection(adapter_id: str) -> dict:
+        a = _get_adapter(adapter_id)
+        credstore_mod.forget(a.managed_env_keys())
+        return {"ok": True}
 
     @app.post("/api/adapters/{adapter_id}/run/{query_id}")
     def api_run(
@@ -507,11 +524,13 @@ INDEX_HTML = r"""<!doctype html>
     <label>Password <input type="password" id="c_pass" autocomplete="off"/></label>
     <label>Timeout (s) <input type="text" id="c_timeout" value="60" style="min-width:80px"/></label>
     <label class="chk"><input type="checkbox" id="c_verify" checked/> Verify TLS certificate</label>
+    <label class="chk"><input type="checkbox" id="c_remember"/> Remember on this machine</label>
     <button id="c_btn" onclick="connect()">Test &amp; connect</button>
   </div>
   <div class="cstat" id="c_status"></div>
   <div class="chint" id="c_hint">Credentials are held in this local server's memory only — never written to disk.
     Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.</div>
+  <div class="chint" id="c_forget"></div>
 </div>
 
 <div id="schedpanel" class="connpanel hidden">
@@ -604,11 +623,32 @@ async function openAdapter(id){
   ax.classList.remove('hidden');
   document.getElementById('crumb').textContent='› '+DETAIL.name;
   applyKind(DETAIL.kind);
+  updateForget();
   setConn(DETAIL.connected, DETAIL.conn_info||{});
   togglePanel(!DETAIL.connected);
   renderSidebar();
   document.getElementById('main').innerHTML='<p class="hint">Select a query on the left.</p>';
   CURRENT=null;
+}
+
+/* remember/forget saved credentials */
+function updateForget(){
+  const el=document.getElementById('c_forget');
+  const rem=document.getElementById('c_remember');
+  if(DETAIL && DETAIL.has_saved){
+    el.innerHTML='✓ Saved on this machine (in <code>.env</code>) — auto-connects on startup. '+
+      '<a href="#" onclick="forgetConn();return false;" style="color:var(--accent)">Forget saved credentials</a>';
+    if(rem) rem.checked=true;
+  }else{
+    el.innerHTML='';
+    if(rem) rem.checked=false;
+  }
+}
+async function forgetConn(){
+  if(!ADAPTER) return;
+  try{ await j('/api/adapters/'+ADAPTER+'/saved-connection',{method:'DELETE'});
+       DETAIL.has_saved=false; updateForget(); }
+  catch(e){ alert('Could not forget: '+e.message); }
 }
 
 /* show the connection fields that fit the adapter kind */
@@ -952,12 +992,15 @@ async function connect(){
               password:document.getElementById('c_pass').value||'',
               base_path:val('c_basepath'),
               verify_certs:document.getElementById('c_verify').checked,
+              remember:document.getElementById('c_remember').checked,
               request_timeout:parseInt(val('c_timeout'))||60};
   try{
     const d=await j('/api/adapters/'+ADAPTER+'/connect',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(d.ok){
-      st.innerHTML='<span style="color:var(--ok)">✓ Connected · '+esc(connSummary(d))+'</span>';
+      st.innerHTML='<span style="color:var(--ok)">✓ Connected · '+esc(connSummary(d))+
+        (d.saved?' · saved on this machine':'')+'</span>';
+      if(DETAIL){ DETAIL.has_saved=DETAIL.has_saved||d.saved; updateForget(); }
       setConn(true,d); setTimeout(()=>togglePanel(false),900);
     }else{ st.innerHTML='<span style="color:var(--bad)">✗ '+esc(d.error)+'</span>'; setConn(false,d);}
   }catch(e){st.innerHTML='<span style="color:var(--bad)">✗ '+esc(e.message)+'</span>';}

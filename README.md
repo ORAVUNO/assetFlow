@@ -141,10 +141,19 @@ round.
 form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;
 you can also paste a full URL), **username**, **password**, toggle **Verify TLS
 certificate**, and hit **Test & connect**. On success the header turns green
-with the cluster name and version. Credentials entered this way are held in the
-local server's memory only and are never written to disk. Setting them in
-`.env` still works and auto-connects on startup — the form is just an
-alternative so you don't have to edit files.
+with the cluster name and version. By default credentials entered this way are
+held in the local server's memory only and are never written to disk. Tick
+**Remember on this machine** before connecting to save the connection to `.env`
+(gitignored) on success — it then auto-connects on every startup with no
+re-entry, and the panel shows a **Forget saved credentials** link to clear it.
+Setting `.env` by hand still works too — the form is just an alternative so you
+don't have to edit files.
+
+> **Note:** *Remember on this machine* writes the host/username/password to the
+> local `.env` in plaintext (the same as editing `.env` yourself). It's opt-in;
+> leave it unticked to keep the memory-only default. Saving a connection is also
+> what lets the background **scheduler** run unattended after a restart, since it
+> needs the adapter already connected.
 
 Each query also has a **time-range** dropdown (All time / 24h / 7d / 30d / 90d)
 next to Run. Picking a range injects a `@timestamp` lower-bound filter right
