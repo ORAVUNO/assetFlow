@@ -171,7 +171,12 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
                     "panel (e.g. 180s) and reconnect, or pick a smaller time range."
                 )
             raise HTTPException(status_code=502, detail=detail)
-        return db.save_fetch(a.info.id, query, result, limit, range)
+        rec = db.save_fetch(a.info.id, query, result, limit, range)
+        # Change-detail rows also feed the deduplicated, cumulative change log,
+        # keyed by the globally-unique revision id (safe across modes/refetches).
+        if getattr(query, "resource", "") == "change_detail":
+            rec["new_changes"] = db.record_changes(a.info.id, result)
+        return rec
 
     @app.get("/api/adapters/{adapter_id}/latest/{query_id}")
     def api_latest(adapter_id: str, query_id: str) -> dict:
@@ -185,6 +190,11 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
     def api_history(adapter_id: str, query_id: str) -> dict:
         _get_adapter(adapter_id)
         return {"runs": db.history(adapter_id, query_id)}
+
+    @app.get("/api/adapters/{adapter_id}/changelog")
+    def api_changelog(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        return db.change_log(adapter_id)
 
     @app.get("/api/adapters/{adapter_id}/merged")
     def api_merged(adapter_id: str) -> dict:
@@ -564,6 +574,23 @@ async function openMerged(){
   }}));
 }
 
+async function openChangeLog(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovChangeLog'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading change log…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/changelog'); }
+  catch(e){ m.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  let h='<h2>Change Log — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Deduplicated changes across every Change Detail fetch (any mode). '+
+    'One row per unique revision change, keyed by the globally-unique revision id.</div>'+
+    '<div class="meta">'+d.rows.length+' change(s)</div><div id="cltable"></div>';
+  m.innerHTML=h;
+  const t=document.getElementById('cltable');
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {});
+  else t.innerHTML='<p class="hint">No changes recorded yet. Run TUF008 (Change Detail) — its rows accumulate here.</p>';
+}
+
 function renderSidebar(){
   const qById={}; DETAIL.queries.forEach(q=>qById[q.id]=q);
   const side=document.getElementById('sidebar'); side.innerHTML='';
@@ -571,6 +598,11 @@ function renderSidebar(){
   const all=document.createElement('div'); all.className='q ov'; all.id='ovAll';
   all.innerHTML='<span class="qid">★ All Fetched Results</span>';
   all.onclick=openMerged; side.appendChild(all);
+  if(DETAIL.kind==='tufin'){
+    const cl=document.createElement('div'); cl.className='q ov'; cl.id='ovChangeLog';
+    cl.innerHTML='<span class="qid">⟳ Change Log</span>';
+    cl.onclick=openChangeLog; side.appendChild(cl);
+  }
   DETAIL.feeds.forEach(f=>{
     const h=document.createElement('div'); h.className='feed'; h.textContent=f.name; side.appendChild(h);
     f.query_ids.forEach(qid=>{

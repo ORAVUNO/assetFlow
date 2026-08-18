@@ -231,6 +231,15 @@ stays bounded. The watermark is stored per (adapter, device) in the database
 (`tufin_change_watermarks`), so incremental coverage survives restarts. For
 continuous monitoring, run **Since last check** on a schedule (every 5–15 min).
 
+**Deduplicated change log.** However you fetch — different modes, repeated runs
+— each detected change also upserts into a cumulative **change log**
+(`tufin_changes`), keyed by the globally-unique revision id plus rule and change
+type. So a change is stored **exactly once** no matter how many times or in
+which mode it is fetched. Open it from the **⟳ Change Log** entry at the top of
+the Tufin sidebar: one row per unique change, accumulated across every fetch —
+separate from the per-fetch snapshots. (The per-query saved view still shows the
+latest fetch; the change log is the deduplicated, growing history.)
+
 ### Other asset-intelligence data available from Tufin
 
 Beyond change detection, SecureTrack is a rich asset source: the **device
