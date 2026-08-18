@@ -17,7 +17,7 @@ def registry() -> Registry:
 
 def test_registry_loads(registry: Registry):
     assert registry.metadata.version >= 1
-    assert len(registry.queries) == 26
+    assert len(registry.queries) == 27
     assert len(registry.feeds) == 9
 
 

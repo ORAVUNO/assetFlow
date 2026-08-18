@@ -21,7 +21,7 @@ def test_default_manager_has_elasticsearch_and_tufin(manager):
     assert "tufin" in ids
     a = manager.get("elasticsearch")
     assert a.info.category == "SIEM / Log Analytics"
-    assert len(a.registry.queries) == 26
+    assert len(a.registry.queries) == 27
 
 
 def test_by_category(manager):

@@ -99,7 +99,7 @@ shows `cluster_name · v<version>`. Credentials are held in memory only.
 
 ## Registry: queries & feeds
 
-`config/asset_intelligence_registry.yaml` — **26 queries** in **9 feeds**,
+`config/asset_intelligence_registry.yaml` — **27 queries** in **9 feeds**,
 validated by the pydantic `Registry` model (duplicate ids, undeclared
 categories, and feeds pointing at missing queries all fail the load).
 
@@ -113,7 +113,7 @@ categories, and feeds pointing at missing queries all fail the load).
 | File Integrity Monitoring | AI017 | file create/modify/delete events (needs an FIM source) |
 | Authentication & Access Changes | AI018–AI021 | privileged logon, lockout, password reset, failed logon (4672/4740/4724/4625) |
 | Security Configuration Changes | AI022–AI025 | scheduled task, audit-policy change, log cleared, firewall rule change (4698/4719/1102/4946–4948) |
-| Asset Inventory | AI026 | host inventory (one row per host: OS, IP, agent, cloud) |
+| Asset Inventory | AI026–AI027 | rich host inventory (logs-derived) + Elastic entity-store host entity (risk, criticality) |
 
 ### Two kinds of "change"
 
