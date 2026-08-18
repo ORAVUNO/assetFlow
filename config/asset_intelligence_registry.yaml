@@ -104,8 +104,8 @@ feeds:
   - id: FEED-ASSET-INVENTORY
     name: Asset Inventory
     category: Asset Inventory
-    description: Host inventory — one row per host with OS, IP, agent, and cloud metadata.
-    query_ids: [AI026]
+    description: Host inventory (logs-derived) and the Elastic entity-store host entity with risk & criticality.
+    query_ids: [AI026, AI027]
     recommended_refresh_frequency: Daily
 
 queries:
@@ -762,16 +762,28 @@ queries:
     name: Host Inventory
     status: partially_validated
     validated: false
-    purpose: Build a host inventory — one row per host with OS, IP, agent, and cloud metadata.
+    purpose: Build a rich host inventory — one row per host with OS, hardware, network, agent, and cloud metadata.
     esql_query: |
       FROM logs-*
       | WHERE host.name IS NOT NULL
       | STATS
           OS = VALUES(host.os.name),
           OSVersion = VALUES(host.os.version),
+          OSFamily = VALUES(host.os.family),
+          Kernel = VALUES(host.os.kernel),
+          Arch = VALUES(host.architecture),
+          Domain = VALUES(host.domain),
           IPs = VALUES(host.ip),
+          MACs = VALUES(host.mac),
           Agent = VALUES(agent.type),
-          Cloud = VALUES(cloud.provider),
+          AgentVersion = VALUES(agent.version),
+          CloudProvider = VALUES(cloud.provider),
+          CloudRegion = VALUES(cloud.region),
+          CloudInstance = VALUES(cloud.instance.id),
+          CloudAccount = VALUES(cloud.account.id),
+          Users = COUNT_DISTINCT(user.name),
+          Services = COUNT_DISTINCT(service.name),
+          FirstSeen = MIN(@timestamp),
           LastSeen = MAX(@timestamp)
       BY host.name
       | SORT host.name ASC
@@ -779,16 +791,62 @@ queries:
       - host.name
       - OS
       - OSVersion
+      - OSFamily
+      - Kernel
+      - Arch
+      - Domain
       - IPs
+      - MACs
       - Agent
-      - Cloud
+      - AgentVersion
+      - CloudProvider
+      - CloudRegion
+      - CloudInstance
+      - CloudAccount
+      - Users
+      - Services
+      - FirstSeen
       - LastSeen
     notes: >-
-      The Elasticsearch analogue of the Tufin device inventory: one golden row
-      per host from standard ECS fields (host.os.*, host.ip, agent.type,
-      cloud.provider). Host-keyed, so it feeds the unified view and inventory
-      drift — new hosts appear as added, hosts that stop reporting show in the
-      previous snapshot only. Fields that aren't ingested come back empty; for a
-      richer, deduplicated host entity, Elastic's Asset Inventory / entity store
-      (the .entities indices) is a follow-up source.
+      The Elasticsearch analogue of the Tufin device inventory, enriched: one
+      golden row per host from standard ECS fields — OS/kernel/family,
+      architecture, domain, IPs, MACs, agent type+version, full cloud metadata
+      (provider/region/instance/account), plus distinct user and service counts
+      and first/last seen. Host-keyed, so it feeds the unified view and inventory
+      drift (new IP, OS upgrade, new host, host gone dark). Fields not ingested
+      come back empty. For a pre-deduplicated, risk-scored host entity see AI027.
+    recommended_refresh_frequency: Daily
+
+  - id: AI027
+    category: Asset Inventory
+    name: Host Entity (Asset Inventory / Risk)
+    status: investigation_required
+    validated: false
+    purpose: >-
+      Read Elastic's Asset Inventory host entity — a pre-deduplicated host record
+      with risk level, asset criticality, and first/last seen.
+    esql_query: |
+      FROM .entities.v1.latest.security_host_default
+      | KEEP host.name, host.risk.calculated_level, host.risk.calculated_score_norm,
+             asset.criticality, host.os.name, host.ip,
+             entity.first_seen_timestamp, entity.last_seen_timestamp
+      | SORT host.risk.calculated_score_norm DESC
+    expected_output_fields:
+      - host.name
+      - host.risk.calculated_level
+      - host.risk.calculated_score_norm
+      - asset.criticality
+      - host.os.name
+      - host.ip
+      - entity.first_seen_timestamp
+      - entity.last_seen_timestamp
+    notes: >-
+      Requires the Elastic Security **Entity Store / Asset Inventory** to be
+      enabled. The index name and entity fields vary by Elastic version and space
+      — this targets the default-space host entity index
+      (.entities.v1.latest.security_host_default). If your deployment differs,
+      adjust the FROM index (e.g. a different space suffix, or the risk-score
+      latest index risk-score.risk-score-latest-<space>) and the risk/criticality
+      field names. Marked investigation_required until confirmed against your
+      cluster; it errors (rather than returns empty) if the index is absent.
     recommended_refresh_frequency: Daily
