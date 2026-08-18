@@ -143,6 +143,45 @@ _CHANGE_COLUMNS = [
 ]
 
 
+class SnapshotChange(Base):
+    """Deduplicated inventory-drift log (the Elasticsearch analogue of the Tufin
+    change log). Each row is one ``(host, attribute, value)`` that appeared or
+    disappeared between two saved snapshots of a query, keyed so re-diffing the
+    same snapshot pair never duplicates a transition."""
+
+    __tablename__ = "snapshot_changes"
+    __table_args__ = (
+        UniqueConstraint(
+            "adapter", "query_id", "host", "attribute", "change_type", "value", "new_run_id",
+            name="uq_snapshot_change",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(64), index=True)
+    query_id: Mapped[str] = mapped_column(String(64), index=True)
+    host: Mapped[str] = mapped_column(String(256), default="")
+    attribute: Mapped[str] = mapped_column(String(128), default="")
+    change_type: Mapped[str] = mapped_column(String(16), default="")
+    value: Mapped[str] = mapped_column(Text, default="")
+    old_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    new_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def to_record(self) -> dict:
+        return {
+            "host.name": self.host,
+            "query": self.query_id,
+            "attribute": self.attribute,
+            "change_type": self.change_type,
+            "value": self.value,
+            "detected_at": self.detected_at.isoformat() if self.detected_at else None,
+        }
+
+
+_DRIFT_COLUMNS = ["host.name", "query", "attribute", "change_type", "value", "detected_at"]
+
+
 def _aware(dt: Optional[datetime]) -> Optional[datetime]:
     """SQLite hands back naive datetimes; treat stored times as UTC."""
     if dt is None:
@@ -248,6 +287,88 @@ def latest_fetch(adapter: str, query_id: str, include_data: bool = True) -> Opti
         )
         run = s.scalars(stmt).first()
         return run.to_record(include_data) if run else None
+
+
+def last_two_fetches(adapter: str, query_id: str) -> List[dict]:
+    """The two most recent fetches (with data) for a query, newest first."""
+    with _session() as s:
+        stmt = (
+            select(FetchRun)
+            .where(FetchRun.adapter == adapter, FetchRun.query_id == query_id)
+            .order_by(desc(FetchRun.ran_at))
+            .limit(2)
+        )
+        return [r.to_record(include_data=True) for r in s.scalars(stmt)]
+
+
+def record_snapshot_changes(
+    adapter: str,
+    query_id: str,
+    rows: List[list],
+    old_run_id: Optional[int],
+    new_run_id: Optional[int],
+    detected_at: Optional[datetime] = None,
+) -> int:
+    """Upsert drift rows (``[host, attribute, change_type, value]``) into the
+    deduplicated snapshot-change log. Returns how many were newly inserted."""
+    if not rows:
+        return 0
+    when = detected_at or datetime.now(timezone.utc)
+    if isinstance(when, str):
+        try:
+            when = datetime.fromisoformat(when)
+        except ValueError:
+            when = datetime.now(timezone.utc)
+    with _session() as s:
+        existing = {
+            (c.host, c.attribute, c.change_type, c.value)
+            for c in s.scalars(
+                select(SnapshotChange).where(
+                    SnapshotChange.adapter == adapter,
+                    SnapshotChange.query_id == query_id,
+                    SnapshotChange.new_run_id == new_run_id,
+                )
+            )
+        }
+        inserted = 0
+        for row in rows:
+            host, attribute, change_type, value = (list(row) + ["", "", "", ""])[:4]
+            key = (str(host), str(attribute), str(change_type), str(value))
+            if key in existing:
+                continue
+            existing.add(key)
+            s.add(
+                SnapshotChange(
+                    adapter=adapter,
+                    query_id=query_id,
+                    host=str(host),
+                    attribute=str(attribute),
+                    change_type=str(change_type),
+                    value=str(value),
+                    old_run_id=old_run_id,
+                    new_run_id=new_run_id,
+                    detected_at=when,
+                )
+            )
+            inserted += 1
+        s.commit()
+        return inserted
+
+
+def snapshot_change_log(adapter: str, limit: int = 1000) -> dict:
+    """Return the deduplicated inventory-drift log for an adapter (newest first)."""
+    with _session() as s:
+        stmt = (
+            select(SnapshotChange)
+            .where(SnapshotChange.adapter == adapter)
+            .order_by(desc(SnapshotChange.id))
+            .limit(limit)
+        )
+        rows = [c.to_record() for c in s.scalars(stmt)]
+    return {
+        "columns": [{"name": c} for c in _DRIFT_COLUMNS],
+        "rows": [[rec[c] for c in _DRIFT_COLUMNS] for rec in rows],
+    }
 
 
 def latest_all(adapter: Optional[str] = None, include_data: bool = True) -> List[dict]:

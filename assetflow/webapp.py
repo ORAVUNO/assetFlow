@@ -22,6 +22,7 @@ from . import export as export_mod
 from . import merge as merge_mod
 from . import scheduler as scheduler_mod
 from . import service as service_mod
+from . import snapshotdiff as snapshotdiff_mod
 from .runner import QueryResult
 
 _state: dict = {"manager": None}
@@ -256,6 +257,25 @@ def create_app(
     def api_changelog(adapter_id: str) -> dict:
         _get_adapter(adapter_id)
         return db.change_log(adapter_id)
+
+    @app.get("/api/adapters/{adapter_id}/drift")
+    def api_drift(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        return db.snapshot_change_log(adapter_id)
+
+    @app.get("/api/adapters/{adapter_id}/change-detail/{query_id}")
+    def api_change_detail(adapter_id: str, query_id: str) -> dict:
+        _get_adapter(adapter_id)
+        runs = db.last_two_fetches(adapter_id, query_id)
+        if len(runs) < 2:
+            raise HTTPException(
+                status_code=404,
+                detail="need at least two saved fetches of this query to diff",
+            )
+        diff = snapshotdiff_mod.diff_snapshots(runs[1], runs[0])  # (old, new)
+        diff["ran_at"] = runs[0].get("ran_at")
+        diff["prev_ran_at"] = runs[1].get("ran_at")
+        return diff
 
     @app.get("/api/adapters/{adapter_id}/merged")
     def api_merged(adapter_id: str) -> dict:
@@ -687,6 +707,37 @@ async function openChangeLog(){
   else t.innerHTML='<p class="hint">No changes recorded yet. Run TUF008 (Change Detail) — its rows accumulate here.</p>';
 }
 
+async function openDrift(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovDrift'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading drift log…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/drift'); }
+  catch(e){ m.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  let h='<h2>Drift Log — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Inventory drift detected by diffing consecutive snapshots of host-keyed queries. '+
+    'One row per unique (host · attribute · value) that appeared or disappeared. Deduplicated.</div>'+
+    '<div class="meta">'+d.rows.length+' change(s)</div><div id="drifttable"></div>';
+  m.innerHTML=h;
+  const t=document.getElementById('drifttable');
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {});
+  else t.innerHTML='<p class="hint">No drift recorded yet. Fetch an inventory query (e.g. AI011) at least twice — added/removed items land here.</p>';
+}
+
+async function openChangeDetail(qid){
+  const out=document.getElementById('diffout'); if(!out) return;
+  out.innerHTML='<p class="hint">Diffing the last two fetches…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/change-detail/'+qid); }
+  catch(e){ out.innerHTML='<div class="hint">'+esc(e.message)+'</div>'; return; }
+  let h='<div class="sheethdr">Change since previous fetch</div>'+
+    '<div class="meta">'+d.added+' added · '+d.removed+' removed'+
+    (d.prev_ran_at?(' · vs '+new Date(d.prev_ran_at).toLocaleString()):'')+'</div><div id="ddtable"></div>';
+  out.innerHTML=h;
+  const t=document.getElementById('ddtable');
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {});
+  else t.innerHTML='<p class="hint">No differences between the last two fetches.</p>';
+}
+
 function renderSidebar(){
   const qById={}; DETAIL.queries.forEach(q=>qById[q.id]=q);
   const side=document.getElementById('sidebar'); side.innerHTML='';
@@ -699,6 +750,9 @@ function renderSidebar(){
     cl.innerHTML='<span class="qid">⟳ Change Log</span>';
     cl.onclick=openChangeLog; side.appendChild(cl);
   }
+  const dl=document.createElement('div'); dl.className='q ov'; dl.id='ovDrift';
+  dl.innerHTML='<span class="qid">⇄ Drift Log</span>';
+  dl.onclick=openDrift; side.appendChild(dl);
   DETAIL.feeds.forEach(f=>{
     const h=document.createElement('div'); h.className='feed'; h.textContent=f.name; side.appendChild(h);
     f.query_ids.forEach(qid=>{
@@ -763,14 +817,19 @@ async function run(){
 
 function render(rec){
   LASTROWS={cols:rec.columns.map(c=>c.name),rows:rec.rows.slice()};
+  const cols=rec.columns.map(c=>c.name);
+  const inventory=cols.includes('host.name') && !cols.includes('@timestamp');
   const res=document.getElementById('results');
   res.innerHTML=
     '<div class="meta">'+rec.row_count+' row(s)'+(rec.limit?(' · limit '+rec.limit):'')+
       (rec.time_range?(' · range '+esc(rec.time_range)):'')+
       ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/export/'+rec.query_id+'.csv">Download CSV</a>'+
-      ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/export/'+rec.query_id+'.json">Download JSON</a></div>'+
+      ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/export/'+rec.query_id+'.json">Download JSON</a>'+
+      (inventory?(' · <a class="dl" href="#" onclick="openChangeDetail(\''+rec.query_id+'\');return false;">⇄ Diff vs previous fetch</a>'):'')+
+      '</div>'+
     '<input type="text" id="filter" placeholder="filter rows…"/>'+
-    '<div class="tablewrap" id="tw"></div>';
+    '<div class="tablewrap" id="tw"></div>'+
+    '<div id="diffout"></div>';
   document.getElementById('filter').oninput=drawTable;
   drawTable();
 }

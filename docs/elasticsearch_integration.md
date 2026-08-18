@@ -55,7 +55,8 @@ both adapters.
 | `config/asset_intelligence_registry.yaml` | 17 ES|QL queries (AI001–AI017) in 6 feeds, with statuses/notes |
 | `assetflow/models.py` | `Query.esql_query`, `Registry` validation (ids unique, categories declared, feeds reference real queries) |
 | `assetflow/merge.py` | Unified host view — golden records keyed on `host.name` |
-| `assetflow/db.py` | `FetchRun` snapshots + `Schedule` (both adapter-agnostic) |
+| `assetflow/snapshotdiff.py` | Inventory drift: diff two snapshots into per-host added/removed facts |
+| `assetflow/db.py` | `FetchRun` snapshots, `SnapshotChange` (drift log), `Schedule` (adapter-agnostic) |
 | `assetflow/service.py` | `run_and_save` / `save_result` / `run_all` (shared) |
 | `assetflow/scheduler.py` | `tick_once` + `Scheduler` (shared) |
 | `assetflow/cli.py` | `validate/feeds/list/show/test-connection/run/run-feed/serve` |
@@ -98,18 +99,29 @@ shows `cluster_name · v<version>`. Credentials are held in memory only.
 
 ## Registry: queries & feeds
 
-`config/asset_intelligence_registry.yaml` — **17 queries** in **6 feeds**,
+`config/asset_intelligence_registry.yaml` — **25 queries** in **8 feeds**,
 validated by the pydantic `Registry` model (duplicate ids, undeclared
 categories, and feeds pointing at missing queries all fail the load).
 
 | Feed | Queries | Theme |
 |---|---|---|
 | Identity Intelligence | AI001 | user ↔ device mapping |
-| User Management Changes | AI002–AI006 | account create/enable/disable/delete, group membership (Windows event codes 4720/4722/4725/4726/4728…) |
+| User Management Changes | AI002–AI006 | account create/enable/disable/delete, group membership (4720/4722/4725/4726/4728…) |
 | Service Change Intelligence | AI007–AI009 | service installed/created, startup-type changes (7045/4697/7040) |
 | Application Discovery | AI010–AI012, AI016 | app/service footprint, software versions |
 | Database Discovery | AI013–AI015 | DB process/host/version discovery |
 | File Integrity Monitoring | AI017 | placeholder |
+| Authentication & Access Changes | AI018–AI021 | privileged logon, lockout, password reset, failed logon (4672/4740/4724/4625) |
+| Security Configuration Changes | AI022–AI025 | scheduled task, audit-policy change, log cleared, firewall rule change (4698/4719/1102/4946–4948) |
+
+### Two kinds of "change"
+
+The feeds split into two shapes, which matters for how change is detected:
+- **Change *events*** — anything with an `@timestamp` column (the user-management,
+  service-change, auth, and security-config feeds). Each row *is* a change
+  (who/what/when), so no diffing is needed.
+- **Inventory / state** — the aggregation feeds (AI001, AI010–AI014) describe
+  current state; "what changed" is computed by [snapshot drift](#deduplication).
 
 Each query has a **status** (`validated` / `partially_validated` /
 `investigation_required` / `not_validated`) and `expected_output_fields`.
@@ -167,32 +179,41 @@ absent.
 
 ## Deduplication
 
-This is the main conceptual difference from Tufin, so it's worth being precise:
+Two layers, mirroring the two kinds of change:
 
-- **Snapshot semantics.** Every Elasticsearch fetch is stored as an independent
-  `FetchRun` (columns/rows JSON). The newest run per (adapter, query) is the
-  saved view; older runs are history. Re-running a query **replaces the view**
-  with a fresh snapshot — it does not accumulate rows, so there is nothing to
-  deduplicate at the storage layer.
-- **Aggregation queries dedupe by construction.** Most AI queries are `STATS …
-  BY host.name` aggregations (AI001, AI010–AI014). Each returns one row per
-  group regardless of how many underlying events exist, so repeated fetches
-  never produce duplicate rows.
-- **Raw-event feeds are inherently point-in-time.** The user-management and
-  service-change feeds (AI002–AI009) return raw Windows events. A snapshot is a
-  window of "the latest matching events," so overlapping fetches *can* show the
-  same event twice **across different snapshots** — but within any one snapshot
-  there are no duplicates, and the latest-wins view keeps things clean.
+**1. Snapshot storage (event feeds & everything else).** Every fetch is an
+independent `FetchRun` (columns/rows JSON); the newest per (adapter, query) is
+the saved view. Re-running **replaces the view** with a fresh snapshot rather
+than accumulating rows, so there is nothing to dedupe at that layer. Aggregation
+queries (`STATS … BY host.name`) also dedupe *by construction* — one row per
+group. Raw-event feeds are point-in-time: overlapping fetches can show the same
+event across different snapshots, but never within one.
 
-There is deliberately **no ES change-log table** like Tufin's
-`tufin_changes`. Tufin's dedup exists because change detection is computed by
-diffing revisions and the results accumulate; the natural key there is the
-globally-unique revision id. Elasticsearch events do have natural keys
-(`event.id`, or `@timestamp`+`host.name`+`event.code`+`user.name`), so an
-**event-level dedup sink** for the raw-event feeds is a viable future extension
-— it just isn't needed for the current snapshot model. If you want a cumulative,
-deduplicated Elasticsearch event log, that's the shape to add (mirroring
-`db.record_changes` / `change_log`).
+**2. Inventory drift (the deduplicated change layer).** For host-keyed
+**inventory** queries (no `@timestamp`), each fetch is diffed against the
+previous snapshot and the result is upserted into the **`snapshot_changes`**
+table — the Elasticsearch analogue of Tufin's `tufin_changes`:
+
+- `snapshotdiff.diff_snapshots(old, new)` builds `host -> {(attribute, value)}`
+  facts from the identifying columns (`*.name`/`*Name` and `VALUES()` lists,
+  ignoring volatile counts/timestamps), then reports each fact added/removed.
+- `service._record_drift` runs automatically inside `save_result` for inventory
+  queries (skipping event feeds and Tufin's `change_detail`), comparing the two
+  most recent `fetch_runs` and calling `db.record_snapshot_changes`.
+- The dedup key is `UNIQUE(adapter, query_id, host, attribute, change_type,
+  value, new_run_id)`. Including `new_run_id` means re-diffing the **same**
+  snapshot pair never duplicates a transition, while a genuinely new snapshot
+  (a later fetch) that re-detects a value records it as a fresh transition.
+
+So drift accumulates deduplicated as fetches happen (manual, Fetch all, or
+scheduled). It surfaces two ways in the UI: the per-query **⇄ Diff vs previous
+fetch** link (`GET .../change-detail/{query_id}` — an on-demand diff of the last
+two fetches) and the adapter-level **⇄ Drift Log** sidebar view
+(`GET .../drift` → `db.snapshot_change_log`). Combine with the scheduler for
+continuous inventory-drift monitoring, exactly like the Tufin change monitor.
+
+Event-level dedup for the raw-event feeds (keyed on `event.id`) is a possible
+further extension but isn't needed — those feeds already emit changes directly.
 
 ## Persistence
 
@@ -202,6 +223,7 @@ Postgres):
 | Table | Used by Elasticsearch? |
 |---|---|
 | `fetch_runs` | yes — every fetch snapshot |
+| `snapshot_changes` | yes — deduplicated inventory-drift log |
 | `schedules` | yes — recurring fetches |
 | `tufin_changes`, `tufin_change_watermarks` | no — Tufin-only |
 
@@ -210,7 +232,9 @@ Postgres):
 Elasticsearch uses the shared adapter endpoints: `.../connect`,
 `.../run/{query_id}`, `.../run-all`, `.../latest|history/{query_id}`,
 `.../merged[.csv|.json]`, `.../export…`, plus `/api/schedules*` and
-`/api/scheduler`.
+`/api/scheduler`. Drift adds two more:
+`GET /api/adapters/{id}/change-detail/{query_id}` (on-demand diff of the last
+two fetches) and `GET /api/adapters/{id}/drift` (the deduplicated drift log).
 
 Unlike Tufin, Elasticsearch is also fully driven from the **CLI**:
 
@@ -264,9 +288,10 @@ categories, `validated` flag matches status, feeds reference real queries).
 ## Design decisions & caveats
 
 - **ES|QL requires Elasticsearch 8.11+.** The client pins `elasticsearch>=8.11`.
-- **Latest-wins snapshots, no accumulation.** Good for "current state"; for a
-  cumulative event log, add an event-level dedup sink (see
-  [Deduplication](#deduplication)).
+- **Latest-wins snapshots for the saved view; drift accumulates separately.**
+  The per-query view is always the latest fetch, but inventory drift is captured
+  cumulatively in `snapshot_changes` (see [Deduplication](#deduplication)). For a
+  cumulative *event* log, an event-level dedup sink is a further extension.
 - **Field mappings vary by data source.** Several queries are
   `partially_validated` / `investigation_required` because field availability
   (e.g. `winlog.event_data.*`, `process.pe.*`) depends on the ingest pipeline;
