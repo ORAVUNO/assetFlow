@@ -60,6 +60,15 @@ class Adapter:
         """Best-effort connect from environment variables at startup."""
         return False
 
+    def managed_env_keys(self) -> List[str]:
+        """Env var names this adapter reads/writes when a connection is saved."""
+        return []
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        """Map a UI connection form to the env vars that reproduce it (for the
+        opt-in 'Remember on this machine' save to .env)."""
+        return {}
+
     def ping(self) -> dict:  # pragma: no cover - overridden
         raise NotImplementedError
 
@@ -129,6 +138,30 @@ class ElasticsearchAdapter(Adapter):
         self._conn_info = info
         return True
 
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "ELASTICSEARCH_URL", "ELASTIC_CLOUD_ID", "ELASTIC_API_KEY",
+            "ELASTIC_USERNAME", "ELASTIC_PASSWORD", "ELASTIC_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        target = (form.get("url") or form.get("host") or "").strip()
+        port = (form.get("port") or "").strip()
+        if target and port and "://" not in target and ":" not in target.split("/", 1)[0]:
+            target = f"{target}:{port}"
+        env: Dict[str, str] = {}
+        if form.get("cloud_id"):
+            env["ELASTIC_CLOUD_ID"] = str(form["cloud_id"])
+        elif target:
+            env["ELASTICSEARCH_URL"] = client_mod.normalize_host(target)
+        if form.get("api_key"):
+            env["ELASTIC_API_KEY"] = str(form["api_key"])
+        elif form.get("username"):
+            env["ELASTIC_USERNAME"] = str(form.get("username") or "")
+            env["ELASTIC_PASSWORD"] = str(form.get("password") or "")
+        env["ELASTIC_VERIFY_CERTS"] = "true" if form.get("verify_certs", True) else "false"
+        return env
+
     def ping(self) -> dict:
         if self._client is None:
             raise client_mod.ConnectionConfigError("adapter is not connected")
@@ -188,6 +221,22 @@ class TufinAdapter(Adapter):
         self._client = candidate
         self._conn_info = info
         return True
+
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "TOS_HOSTNAME", "TOS_USERNAME", "TOS_PASSWORD",
+            "TUFIN_BASE_PATH", "TUFIN_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        host = (form.get("host") or form.get("url") or "").strip()
+        return {
+            "TOS_HOSTNAME": tufin_client_mod.clean_host(host),
+            "TOS_USERNAME": str(form.get("username") or ""),
+            "TOS_PASSWORD": str(form.get("password") or ""),
+            "TUFIN_BASE_PATH": str(form.get("base_path") or "/securetrack/api"),
+            "TUFIN_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
+        }
 
     def ping(self) -> dict:
         if self._client is None:
