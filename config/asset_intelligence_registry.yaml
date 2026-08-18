@@ -760,21 +760,26 @@ queries:
   - id: AI026
     category: Asset Inventory
     name: Host Inventory
-    status: partially_validated
-    validated: false
-    purpose: Build a host inventory — one row per host with OS, network, users, and activity.
+    status: validated
+    validated: true
+    purpose: Build a rich host inventory — one row per host with full OS build, hardware, agent, and user detail.
     esql_query: |
       FROM logs-*
       | WHERE host.name IS NOT NULL
       | STATS
           OS = VALUES(host.os.name),
           OSVersion = VALUES(host.os.version),
-          Domain = VALUES(host.domain),
+          OSBuild = VALUES(host.os.build),
+          OSFamily = VALUES(host.os.family),
+          OSPlatform = VALUES(host.os.platform),
+          OSType = VALUES(host.os.type),
+          Kernel = VALUES(host.os.kernel),
+          Arch = VALUES(host.architecture),
           IPs = VALUES(host.ip),
           MACs = VALUES(host.mac),
           Agent = VALUES(agent.type),
+          AgentVersion = VALUES(agent.version),
           Users = VALUES(user.name),
-          Services = VALUES(service.name),
           Events = COUNT(),
           FirstSeen = MIN(@timestamp),
           LastSeen = MAX(@timestamp)
@@ -784,25 +789,29 @@ queries:
       - host.name
       - OS
       - OSVersion
-      - Domain
+      - OSBuild
+      - OSFamily
+      - OSPlatform
+      - OSType
+      - Kernel
+      - Arch
       - IPs
       - MACs
       - Agent
+      - AgentVersion
       - Users
-      - Services
       - Events
       - FirstSeen
       - LastSeen
     notes: >-
       The Elasticsearch analogue of the Tufin device inventory: one golden row
-      per host from ECS fields that on-prem Windows/log data reliably carries —
-      OS name/version, domain, IPs, MACs, agent type, the users and services seen
-      on the host, event volume, and first/last seen. (Dropped cloud.*, host OS
-      family/kernel, and architecture — those are typically empty for on-prem
-      Windows event logs. Users/Services list the actual values so you can see
-      what populates.) Host-keyed, so it feeds the unified view and inventory
-      drift (new IP/MAC, OS upgrade, new host, host gone dark). Any field your
-      ingest doesn't set simply comes back empty.
+      per host with full OS detail (name/version/build/family/platform/type/
+      kernel), architecture, IPs, MACs, agent type+version, the users seen on the
+      host, event volume, and first/last seen. Field set confirmed populated
+      against a live Windows/Elastic Agent environment. Omits host.domain,
+      service.name, and cloud.* (empty in that environment — add them back if your
+      ingest carries them). Host-keyed, so it feeds the unified view and inventory
+      drift (new IP/MAC, OS build change, new host, host gone dark).
     recommended_refresh_frequency: Daily
 
   - id: AI027
