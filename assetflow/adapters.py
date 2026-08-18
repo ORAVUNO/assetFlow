@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from . import client as client_mod
+from . import db as db_mod
 from . import runner as runner_mod
 from . import tufin_client as tufin_client_mod
 from . import tufin_runner as tufin_runner_mod
@@ -198,7 +199,12 @@ class TufinAdapter(Adapter):
     def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
         if self._client is None:
             raise tufin_client_mod.TufinConfigError("adapter is not connected")
-        return tufin_runner_mod.run_query(self._client, query, limit=limit, time_range=time_range)
+        # The change-detail "since last seen" mode reads/advances a per-device
+        # watermark stored in the database (scoped to this adapter).
+        store = db_mod.watermark_store(self.info.id)
+        return tufin_runner_mod.run_query(
+            self._client, query, limit=limit, time_range=time_range, watermark_store=store
+        )
 
 
 class AdapterManager:

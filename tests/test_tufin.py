@@ -272,6 +272,74 @@ def test_change_detail_range_excludes_old_only_history():
     assert result.row_count == 0  # nothing changed inside the last 24h
 
 
+class FakeStore:
+    def __init__(self):
+        self.data = {}
+
+    def get(self, device_id):
+        return self.data.get(device_id)
+
+    def set(self, device_id, revision_id):
+        self.data[device_id] = revision_id
+
+
+def test_change_detail_incremental_baseline_then_since_last_seen():
+    store = FakeStore()
+    m = dict(DEVICES)
+    m["devices/1/revisions.json"] = {"revisions": [
+        {"id": "1", "date": "2026-01-01", "time": "00:00:00", "admin": "a"},
+        {"id": "2", "date": "2026-01-02", "time": "00:00:00", "admin": "a"},
+    ]}
+    m["revisions/1/rules.json"] = {"rules": [{"uid": "r", "service": "tcp/1", "action": "accept"}]}
+    m["revisions/2/rules.json"] = {"rules": [{"uid": "r", "service": "tcp/1", "action": "accept"}]}
+    client = FakeClient(m)
+
+    # First run establishes a baseline silently and records the watermark.
+    r1 = tufin_runner_mod.run_query(client, _q("change_detail"), time_range="incremental", watermark_store=store)
+    assert r1.row_count == 0
+    assert store.get("1") == "2"
+
+    # A new revision modifies rule r; the next run reports only that change.
+    m["devices/1/revisions.json"]["revisions"].append(
+        {"id": "3", "date": "2026-01-03", "time": "00:00:00", "admin": "jane"}
+    )
+    m["revisions/3/rules.json"] = {"rules": [{"uid": "r", "service": "tcp/2", "action": "accept"}]}
+    r2 = tufin_runner_mod.run_query(client, _q("change_detail"), time_range="incremental", watermark_store=store)
+    rows = [dict(zip(r2.column_names, row)) for row in r2.rows]
+    assert len(rows) == 1
+    assert rows[0]["change_type"] == "modified" and rows[0]["revision.id"] == "3"
+    assert rows[0]["changed_by"] == "jane"
+    assert store.get("1") == "3"
+
+    # Nothing new since -> no rows, watermark unchanged.
+    r3 = tufin_runner_mod.run_query(client, _q("change_detail"), time_range="incremental", watermark_store=store)
+    assert r3.row_count == 0
+    assert store.get("1") == "3"
+
+
+def test_incremental_without_store_falls_back_to_latest_two():
+    m = dict(DEVICES)
+    m["devices/1/revisions.json"] = {"revisions": [
+        {"id": "1", "date": "2026-01-01", "time": "00:00:00"},
+        {"id": "2", "date": "2026-01-02", "time": "00:00:00"},
+    ]}
+    m["revisions/1/rules.json"] = {"rules": [{"uid": "r", "service": "tcp/1", "action": "accept"}]}
+    m["revisions/2/rules.json"] = {"rules": [{"uid": "r", "service": "tcp/2", "action": "accept"}]}
+    result = tufin_runner_mod.run_query(FakeClient(m), _q("change_detail"), time_range="incremental")
+    assert result.row_count == 1  # no store -> behaves like the latest-two default
+
+
+def test_db_change_watermark_roundtrip(tmp_path):
+    from assetflow import db
+    db.init_engine(f"sqlite:///{tmp_path}/w.db")
+    assert db.get_change_watermark("tufin", "d1") is None
+    db.set_change_watermark("tufin", "d1", "10")
+    assert db.get_change_watermark("tufin", "d1") == "10"
+    db.set_change_watermark("tufin", "d1", "11")
+    assert db.get_change_watermark("tufin", "d1") == "11"
+    assert db.get_change_watermark("tufin", "other") is None
+
+
 # --------------------------------------------------------------------------- #
 # Adapter wiring
 # --------------------------------------------------------------------------- #

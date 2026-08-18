@@ -212,14 +212,24 @@ and timestamp. When SecureChange ticket authorization is enabled
 snapshots, not a field-level changelog, so this "what changed" view is computed
 by comparison; a pure rule rename is intentionally *not* counted as a change.)
 
-**Which revisions get compared** is driven by the **time-range** control: pick
-`24h/7d/30d/90d` and it diffs every revision in that window (plus the one just
-before it as a baseline), so you get *every* change in the period, each with its
-own actor and timestamp — not just the latest one. With **All time** it diffs
-only the two most recent revisions. The number of pairs per device is capped so
-a wide range on a busy firewall stays bounded; for continuous coverage, run it
-on a schedule (every 5–15 min) — each fetch is saved to the database, building
-history over time.
+**Which revisions get compared** is driven by the range control, which offers
+three modes for `TUF008`:
+
+- **Since last check** (incremental — the change-monitoring mode) — diffs only
+  the revisions newer than each device's stored **watermark**, then advances it.
+  Every change is reported **exactly once**, with no missed intermediate
+  revisions and no re-processing, regardless of how long between runs; the first
+  run just records a baseline. This is the mode to schedule for follow-up.
+- **24h / 7d / 30d / 90d** (window) — diffs every revision in that period (plus
+  the one just before it as a baseline). Best for on-demand audits — *"what
+  changed last week"* — and re-reports the whole window each run.
+- **All time** — diffs only the two most recent revisions (the quick "latest
+  change" peek).
+
+The number of pairs per device is capped so a wide window on a busy firewall
+stays bounded. The watermark is stored per (adapter, device) in the database
+(`tufin_change_watermarks`), so incremental coverage survives restarts. For
+continuous monitoring, run **Since last check** on a schedule (every 5–15 min).
 
 ### Other asset-intelligence data available from Tufin
 

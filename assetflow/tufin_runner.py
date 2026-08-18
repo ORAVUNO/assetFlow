@@ -408,6 +408,12 @@ DEFAULT_CHANGE_REVISIONS = 2
 # Safety cap on how many consecutive revision pairs to diff per device in one
 # fetch, so a wide range on a busy device can't fan out into unbounded calls.
 MAX_CHANGE_PAIRS = 25
+# Time-range tokens that select the "since last seen" incremental mode.
+INCREMENTAL_TOKENS = {"incremental", "since", "new"}
+
+
+def _rev_id(rev: dict) -> str:
+    return str(_first(rev, "id", "revisionId"))
 
 
 def _rule_key(rule: dict) -> str:
@@ -497,6 +503,33 @@ def _select_change_pairs(
     return list(zip(window, window[1:]))
 
 
+def _incremental_pairs(
+    revisions: List[dict], watermark: Optional[str], max_pairs: int
+) -> Tuple[List[Tuple[dict, dict]], str]:
+    """Pick pairs newer than the watermark; also return the new watermark.
+
+    - First run (``watermark`` is None): establish a baseline silently — no
+      pairs, and the returned watermark is the latest revision id.
+    - Known watermark: diff every consecutive pair from it up to the latest.
+    - Stale/unknown watermark (revision was pruned): fall back to the latest
+      pair so a change is still reported rather than nothing.
+    """
+    if len(revisions) < 2:
+        latest = _rev_id(revisions[-1]) if revisions else (watermark or "")
+        return [], latest
+
+    latest = _rev_id(revisions[-1])
+    if watermark is None:
+        return [], latest  # baseline only
+
+    idx = next((i for i, r in enumerate(revisions) if _rev_id(r) == watermark), None)
+    window = revisions[idx:] if idx is not None else revisions[-2:]
+    pairs = list(zip(window, window[1:]))
+    if len(pairs) > max_pairs:
+        pairs = pairs[-max_pairs:]
+    return pairs, latest
+
+
 def _revision_rules(client, revision_id: str) -> Dict[str, dict]:
     payload = _first_payload(
         client,
@@ -533,26 +566,40 @@ def _authorization(client, old_id: str, new_id: str) -> Tuple[str, str]:
 
 
 def _collect_change_detail(
-    client, scan: int, time_range: Optional[str] = None
+    client, scan: int, time_range: Optional[str] = None, watermark_store=None
 ) -> Tuple[List[str], List[List[Any]]]:
-    """Diff each device's revisions in the selected window into per-change rows.
+    """Diff each device's revisions into per-change rows.
 
     Answers *what changed, who changed it, when* — and, when SecureChange
     ticket authorization is enabled, whether the change was authorized (with the
     requester). The API exposes revision *snapshots*, so the change list is
-    computed by comparing consecutive revisions' rulebases. ``time_range`` picks
-    which revisions to compare (see ``_select_change_pairs``); rules for a given
-    revision are fetched once and reused across adjacent pairs.
+    computed by comparing consecutive revisions' rulebases.
+
+    Which revisions get compared depends on ``time_range``:
+    - a window token (24h/7d/…) → every revision in the window plus a baseline;
+    - an incremental token (``since``/``new``/``incremental``) with a
+      ``watermark_store`` → only revisions newer than each device's last-seen
+      watermark, which is then advanced (the change-monitoring mode);
+    - otherwise → the latest two revisions.
+
+    Rules for a given revision are fetched once and reused across adjacent pairs.
     """
     columns = [
         "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
         "rule.uid", "before", "after", "authorized", "requester",
     ]
+    incremental = (time_range or "").lower() in INCREMENTAL_TOKENS and watermark_store is not None
     rows: List[List[Any]] = []
     for device in _fetch_devices(client)[:scan]:
         device_id, name = _device_key(device)
         revisions = _revisions_sorted(client, device_id)
-        pairs = _select_change_pairs(revisions, time_range, MAX_CHANGE_PAIRS)
+        if incremental:
+            watermark = watermark_store.get(device_id)
+            pairs, new_watermark = _incremental_pairs(revisions, watermark, MAX_CHANGE_PAIRS)
+            if new_watermark and new_watermark != watermark:
+                watermark_store.set(device_id, new_watermark)
+        else:
+            pairs = _select_change_pairs(revisions, time_range, MAX_CHANGE_PAIRS)
         rules_cache: Dict[str, Dict[str, dict]] = {}
 
         def rules_for(rev_id: str) -> Dict[str, dict]:
@@ -609,6 +656,7 @@ def run_query(
     limit: Optional[int] = None,
     time_range: Optional[str] = None,
     device_scan_limit: int = DEFAULT_DEVICE_SCAN,
+    watermark_store=None,
 ) -> QueryResult:
     """Fetch a Tufin registry query's resource and normalize the response."""
     resource = (query.resource or "").strip()
@@ -626,7 +674,9 @@ def run_query(
         # This resource selects its own revision window from the time range
         # (it decides which revisions to fetch and diff), so it is not also
         # row-filtered afterwards.
-        columns, rows = _collect_change_detail(client, device_scan_limit, time_range)
+        columns, rows = _collect_change_detail(
+            client, device_scan_limit, time_range, watermark_store
+        )
     else:
         columns, rows = collector(client, device_scan_limit)
         rows = _apply_time_range(columns, rows, time_range)
