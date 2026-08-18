@@ -44,8 +44,8 @@ def test_adapters_listing(client):
 def test_adapter_detail(client):
     d = client.get(f"/api/adapters/{A}").json()
     assert d["id"] == "elasticsearch"
-    assert len(d["queries"]) == 17
-    assert len(d["feeds"]) == 6
+    assert len(d["queries"]) == 25
+    assert len(d["feeds"]) == 8
     # auto-connected from env in the fixture
     assert d["connected"] is True
 

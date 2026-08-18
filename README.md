@@ -12,8 +12,9 @@ many sources can later be merged.
   Analytics*) and **Tufin SecureTrack** (category *Network Security Policy* —
   see [Tufin adapter](#tufin-securetrack-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
-  adapter's 17 ES|QL queries grouped into 6 feeds (Identity, User Management,
-  Service Change, Application Discovery, Database Discovery, File Integrity).
+  adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
+  Service Change, Application Discovery, Database Discovery, File Integrity,
+  Authentication & Access Changes, Security Configuration Changes).
   `config/tufin_registry.yaml` — the Tufin adapter's 8 SecureTrack resources in
   7 feeds (Device Inventory, Change History, Policy Rules, Network Objects &
   Services, Segmentation, Policy Hygiene, Audit Events).

@@ -17,8 +17,8 @@ def registry() -> Registry:
 
 def test_registry_loads(registry: Registry):
     assert registry.metadata.version >= 1
-    assert len(registry.queries) == 17
-    assert len(registry.feeds) == 6
+    assert len(registry.queries) == 25
+    assert len(registry.feeds) == 8
 
 
 def test_all_query_ids_unique(registry: Registry):

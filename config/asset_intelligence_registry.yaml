@@ -31,6 +31,8 @@ metadata:
     - Application Discovery
     - Database Discovery
     - File Integrity Monitoring
+    - Authentication & Access Changes
+    - Security Configuration Changes
 
 # =============================================================================
 # FEEDS
@@ -82,6 +84,20 @@ feeds:
     category: File Integrity Monitoring
     description: File create/modify/delete change monitoring. Placeholder feed; query not yet defined.
     query_ids: [AI017]
+    recommended_refresh_frequency: Hourly
+
+  - id: FEED-AUTH-ACCESS
+    name: Authentication & Access Changes
+    category: Authentication & Access Changes
+    description: Privileged logon, account lockout, password reset, and failed-logon change events.
+    query_ids: [AI018, AI019, AI020, AI021]
+    recommended_refresh_frequency: Hourly
+
+  - id: FEED-SEC-CONFIG
+    name: Security Configuration Changes
+    category: Security Configuration Changes
+    description: Scheduled task creation, audit-policy change, event-log clearing, and host firewall rule changes.
+    query_ids: [AI022, AI023, AI024, AI025]
     recommended_refresh_frequency: Hourly
 
 queries:
@@ -511,4 +527,214 @@ queries:
       (FEED-FILE-INTEGRITY) because it does not belong to the identity, service,
       application, or database feeds. expected_output_fields above are proposed,
       not validated.
+    recommended_refresh_frequency: Hourly
+
+  # ===========================================================================
+  # AUTHENTICATION & ACCESS CHANGES
+  # ===========================================================================
+
+  - id: AI018
+    category: Authentication & Access Changes
+    name: Privileged Logon
+    status: partially_validated
+    validated: false
+    purpose: Detect logons granted special/administrative privileges.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4672"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.PrivilegeList
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.PrivilegeList
+    notes: >-
+      Windows event code 4672 (special privileges assigned to new logon).
+      Highlights administrative/privileged sessions. Field mapping mirrors the
+      validated user-management queries; confirm winlog fields in the target env.
+    recommended_refresh_frequency: Hourly
+
+  - id: AI019
+    category: Authentication & Access Changes
+    name: Account Lockout
+    status: partially_validated
+    validated: false
+    purpose: Detect user account lockouts.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4740"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.TargetUserName,
+          winlog.event_data.SubjectUserName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.TargetUserName
+      - winlog.event_data.SubjectUserName
+    notes: Windows event code 4740 (a user account was locked out).
+    recommended_refresh_frequency: Hourly
+
+  - id: AI020
+    category: Authentication & Access Changes
+    name: Password Reset
+    status: partially_validated
+    validated: false
+    purpose: Detect administrative password resets on accounts.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4724"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.TargetUserName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.TargetUserName
+    notes: >-
+      Windows event code 4724 (an attempt was made to reset an account's
+      password). Actor is SubjectUserName; target is TargetUserName.
+    recommended_refresh_frequency: Hourly
+
+  - id: AI021
+    category: Authentication & Access Changes
+    name: Failed Logon
+    status: partially_validated
+    validated: false
+    purpose: Detect failed logon attempts (brute-force / credential misuse signal).
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4625"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.TargetUserName,
+          source.ip,
+          winlog.event_data.LogonType
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.TargetUserName
+      - source.ip
+      - winlog.event_data.LogonType
+    notes: >-
+      Windows event code 4625 (an account failed to log on). source.ip and
+      LogonType support brute-force and remote-access analysis. High volume;
+      bound with the time-range control.
+    recommended_refresh_frequency: Hourly
+
+  # ===========================================================================
+  # SECURITY CONFIGURATION CHANGES
+  # ===========================================================================
+
+  - id: AI022
+    category: Security Configuration Changes
+    name: Scheduled Task Created
+    status: partially_validated
+    validated: false
+    purpose: Detect scheduled task creation (a common persistence mechanism).
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4698"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.TaskName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.TaskName
+    notes: >-
+      Windows event code 4698 (a scheduled task was created). TaskName often
+      requires XML parsing depending on the ingest pipeline; confirm the field.
+    recommended_refresh_frequency: Hourly
+
+  - id: AI023
+    category: Security Configuration Changes
+    name: Audit Policy Changed
+    status: partially_validated
+    validated: false
+    purpose: Detect changes to the system audit policy (log tampering signal).
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "4719"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName,
+          winlog.event_data.CategoryId,
+          winlog.event_data.SubcategoryGuid
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+      - winlog.event_data.CategoryId
+      - winlog.event_data.SubcategoryGuid
+    notes: Windows event code 4719 (system audit policy was changed).
+    recommended_refresh_frequency: Hourly
+
+  - id: AI024
+    category: Security Configuration Changes
+    name: Event Log Cleared
+    status: partially_validated
+    validated: false
+    purpose: Detect security event log clearing (anti-forensics signal).
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code == "1102"
+      | KEEP
+          @timestamp,
+          host.name,
+          winlog.event_data.SubjectUserName
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - winlog.event_data.SubjectUserName
+    notes: >-
+      Windows event code 1102 (the audit log was cleared). High-signal, low
+      volume — clearing the log is a strong tampering indicator.
+    recommended_refresh_frequency: Hourly
+
+  - id: AI025
+    category: Security Configuration Changes
+    name: Host Firewall Rule Changed
+    status: partially_validated
+    validated: false
+    purpose: Detect Windows firewall rule add/modify/delete changes.
+    esql_query: |
+      FROM logs-*
+      | WHERE event.code IN ("4946","4947","4948")
+      | KEEP
+          @timestamp,
+          host.name,
+          event.code,
+          winlog.event_data.RuleName,
+          winlog.event_data.RuleId
+      | SORT @timestamp DESC
+    expected_output_fields:
+      - "@timestamp"
+      - host.name
+      - event.code
+      - winlog.event_data.RuleName
+      - winlog.event_data.RuleId
+    notes: >-
+      Windows firewall rule change events: 4946 (added), 4947 (modified),
+      4948 (deleted). event.code identifies the change type.
     recommended_refresh_frequency: Hourly

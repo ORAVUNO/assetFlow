@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from . import db
+from . import snapshotdiff
 from .adapters import Adapter
 
 
@@ -25,7 +26,30 @@ def save_result(
     rec = db.save_fetch(adapter.info.id, query, result, limit, time_range)
     if getattr(query, "resource", "") == "change_detail":
         rec["new_changes"] = db.record_changes(adapter.info.id, result)
+    else:
+        drift = _record_drift(adapter, query, result)
+        if drift is not None:
+            rec["drift"] = drift
     return rec
+
+
+def _record_drift(adapter: Adapter, query, result) -> Optional[int]:
+    """For host-keyed inventory queries, diff this fetch against the previous
+    snapshot and record the drift into the deduplicated snapshot-change log.
+    Event feeds (with ``@timestamp``) are skipped — their rows are already
+    changes. Returns the number of newly recorded drift rows, or None if the
+    query isn't an inventory snapshot / has no prior fetch to compare."""
+    if not snapshotdiff.is_inventory(result.columns):
+        return None
+    runs = db.last_two_fetches(adapter.info.id, query.id)
+    if len(runs) < 2:
+        return None
+    new_run, old_run = runs[0], runs[1]
+    diff = snapshotdiff.diff_snapshots(old_run, new_run)
+    return db.record_snapshot_changes(
+        adapter.info.id, query.id, diff["rows"],
+        old_run.get("run_id"), new_run.get("run_id"), new_run.get("ran_at"),
+    )
 
 
 def run_and_save(
