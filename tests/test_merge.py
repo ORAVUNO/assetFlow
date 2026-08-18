@@ -115,3 +115,63 @@ def test_unified_inventory_empty():
     inv = merge.build_unified_inventory([])
     assert inv["asset_count"] == 0
     assert inv["multi_adapter_count"] == 0
+
+
+# -- single-asset drill-down ------------------------------------------------
+
+
+def test_asset_detail_fields_common_specific_and_preferred():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping",
+            ["host.name", "host.ip", "os.name", "user.name"],
+            [["WIN-DC01", "10.0.0.5", "Windows Server 2019", "administrator"],
+             ["WIN-DC01", "10.0.0.5", "Windows Server 2019", "svc_backup"]]),
+    ])
+    tufin = _block("tufin", "Tufin SecureTrack", [
+        rec("TUF001", "Device Inventory",
+            ["host.name", "host.ip", "vendor"],
+            [["WIN-DC01", "10.0.0.5", "Check Point"]]),
+    ])
+    d = merge.build_asset_detail([es, tufin], "WIN-DC01")
+    assert d["found"] is True
+    assert [a["id"] for a in d["adapters"]] == ["elasticsearch", "tufin"]
+
+    by_name = {f["name"]: f for f in d["fields"]}
+    # host.ip reported by both, same value -> common + agree
+    ip = by_name["host.ip"]
+    assert ip["scope"] == "common" and ip["agree"] is True
+    assert ip["preferred"] == "10.0.0.5"
+    # os.name only from Elasticsearch -> specific
+    assert by_name["os.name"]["scope"] == "specific"
+    assert by_name["os.name"]["adapters"] == ["Elasticsearch"]
+    # vendor only from Tufin -> specific
+    assert by_name["vendor"]["scope"] == "specific"
+    assert by_name["vendor"]["adapters"] == ["Tufin SecureTrack"]
+
+
+def test_asset_detail_mini_tables_scoped_to_host():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping",
+            ["host.name", "user.name"],
+            [["WIN-DC01", "administrator"], ["WIN-DC01", "svc_backup"],
+             ["OTHER", "eve"]]),
+    ])
+    d = merge.build_asset_detail([es], "WIN-DC01")
+    tbls = d["tables"]
+    assert len(tbls) == 1
+    t = tbls[0]
+    assert t["adapter_id"] == "elasticsearch" and t["query_id"] == "AI001"
+    # host column dropped; only this host's rows kept
+    assert t["columns"] == ["user.name"]
+    assert t["row_count"] == 2
+    assert sorted(r[0] for r in t["rows"]) == ["administrator", "svc_backup"]
+
+
+def test_asset_detail_missing_host():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping", ["host.name", "user.name"],
+            [["WIN-DC01", "administrator"]]),
+    ])
+    d = merge.build_asset_detail([es], "NOPE")
+    assert d["found"] is False
+    assert d["fields"] == [] and d["tables"] == []

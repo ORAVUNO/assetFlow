@@ -14,6 +14,7 @@ Cross-adapter reconciliation (layer 3) will build on the same shape later.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import List, Optional, Tuple
 
 HOST_KEY = "host.name"
@@ -208,4 +209,122 @@ def build_unified_inventory(blocks: List[Tuple[dict, List[dict]]]) -> dict:
         "asset_count": len(rows),
         "multi_adapter_count": multi,
         "adapters": [{"id": aid, "name": aname} for aid, aname in adapter_order],
+    }
+
+
+def build_asset_detail(blocks: List[Tuple[dict, List[dict]]], host: str) -> dict:
+    """Full cross-adapter detail for a single asset (host).
+
+    Powers the asset drill-down opened from the unified inventory. Gathers, for
+    one ``host.name``, everything every adapter reported about it and returns
+    three views of it:
+
+    - ``adapters`` — the adapters that saw this host (id + name).
+    - ``fields`` — every attribute flattened to distinct values, each tagged
+      ``common`` (reported by more than one adapter) or ``specific`` (only one),
+      with a ``preferred`` best-guess value, per-adapter values, and whether the
+      adapters ``agree``. The **preferred** value is the one the most adapters
+      report, ties broken by adapter order (the order the blocks arrive in).
+    - ``tables`` — the raw per-host rows of each contributing query, kept as
+      mini tables (users, revisions, applications, …) to expand under the asset.
+
+    ``blocks`` is ``[(adapter_info, records), ...]`` — the exporter/inventory
+    shape. Returns ``{host, found, adapters, fields, tables}``.
+    """
+    host = str(host)
+    adapters_seen: List[Tuple[str, str]] = []  # (id, name) in input order
+    seen_ids: set = set()
+    adapter_names: dict = {}
+    field_vals: dict = {}   # field name -> {adapter_id: set(values)}
+    field_order: List[str] = []
+    tables: List[dict] = []
+
+    for info, records in blocks:
+        aid = info.get("id", "?")
+        aname = info.get("name", aid)
+        adapter_names[aid] = aname
+        for rec in records:
+            cols = rec.get("columns", [])
+            hn = _col_index(cols, HOST_KEY)
+            if hn is None:
+                continue
+            hrows = [
+                r for r in rec.get("rows", [])
+                if hn < len(r) and str(r[hn]) == host
+            ]
+            if not hrows:
+                continue
+            if aid not in seen_ids:
+                seen_ids.add(aid)
+                adapters_seen.append((aid, aname))
+
+            # Aggregated fields: every non-host column's distinct values.
+            for i, c in enumerate(cols):
+                if i == hn:
+                    continue
+                name = str(c.get("name", ""))
+                if name == HOST_KEY:
+                    continue
+                if name not in field_vals:
+                    field_vals[name] = {}
+                    field_order.append(name)
+                bucket = field_vals[name].setdefault(aid, set())
+                for r in hrows:
+                    if i < len(r):
+                        _collect(bucket, r[i])
+
+            # Mini table: this query's per-host rows (host column dropped).
+            other = [i for i, c in enumerate(cols) if c.get("name") != HOST_KEY]
+            tables.append({
+                "adapter": aname,
+                "adapter_id": aid,
+                "query_id": rec.get("query_id", "?"),
+                "query_name": rec.get("name", ""),
+                "row_count": len(hrows),
+                "columns": [str(cols[i].get("name", "")) for i in other],
+                "rows": [[(r[i] if i < len(r) else "") for i in other] for r in hrows],
+            })
+
+    fields: List[dict] = []
+    for name in field_order:
+        per = {aid: vals for aid, vals in field_vals[name].items() if vals}
+        contributors = [aid for aid, _ in adapters_seen if aid in per]
+        if not contributors:
+            continue
+        scope = "common" if len(contributors) > 1 else "specific"
+        counts: Counter = Counter()
+        for aid in contributors:
+            for v in per[aid]:
+                counts[v] += 1
+        preferred = None
+        if counts:
+            top_c = max(counts.values())
+            top = [v for v, c in counts.items() if c == top_c]
+            if len(top) == 1:
+                preferred = top[0]
+            else:  # tie -> the value from the earliest-ordered adapter
+                for aid, _ in adapters_seen:
+                    hit = sorted(v for v in per.get(aid, ()) if v in top)
+                    if hit:
+                        preferred = hit[0]
+                        break
+        agree = len({tuple(sorted(per[aid])) for aid in contributors}) == 1
+        fields.append({
+            "name": name,
+            "scope": scope,
+            "adapters": [adapter_names[aid] for aid in contributors],
+            "adapter_ids": contributors,
+            "preferred": preferred,
+            "agree": agree,
+            "values_by_adapter": {
+                adapter_names[aid]: sorted(per[aid]) for aid in contributors
+            },
+        })
+
+    return {
+        "host": host,
+        "found": bool(adapters_seen),
+        "adapters": [{"id": aid, "name": aname} for aid, aname in adapters_seen],
+        "fields": fields,
+        "tables": tables,
     }

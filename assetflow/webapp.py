@@ -389,6 +389,15 @@ def create_app(
             )
         raise HTTPException(status_code=400, detail="format must be csv or json")
 
+    @app.get("/api/inventory/asset")
+    def api_inventory_asset(host: str = QueryParam(..., min_length=1)) -> dict:
+        """Full cross-adapter detail for one asset: aggregated/preferred fields
+        (tagged common vs adapter-specific) and per-query mini tables."""
+        detail = merge_mod.build_asset_detail(_blocks(None), host)
+        if not detail["found"]:
+            raise HTTPException(status_code=404, detail=f"no saved data for host {host!r}")
+        return detail
+
     @app.get("/api/export-all.{fmt}")
     def api_export_platform(fmt: str) -> Response:
         return _bundle_response("platform", _blocks(None), fmt, "assetflow-export")
@@ -529,6 +538,14 @@ INDEX_HTML = r"""<!doctype html>
   .invbtn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
           padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
   .backlink{color:var(--accent);cursor:pointer;font-weight:600}
+  .scopetag{font-size:10px;padding:1px 7px;border-radius:20px;font-weight:600;white-space:nowrap}
+  .scopetag.common{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+  .scopetag.specific{background:color-mix(in srgb,var(--info) 20%,transparent);color:var(--info)}
+  .scopetag.conflict{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+  details.asset-det{border:1px solid var(--border);border-radius:8px;margin:8px 0;background:var(--panel)}
+  details.asset-det>summary{cursor:pointer;padding:9px 12px;font-size:12.5px;font-weight:600;user-select:none}
+  details.asset-det[open]>summary{border-bottom:1px solid var(--border)}
+  details.asset-det .mini{padding:10px 12px}
 </style>
 </head>
 <body>
@@ -646,7 +663,8 @@ async function openInventory(){
   let h='<div class="gbar"><span class="backlink" onclick="showGallery()">← Back to adapters</span></div>'+
     '<h2 style="margin:6px 0 2px">Unified Inventory</h2>'+
     '<div class="sub">One row per asset (host), correlated across every adapter. '+
-    'Rows highlighted in blue are assets seen by more than one adapter.</div>'+
+    'Rows highlighted in blue are assets seen by more than one adapter. '+
+    '<b>Click a row</b> to open the asset — all fields, aggregated &amp; preferred.</div>'+
     '<div class="meta">'+d.asset_count+' asset(s) · '+d.multi_adapter_count+
     ' seen by multiple adapters · adapters: '+esc(names.join(', ')||'none')+
     ' · <a class="dl" href="/api/inventory.csv">Download CSV</a>'+
@@ -657,12 +675,95 @@ async function openInventory(){
   if(d.rows.length){
     const cols=d.columns.map(c=>c.name);
     const ci=cols.indexOf('adapter_count');
-    mountTable(t, cols, d.rows, {rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':'')});
+    mountTable(t, cols, d.rows, {
+      rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
+      onRow:r=>openAsset(r[0]),
+    });
   }else{
     t.innerHTML='<p class="hint">No host-keyed results saved yet. Open an adapter, connect, '+
       'and fetch a host query (e.g. AI001) — assets appear here as adapters report them.</p>';
   }
 }
+
+/* ---------- asset drill-down (open one host) ---------- */
+let ASSET=null, ASSET_VIEW='__all__';
+async function openAsset(host){
+  const g=document.getElementById('gallery');
+  g.innerHTML='<p class="hint">Loading asset '+esc(host)+'…</p>';
+  try{ ASSET=await j('/api/inventory/asset?host='+encodeURIComponent(host)); }
+  catch(e){ g.innerHTML='<div class="err">'+esc(e.message)+'</div>'+
+    '<p><span class="backlink" onclick="openInventory()">← Back to inventory</span></p>'; return; }
+  ASSET_VIEW='__all__';
+  renderAsset();
+}
+function renderAsset(){
+  const g=document.getElementById('gallery'), a=ASSET; if(!a) return;
+  const adapters=a.adapters;
+  let opts='<option value="__all__">All adapters (aggregated)</option>';
+  adapters.forEach(ad=>{ opts+='<option value="'+esc(ad.id)+'"'+
+    (ASSET_VIEW===ad.id?' selected':'')+'>'+esc(ad.name)+'</option>'; });
+  let h='<div class="gbar"><span class="backlink" onclick="openInventory()">← Back to inventory</span></div>'+
+    '<h2 style="margin:6px 0 2px">'+esc(a.host)+'</h2>'+
+    '<div class="sub">Seen by '+adapters.length+' adapter(s): '+esc(adapters.map(x=>x.name).join(', '))+'</div>'+
+    '<div class="controls"><label class="hint">View by adapter '+
+      '<select id="assetview" onchange="setAssetView(this.value)">'+opts+'</select></label>'+
+      '<span class="hint">'+
+        '<span class="scopetag common">common</span> = seen by 2+ adapters · '+
+        '<span class="scopetag specific">specific</span> = only this source</span>'+
+    '</div>';
+
+  const view=ASSET_VIEW;
+  const perAdapter=(view!=='__all__');
+  // ----- fields (aggregated / preferred, or one adapter's fields) -----
+  const fields=a.fields.filter(f=>!perAdapter || f.adapter_ids.indexOf(view)>=0);
+  h+='<div class="minihdr">'+(perAdapter?'Fields from this adapter':'All fields — aggregated &amp; preferred')+
+     ' <span class="hint">('+fields.length+')</span></div>';
+  if(fields.length){
+    h+='<div class="tablewrap"><table><thead><tr><th>Field</th><th>Preferred</th><th>Scope</th>'+
+       (perAdapter?'<th>This adapter</th><th>Other adapters</th>':'<th>Reported by</th><th>Values by adapter</th>')+
+       '</tr></thead><tbody>';
+    fields.forEach(f=>{
+      const tag='<span class="scopetag '+f.scope+'">'+f.scope+'</span>'+
+        (f.scope==='common'&&!f.agree?' <span class="scopetag conflict">differs</span>':'');
+      let c3,c4;
+      if(perAdapter){
+        const selName=(adapters.find(x=>x.id===view)||{}).name;
+        c3=esc((f.values_by_adapter[selName]||[]).join(', '));
+        const others=f.adapters.filter(n=>n!==selName)
+          .map(n=>esc(n)+': '+esc((f.values_by_adapter[n]||[]).join(', ')));
+        c4=others.length?others.join('<br>'):'<span class="hint">—</span>';
+      }else{
+        c3=esc(f.adapters.join(', '));
+        c4=f.adapters.map(n=>esc(n)+': '+esc((f.values_by_adapter[n]||[]).join(', '))).join('<br>');
+      }
+      h+='<tr><td><b>'+esc(f.name)+'</b></td><td>'+esc(f.preferred==null?'':f.preferred)+'</td>'+
+         '<td>'+tag+'</td><td>'+c3+'</td><td>'+c4+'</td></tr>';
+    });
+    h+='</tbody></table></div>';
+  }else{ h+='<p class="hint">No scalar fields for this selection.</p>'; }
+
+  // ----- mini tables (users, revisions, applications, …) -----
+  const tbls=a.tables.filter(t=>!perAdapter || t.adapter_id===view);
+  h+='<div class="sheethdr">Detail tables — click to expand</div>';
+  if(tbls.length){
+    tbls.forEach((t,idx)=>{
+      const single=(a.adapters.length<2);
+      const src=perAdapter?'':(esc(t.adapter)+' · ');
+      h+='<details class="asset-det"'+(tbls.length===1?' open':'')+'>'+
+         '<summary>'+src+esc(t.query_id)+' — '+esc(t.query_name)+
+         ' <span class="hint">('+t.row_count+' row'+(t.row_count===1?'':'s')+')</span></summary>'+
+         '<div class="mini" data-t="'+idx+'"></div></details>';
+    });
+  }else{ h+='<p class="hint">No detail tables for this selection.</p>'; }
+  g.innerHTML=h;
+
+  tbls.forEach((t,idx)=>{
+    const el=g.querySelector('.mini[data-t="'+idx+'"]');
+    if(el && t.rows.length) mountTable(el, t.columns, t.rows, {filter:false});
+    else if(el) el.innerHTML='<p class="hint">(no rows)</p>';
+  });
+}
+function setAssetView(v){ ASSET_VIEW=v; renderAsset(); }
 
 /* ---------- workspace ---------- */
 async function openAdapter(id){
@@ -748,6 +849,10 @@ function mountTable(container, cols, rows, opts){
         r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
     tw.querySelectorAll('th').forEach(th=>th.onclick=()=>{
       const i=+th.dataset.i; if(sort.col===i)sort.dir*=-1; else{sort.col=i;sort.dir=1;} draw();});
+    if(opts.onRow){
+      tw.querySelectorAll('tbody tr').forEach((tr,idx)=>{
+        tr.style.cursor='pointer'; tr.onclick=()=>opts.onRow(rs[idx]);});
+    }
   }
   if(fin) fin.oninput=draw;
   draw();

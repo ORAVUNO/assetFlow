@@ -144,6 +144,20 @@ def test_unified_inventory(client):
     assert client.get("/api/inventory.xml").status_code == 400
 
 
+def test_inventory_asset_detail(client):
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")  # host.name + LoginCount
+    d = client.get("/api/inventory/asset?host=host-a").json()
+    assert d["found"] is True and d["host"] == "host-a"
+    assert any(a["id"] == "elasticsearch" for a in d["adapters"])
+    # LoginCount is a field of this single-adapter asset -> specific
+    lc = next((f for f in d["fields"] if f["name"] == "LoginCount"), None)
+    assert lc is not None and lc["scope"] == "specific"
+    # the AI001 result is available as a mini table
+    assert any(t["query_id"] == "AI001" for t in d["tables"])
+    # unknown host -> 404
+    assert client.get("/api/inventory/asset?host=nope").status_code == 404
+
+
 def test_run_placeholder_rejected(client):
     # All shipped queries are now runnable, so force one non-runnable to exercise
     # the 422 "no query defined" branch.

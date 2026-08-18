@@ -151,6 +151,19 @@ Tufin SecureTrack becomes a single row.
 - Downloadable as CSV/JSON, and available over the API at `/api/inventory`
   (`/api/inventory.csv`, `/api/inventory.json`).
 
+**Click any asset row** to open its drill-down (API: `/api/inventory/asset?host=…`):
+
+- **All fields — aggregated & preferred.** Every attribute the adapters
+  reported, flattened to distinct values, each with a **preferred** best-guess
+  value (the value the most adapters agree on) and a per-adapter breakdown. Each
+  field is tagged **common** (reported by 2+ adapters) or **specific** (only one
+  source); a **differs** flag marks common fields whose adapters disagree.
+- **View by adapter.** A dropdown switches from the aggregated view to a single
+  adapter — showing exactly the fields *that* adapter provides, still tagged
+  common vs specific to it.
+- **Detail tables.** Multi-row fields (users, revisions, applications, …) are
+  kept as their original per-query tables and expand in place under the asset.
+
 **Connecting from the browser:** click **Connection** in the header to open a
 form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;
 you can also paste a full URL), **username**, **password**, toggle **Verify TLS
