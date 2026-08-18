@@ -77,9 +77,11 @@ def test_unified_inventory_flags_multi_adapter_assets():
     inv = merge.build_unified_inventory([es, tufin])
 
     names = [c["name"] for c in inv["columns"]]
-    assert names[:4] == ["host.name", "host.ip", "seen_by", "adapter_count"]
+    assert names[:6] == [
+        "host.name", "aliases", "host.ip", "seen_by", "adapter_count", "correlated_by",
+    ]
     # one column per contributing adapter, in input order
-    assert names[4:] == ["Elasticsearch", "Tufin SecureTrack"]
+    assert names[6:] == ["Elasticsearch", "Tufin SecureTrack"]
 
     assert inv["asset_count"] == 2
     assert inv["multi_adapter_count"] == 1
@@ -98,6 +100,57 @@ def test_unified_inventory_flags_multi_adapter_assets():
     assert app[names.index("Tufin SecureTrack")] == ""
 
 
+def test_unified_inventory_merges_different_names_by_shared_ip():
+    # Same machine, two different hostnames, correlated by a shared IP.
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping",
+            ["host.name", "host.ip", "user.name"],
+            [["WIN-DC01", "10.0.0.5", "administrator"]]),
+    ])
+    tufin = _block("tufin", "Tufin SecureTrack", [
+        rec("TUF001", "Device Inventory",
+            ["host.name", "host.ip", "vendor"],
+            [["dc01.corp.local", "10.0.0.5", "Check Point"]]),
+    ])
+    inv = merge.build_unified_inventory([es, tufin])
+    # one asset, not two — merged on the shared IP
+    assert inv["asset_count"] == 1
+    assert inv["multi_adapter_count"] == 1
+    assert inv["correlated_count"] == 1
+    names = [c["name"] for c in inv["columns"]]
+    row = inv["rows"][0]
+    # aliases column carries the other name; correlated_by names the shared IP
+    aliases = row[names.index("aliases")]
+    assert "dc01.corp.local" in aliases or "WIN-DC01" in aliases
+    assert "10.0.0.5" in row[names.index("correlated_by")]
+
+
+def test_correlate_matches_mac_across_separators():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI020", "Host Inventory", ["host.name", "host.mac"],
+            [["A", "AA:BB:CC:DD:EE:FF"]]),
+    ])
+    tufin = _block("tufin", "Tufin", [
+        rec("TUF020", "Devices", ["host.name", "host.mac"],
+            [["B", "aa-bb-cc-dd-ee-ff"]]),
+    ])
+    res = merge.correlate([es, tufin])
+    assert len(res["assets"]) == 1  # different names + separators, same MAC
+    assert res["assets"][0]["match_by"].get("mac")
+
+
+def test_correlate_ignores_junk_identifiers():
+    # A shared junk IP (0.0.0.0) must NOT merge two distinct hosts.
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "x", ["host.name", "host.ip"], [["HOST-A", "0.0.0.0"]]),
+    ])
+    tufin = _block("tufin", "Tufin", [
+        rec("TUF001", "y", ["host.name", "host.ip"], [["HOST-B", "0.0.0.0"]]),
+    ])
+    res = merge.correlate([es, tufin])
+    assert len(res["assets"]) == 2
+
+
 def test_unified_inventory_skips_non_host_keyed():
     es = _block("elasticsearch", "Elasticsearch", [
         rec("AI010", "App by Service", ["service.name", "Hosts"], [["Elastic Agent", 12]]),
@@ -106,7 +159,7 @@ def test_unified_inventory_skips_non_host_keyed():
     assert inv["asset_count"] == 0
     # no adapter contributed a host, so no per-adapter columns
     assert [c["name"] for c in inv["columns"]] == [
-        "host.name", "host.ip", "seen_by", "adapter_count",
+        "host.name", "aliases", "host.ip", "seen_by", "adapter_count", "correlated_by",
     ]
     assert inv["adapters"] == []
 
@@ -165,6 +218,27 @@ def test_asset_detail_mini_tables_scoped_to_host():
     assert t["columns"] == ["user.name"]
     assert t["row_count"] == 2
     assert sorted(r[0] for r in t["rows"]) == ["administrator", "svc_backup"]
+
+
+def test_asset_detail_lookup_by_alias():
+    # Asset merged by IP under two names; detail is reachable by either name.
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping", ["host.name", "host.ip", "user.name"],
+            [["WIN-DC01", "10.0.0.5", "administrator"]]),
+    ])
+    tufin = _block("tufin", "Tufin SecureTrack", [
+        rec("TUF001", "Device Inventory", ["host.name", "host.ip", "vendor"],
+            [["dc01.corp.local", "10.0.0.5", "Check Point"]]),
+    ])
+    blocks = [es, tufin]
+    for lookup in ("WIN-DC01", "dc01.corp.local"):
+        d = merge.build_asset_detail(blocks, lookup)
+        assert d["found"] is True
+        assert len(d["adapters"]) == 2
+        assert set(d["names"]) == {"WIN-DC01", "dc01.corp.local"}
+        assert "10.0.0.5" in d["correlated_by"].get("ip", [])
+        # both adapters' fields present
+        assert {"vendor", "user.name"} <= {f["name"] for f in d["fields"]}
 
 
 def test_asset_detail_missing_host():

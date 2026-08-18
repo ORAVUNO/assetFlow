@@ -662,11 +662,12 @@ async function openInventory(){
   const names=d.adapters.map(a=>a.name);
   let h='<div class="gbar"><span class="backlink" onclick="showGallery()">← Back to adapters</span></div>'+
     '<h2 style="margin:6px 0 2px">Unified Inventory</h2>'+
-    '<div class="sub">One row per asset (host), correlated across every adapter. '+
-    'Rows highlighted in blue are assets seen by more than one adapter. '+
-    '<b>Click a row</b> to open the asset — all fields, aggregated &amp; preferred.</div>'+
+    '<div class="sub">One row per asset, correlated across every adapter by shared '+
+    'identifiers (hostname, IP, MAC, serial). Rows highlighted in blue are seen by '+
+    'more than one adapter. <b>Click a row</b> to open the asset.</div>'+
     '<div class="meta">'+d.asset_count+' asset(s) · '+d.multi_adapter_count+
-    ' seen by multiple adapters · adapters: '+esc(names.join(', ')||'none')+
+    ' seen by multiple adapters · '+(d.correlated_count||0)+' merged via shared identifiers'+
+    ' · adapters: '+esc(names.join(', ')||'none')+
     ' · <a class="dl" href="/api/inventory.csv">Download CSV</a>'+
     ' · <a class="dl" href="/api/inventory.json">Download JSON</a></div>'+
     '<div id="invtable"></div>';
@@ -702,9 +703,19 @@ function renderAsset(){
   let opts='<option value="__all__">All adapters (aggregated)</option>';
   adapters.forEach(ad=>{ opts+='<option value="'+esc(ad.id)+'"'+
     (ASSET_VIEW===ad.id?' selected':'')+'>'+esc(ad.name)+'</option>'; });
+  const IDLBL={ip:'host.ip',mac:'host.mac',serial:'serial',uid:'id',name:'host.name'};
+  const cb=a.correlated_by||{};
+  const cbtxt=['mac','serial','uid','ip'].filter(k=>cb[k]&&cb[k].length)
+    .map(k=>esc(IDLBL[k])+' '+esc(cb[k].join(', '))).join(' · ');
+  const ident=a.identities||{};
+  const identtxt=['ip','mac','serial','uid'].filter(k=>ident[k]&&ident[k].length)
+    .map(k=>esc(IDLBL[k])+': '+esc(ident[k].join(', '))).join(' · ');
   let h='<div class="gbar"><span class="backlink" onclick="openInventory()">← Back to inventory</span></div>'+
     '<h2 style="margin:6px 0 2px">'+esc(a.host)+'</h2>'+
-    '<div class="sub">Seen by '+adapters.length+' adapter(s): '+esc(adapters.map(x=>x.name).join(', '))+'</div>'+
+    '<div class="sub">Seen by '+adapters.length+' adapter(s): '+esc(adapters.map(x=>x.name).join(', '))+
+    ((a.aliases&&a.aliases.length)?(' · also known as: '+esc(a.aliases.join(', '))):'')+'</div>'+
+    (identtxt?'<div class="meta">Identifiers: '+identtxt+'</div>':'')+
+    (cbtxt?'<div class="meta">🔗 Correlated across adapters by '+cbtxt+'</div>':'')+
     '<div class="controls"><label class="hint">View by adapter '+
       '<select id="assetview" onchange="setAssetView(this.value)">'+opts+'</select></label>'+
       '<span class="hint">'+

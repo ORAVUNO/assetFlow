@@ -138,14 +138,21 @@ This is the intra-adapter merge.
 ### Unified inventory (across all adapters)
 
 The **★ Unified inventory** button on the adapter gallery is the cross-adapter
-view: it folds every adapter's host-keyed results into **one asset per host** and
-shows *which adapters saw it*. This is where the same host reported by more than
-one source is reconciled — e.g. a server that appears in both Elasticsearch and
-Tufin SecureTrack becomes a single row.
+view: it folds every adapter's host-keyed results into **one asset per machine**
+and shows *which adapters saw it*. This is where the same host reported by more
+than one source is reconciled.
 
-- **One row per asset (host)**, with `host.name`, `host.ip`, a **Seen by** list
-  of the adapters that reported it, an **adapter count**, and one column per
-  adapter summarizing what that adapter captured for the host.
+- **Correlated on shared identifiers, not just the hostname.** Assets are merged
+  by matching any shared identifier — `host.name`, `host.ip`, `host.mac`,
+  serial, or cloud instance id (MACs are matched regardless of `:`/`-`
+  formatting; empty/loopback/all-zero placeholders are ignored). So a machine
+  reported as `WIN-DC01` by one adapter and `dc01.corp.local` by another
+  collapses into **one** asset when they share, e.g., an IP or MAC. The other
+  names appear in an **aliases** column, and a **correlated by** column shows
+  which identifier merged them.
+- **One row per asset**, with the primary `host.name`, `aliases`, `host.ip`, a
+  **Seen by** list of the adapters that reported it, an **adapter count**,
+  **correlated by**, and one column per adapter summarizing what it captured.
 - **Assets seen by multiple adapters surface first** and are highlighted, so
   overlap between sources is immediately visible.
 - Downloadable as CSV/JSON, and available over the API at `/api/inventory`
