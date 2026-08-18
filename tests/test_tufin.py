@@ -329,6 +329,37 @@ def test_incremental_without_store_falls_back_to_latest_two():
     assert result.row_count == 1  # no store -> behaves like the latest-two default
 
 
+def test_change_log_dedupes_across_fetches_and_modes(tmp_path):
+    from assetflow import db
+    db.init_engine(f"sqlite:///{tmp_path}/c.db")
+    cols = [{"name": n} for n in [
+        "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
+        "rule.uid", "before", "after", "authorized", "requester",
+    ]]
+    row = ["HQ", "1052", "2026-07-26 19:42:11", "jane", "modified", "r10",
+           "a → b : tcp/8443 (accept)", "a → b : tcp/443 (accept)", "unauthorized", "Alice"]
+    res = QueryResult(columns=cols, rows=[row])
+
+    # First fetch records the change.
+    assert db.record_changes("tufin", res) == 1
+    # Re-fetching the same change (any mode) inserts nothing.
+    assert db.record_changes("tufin", res) == 0
+
+    # A distinct change (different rule + type) is added once.
+    row2 = list(row)
+    row2[4], row2[5] = "added", "r30"
+    assert db.record_changes("tufin", QueryResult(columns=cols, rows=[row2])) == 1
+
+    # A batch containing an in-batch duplicate only counts it once.
+    assert db.record_changes("tufin", QueryResult(columns=cols, rows=[row, row2, list(row)])) == 0
+
+    log = db.change_log("tufin")
+    assert len(log["rows"]) == 2
+    assert [c["name"] for c in log["columns"]][:2] == ["host.name", "revision.id"]
+    # scoped per adapter
+    assert db.change_log("elasticsearch")["rows"] == []
+
+
 def test_db_change_watermark_roundtrip(tmp_path):
     from assetflow import db
     db.init_engine(f"sqlite:///{tmp_path}/w.db")

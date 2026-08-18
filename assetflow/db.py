@@ -16,7 +16,17 @@ import os
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import DateTime, Integer, String, Text, create_engine, desc, func, select
+from sqlalchemy import (
+    DateTime,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    desc,
+    func,
+    select,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .models import Query
@@ -77,6 +87,59 @@ class ChangeWatermark(Base):
     device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     revision_id: Mapped[str] = mapped_column(String(64), default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class TufinChange(Base):
+    """Deduplicated Tufin change-log sink.
+
+    Every change-detail fetch (any mode — window, All time, or incremental)
+    upserts its rows here keyed by the globally-unique revision id plus the rule
+    and change type, so the same change is stored **exactly once** no matter how
+    many times or in which mode it is fetched. This is the cumulative change log,
+    separate from the per-fetch snapshots in ``fetch_runs``.
+    """
+
+    __tablename__ = "tufin_changes"
+    __table_args__ = (
+        UniqueConstraint(
+            "adapter", "revision_id", "rule_uid", "change_type", name="uq_tufin_change"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(64), index=True)
+    revision_id: Mapped[str] = mapped_column(String(64), default="")
+    rule_uid: Mapped[str] = mapped_column(String(128), default="")
+    change_type: Mapped[str] = mapped_column(String(16), default="")
+    device_name: Mapped[str] = mapped_column(String(256), default="")
+    changed_by: Mapped[str] = mapped_column(String(256), default="")
+    changed_at: Mapped[str] = mapped_column(String(64), default="")
+    before: Mapped[str] = mapped_column(Text, default="")
+    after: Mapped[str] = mapped_column(Text, default="")
+    authorized: Mapped[str] = mapped_column(String(32), default="")
+    requester: Mapped[str] = mapped_column(String(256), default="")
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def to_record(self) -> dict:
+        return {
+            "host.name": self.device_name,
+            "revision.id": self.revision_id,
+            "@timestamp": self.changed_at,
+            "changed_by": self.changed_by,
+            "change_type": self.change_type,
+            "rule.uid": self.rule_uid,
+            "before": self.before,
+            "after": self.after,
+            "authorized": self.authorized,
+            "requester": self.requester,
+        }
+
+
+# Column order for the change-log view (matches the change_detail result shape).
+_CHANGE_COLUMNS = [
+    "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
+    "rule.uid", "before", "after", "authorized", "requester",
+]
 
 
 _engine = None
@@ -165,6 +228,76 @@ def latest_all(adapter: Optional[str] = None, include_data: bool = True) -> List
             .order_by(FetchRun.adapter, FetchRun.query_id)
         )
         return [r.to_record(include_data) for r in s.scalars(stmt).all()]
+
+
+def record_changes(adapter: str, result) -> int:
+    """Upsert change-detail rows into the deduped change log; return new count.
+
+    ``result`` is a ``QueryResult`` (columns + rows) from the change_detail
+    resource. Rows already present (same adapter + revision id + rule uid +
+    change type) are skipped, so re-fetching in any mode never duplicates a
+    change. Returns how many rows were newly inserted.
+    """
+    rows = result.to_dicts()
+    if not rows:
+        return 0
+    rev_ids = {str(r.get("revision.id", "")) for r in rows}
+    with _session() as s:
+        existing = {
+            (r.revision_id, r.rule_uid, r.change_type)
+            for r in s.scalars(
+                select(TufinChange).where(
+                    TufinChange.adapter == adapter,
+                    TufinChange.revision_id.in_(rev_ids),
+                )
+            )
+        }
+        now = datetime.now(timezone.utc)
+        inserted = 0
+        for r in rows:
+            key = (
+                str(r.get("revision.id", "")),
+                str(r.get("rule.uid", "")),
+                str(r.get("change_type", "")),
+            )
+            if key in existing:  # already stored, or seen earlier in this batch
+                continue
+            existing.add(key)
+            s.add(
+                TufinChange(
+                    adapter=adapter,
+                    revision_id=key[0],
+                    rule_uid=key[1],
+                    change_type=key[2],
+                    device_name=str(r.get("host.name", "")),
+                    changed_by=str(r.get("changed_by", "")),
+                    changed_at=str(r.get("@timestamp", "")),
+                    before=str(r.get("before", "")),
+                    after=str(r.get("after", "")),
+                    authorized=str(r.get("authorized", "")),
+                    requester=str(r.get("requester", "")),
+                    first_seen_at=now,
+                )
+            )
+            inserted += 1
+        s.commit()
+        return inserted
+
+
+def change_log(adapter: str, limit: int = 1000) -> dict:
+    """Return the deduplicated change log for an adapter (newest first)."""
+    with _session() as s:
+        stmt = (
+            select(TufinChange)
+            .where(TufinChange.adapter == adapter)
+            .order_by(desc(TufinChange.id))
+            .limit(limit)
+        )
+        rows = [c.to_record() for c in s.scalars(stmt)]
+    return {
+        "columns": [{"name": c} for c in _CHANGE_COLUMNS],
+        "rows": [[rec[c] for c in _CHANGE_COLUMNS] for rec in rows],
+    }
 
 
 def get_change_watermark(adapter: str, device_id: str) -> Optional[str]:
