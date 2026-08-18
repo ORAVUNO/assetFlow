@@ -203,14 +203,23 @@ The **time-range** control (24h/7d/30d/90d) bounds a revisions fetch to recent
 changes, filtered on the revision timestamp.
 
 `TUF002` gives the revision *history* (a snapshot per revision). To see **what
-actually changed** in each revision, `TUF008` (**Change Detail**) diffs each
-device's two most recent revisions rule-by-rule and emits one row per change —
-`change_type` (added/modified/removed) with a `before → after` summary, plus the
-acting admin and timestamp. When SecureChange ticket authorization is enabled
+actually changed** in each revision, `TUF008` (**Change Detail**) diffs a
+device's revisions rule-by-rule and emits one row per change — `change_type`
+(added/modified/removed) with a `before → after` summary, plus the acting admin
+and timestamp. When SecureChange ticket authorization is enabled
 (`/change_authorization`), it also fills in whether each change was
 **authorized** and who **requested** it. (SecureTrack exposes revision
 snapshots, not a field-level changelog, so this "what changed" view is computed
 by comparison; a pure rule rename is intentionally *not* counted as a change.)
+
+**Which revisions get compared** is driven by the **time-range** control: pick
+`24h/7d/30d/90d` and it diffs every revision in that window (plus the one just
+before it as a baseline), so you get *every* change in the period, each with its
+own actor and timestamp — not just the latest one. With **All time** it diffs
+only the two most recent revisions. The number of pairs per device is capped so
+a wide range on a busy firewall stays bounded; for continuous coverage, run it
+on a schedule (every 5–15 min) — each fetch is saved to the database, building
+history over time.
 
 ### Other asset-intelligence data available from Tufin
 
