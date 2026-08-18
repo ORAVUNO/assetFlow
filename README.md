@@ -2,16 +2,21 @@
 
 Asset-intelligence tool that fetches assets from pluggable **adapters** (data
 sources), shows them in a local web UI, and persists every fetch to a local
-database. Elasticsearch is the first adapter; more sources plug in beside it,
-grouped by category, so results from many sources can later be merged.
+database. Elasticsearch is the first adapter and Tufin SecureTrack is the
+second; more sources plug in beside them, grouped by category, so results from
+many sources can later be merged.
 
 - **Adapters:** each adapter has its own metadata, query registry, and live
   connection. The UI lists adapters by category; you open one adapter's panel
   to connect and fetch. Today: **Elasticsearch** (category *SIEM / Log
-  Analytics*).
+  Analytics*) and **Tufin SecureTrack** (category *Network Security Policy* —
+  see [Tufin adapter](#tufin-securetrack-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 17 ES|QL queries grouped into 6 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity).
+  `config/tufin_registry.yaml` — the Tufin adapter's 8 SecureTrack resources in
+  7 feeds (Device Inventory, Change History, Policy Rules, Network Objects &
+  Services, Segmentation, Policy Hygiene, Audit Events).
 - **Database:** fetched results are saved to a local SQLite file
   (`assetflow.db`, gitignored). The newest run per query is the panel's saved
   view; older runs form the history. Real telemetry never leaves your machine.
@@ -22,8 +27,10 @@ grouped by category, so results from many sources can later be merged.
 ## Requirements
 
 - Python 3.9+
-- Network access to your Elasticsearch (8.11+ for ES|QL) and credentials
-  (an API key, or a username/password).
+- For the Elasticsearch adapter: network access to your Elasticsearch (8.11+
+  for ES|QL) and credentials (an API key, or a username/password).
+- For the Tufin adapter: network access to your Tufin SecureTrack host and a
+  SecureTrack API user (host + username + password).
 
 ## Setup
 
@@ -146,6 +153,84 @@ your credentials and data never leave your machine. Change the bind with
 `assetflow serve --host 0.0.0.0 --port 9000` if you need to (localhost is
 recommended).
 
+## Tufin SecureTrack adapter
+
+The second adapter fetches **network security policy** asset intelligence from
+[Tufin SecureTrack](https://www.tufin.com/tufin-orchestration-suite/securetrack)
+over its REST API (`https://<host>/securetrack/api/`, HTTP Basic auth with a
+SecureTrack API user). It plugs into the same framework as Elasticsearch: a
+registry of resources, a live connection, saved fetches, the unified host view,
+and CSV/JSON/ZIP export.
+
+Instead of an ES|QL body, each Tufin registry entry names a **resource** that
+the adapter maps to one or more SecureTrack endpoints and normalizes into the
+same column/row shape. Device-scoped resources emit a `host.name` column (the
+device/CI name), so they fold into the *All Fetched Results* golden records
+right alongside the Elasticsearch host-keyed queries.
+
+### What it fetches
+
+| ID | Resource | Feed | SecureTrack endpoint(s) |
+|---|---|---|---|
+| TUF001 | Device inventory | Device Inventory | `devices.json?show_os_version=true` |
+| TUF002 | **Device revisions — who changed what, when** | Change History | `devices/{id}/revisions.json` |
+| TUF003 | Effective policy rules | Policy Rules | `revisions/{latest}/rules.json`, `devices/{id}/rules.json` |
+| TUF004 | Network objects | Network Objects & Services | `devices/{id}/network_objects.json` |
+| TUF005 | Services | Network Objects & Services | `devices/{id}/services.json` |
+| TUF006 | Zones (segmentation) | Segmentation & Topology | `zones.json` |
+| TUF007 | Rule cleanups (shadowed/unused) | Policy Hygiene | `devices/{id}/cleanups.json` |
+| TUF008 | Audit / change events | Audit & Change Events | `audit_logs.json` (varies by TOS version) |
+
+### Rich per-revision change intelligence (the headline)
+
+`TUF002` is the resource that answers *"who changed what, and when?"*. Each
+SecureTrack **revision** is a point-in-time snapshot of a device's policy, and
+the API exposes, per revision:
+
+- **`changed_by`** — the administrator who made the change (SecureTrack's
+  `admin_name`). For most vendors this is exposed directly; for Cisco,
+  Fortinet, Juniper, and Palo Alto it is populated when the device is monitored
+  with **syslog**.
+- **`@timestamp`** — when the revision was created/received.
+- **`action`** — the operation performed.
+- **`ticket`** — the change ticket (`ticket_cr`) linked to the revision, the
+  seam to change-management/approval workflows.
+- **`policy_package`**, **`authorization_status`**, and the revision **comment**.
+
+The **time-range** control (24h/7d/30d/90d) bounds a revisions/audit fetch to
+recent changes, filtered on the revision timestamp. For an even richer signal,
+`TUF008` reads SecureTrack **audit-log** events, which additionally carry the
+actor role, **source IP**, auth method, and change type — though the log
+endpoint's availability depends on the TOS version and enabled products
+(SecureTrack vs SecureChange).
+
+### Other asset-intelligence data available from Tufin
+
+Beyond change detection, SecureTrack is a rich asset source: the **device
+inventory** (vendor/model/OS), the **effective rulebase** per device, the
+**network object** and **service** inventories (the hosts, subnets, groups, and
+ports each firewall protects), **zones** for segmentation matrices, and
+**cleanup** findings (shadowed/unused/disabled rules) that flag policy drift and
+risk. Follow-ups the REST API also supports include topology interfaces and
+paths, security-policy (USP) matrices, rule documentation, and policy-analysis
+queries — natural next resources to add to the registry.
+
+### Connecting
+
+In the web UI, open the **Tufin SecureTrack** card and click **Connection**:
+enter the **host** (or IP), **username**, **password**, the **API base path**
+(defaults to `/securetrack/api`), and toggle **Verify TLS certificate** (keep it
+on for production certs; disable only for a lab/self-signed environment). Or set
+`TOS_HOSTNAME` / `TOS_USERNAME` / `TOS_PASSWORD` in `.env` (see `.env.example`)
+to auto-connect on startup. As with Elasticsearch, credentials entered in the
+form are held in the local server's memory only and never written to disk.
+
+> **Validation status.** The SecureTrack endpoint *paths* are confirmed from
+> Tufin's official REST API / pytos SDK, but the field mapping is best-effort
+> and marked `partially_validated` / `investigation_required` until confirmed
+> against a live TOS release in the target environment — the same honest
+> labeling the Elasticsearch registry uses.
+
 ## CLI reference
 
 | Command | What it does |
@@ -159,7 +244,12 @@ recommended).
 | `assetflow run-feed <FEED_ID> [--limit N]` | Execute every runnable query in a feed. |
 
 Point at a registry elsewhere with the global `--registry` option, e.g.
-`assetflow --registry /path/to/registry.yaml validate`.
+`assetflow --registry /path/to/registry.yaml validate`. The registry commands
+(`validate`, `feeds`, `list`, `show`) are adapter-agnostic and work with the
+Tufin registry too — e.g. `assetflow --registry config/tufin_registry.yaml
+list`. Live fetching from the CLI (`run`, `run-feed`, `test-connection`) targets
+Elasticsearch; **the Tufin adapter is driven from the web UI** (`assetflow
+serve`), which is the multi-adapter surface.
 
 ### Examples
 
