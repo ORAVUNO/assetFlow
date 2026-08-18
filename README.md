@@ -188,14 +188,16 @@ SecureTrack **revision** is a point-in-time snapshot of a device's policy, and
 the API exposes, per revision:
 
 - **`changed_by`** — the administrator who made the change (SecureTrack's
-  `admin_name`). For most vendors this is exposed directly; for Cisco,
-  Fortinet, Juniper, and Palo Alto it is populated when the device is monitored
-  with **syslog**.
-- **`@timestamp`** — when the revision was created/received.
-- **`action`** — the operation performed.
-- **`ticket`** — the change ticket (`ticket_cr`) linked to the revision, the
-  seam to change-management/approval workflows.
-- **`policy_package`**, **`authorization_status`**, and the revision **comment**.
+  `admin`). For most vendors this is exposed directly; for Cisco, Fortinet,
+  Juniper, and Palo Alto it is populated when the device is monitored with
+  **syslog**.
+- **`gui_client`** — the client/tool the change was made from (`guiClient`).
+- **`@timestamp`** — when the revision was created (`date` + `time`).
+- **`action`** — the operation performed (e.g. "Policy Installed").
+- **`ticket`** — the change ticket(s) linked to the revision
+  (`tickets.ticket[].id`), the seam to change-management/approval workflows.
+- **`policy_package`**, **`authorization_status`**, the revision **comment**,
+  plus the revision id and its per-device order number.
 
 The **time-range** control (24h/7d/30d/90d) bounds a revisions/audit fetch to
 recent changes, filtered on the revision timestamp. For an even richer signal,
@@ -225,11 +227,14 @@ on for production certs; disable only for a lab/self-signed environment). Or set
 to auto-connect on startup. As with Elasticsearch, credentials entered in the
 form are held in the local server's memory only and never written to disk.
 
-> **Validation status.** The SecureTrack endpoint *paths* are confirmed from
-> Tufin's official REST API / pytos SDK, but the field mapping is best-effort
-> and marked `partially_validated` / `investigation_required` until confirmed
-> against a live TOS release in the target environment — the same honest
-> labeling the Elasticsearch registry uses.
+> **Validation status.** Endpoint paths **and** field mappings are confirmed
+> against the **SecureTrack 25.2 (TOS R25-2)** Swagger — see
+> [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md)
+> for the DTO field reference. Resources stay marked `partially_validated` /
+> `investigation_required` until also run against a live TOS box (the same
+> honest labeling the Elasticsearch registry uses); the schema is now accurate,
+> the live run is the remaining step. Point the adapter at a different release
+> and re-check the fields against that box's `/securetrack/apidoc/`.
 
 ## CLI reference
 

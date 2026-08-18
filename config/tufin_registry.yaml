@@ -29,7 +29,10 @@
 
 metadata:
   version: 1
-  description: Tufin SecureTrack configuration, change-history, and asset-intelligence resources.
+  description: >-
+    Tufin SecureTrack configuration, change-history, and asset-intelligence
+    resources. Endpoint paths and field mappings confirmed against the
+    SecureTrack REST API for TOS R25-2 (SecureTrack 25.2 Swagger).
   query_language: SecureTrack REST
   status_values:
     - validated
@@ -110,17 +113,22 @@ queries:
     resource: devices
     purpose: Inventory every device SecureTrack manages, with vendor, model, management IP, and OS version.
     expected_output_fields:
-      - host.name        # device / CI name
+      - host.name          # device / CI name (DetailedDeviceDTO.name)
       - device.id
-      - device.vendor
-      - device.model
-      - host.ip          # management IP
-      - os.version
-      - device.domain
+      - device.vendor      # DetailedDeviceDTO.vendor
+      - device.model       # DetailedDeviceDTO.model
+      - host.ip            # DetailedDeviceDTO.ip
+      - os.version         # DetailedDeviceDTO.OS_Version
+      - device.domain      # DetailedDeviceDTO.domain_name
+      - device.status      # DetailedDeviceDTO.status / offline
+      - installed_policy   # DetailedDeviceDTO.installed_policy
     notes: >-
-      GET /securetrack/api/devices.json?show_os_version=true. host.name is the
-      device name so the row folds into the unified host view. The anchor for
-      every other Tufin resource, which is keyed by device id.
+      GET /securetrack/api/devices.json?show_os_version=true. Fields confirmed
+      against DetailedDeviceDTO (R25-2): name, vendor, model, ip, OS_Version,
+      domain_name, status, installed_policy (also exposes offline flag,
+      latest_revision, licenses, topology). host.name is the device name so the
+      row folds into the unified host view; it is the anchor for every other
+      Tufin resource, which is keyed by device id.
     recommended_refresh_frequency: Daily
 
   - id: TUF002
@@ -134,18 +142,23 @@ queries:
       signal: which administrator changed the policy, when, under which ticket and action.
     expected_output_fields:
       - host.name              # device
-      - revision.id
-      - "@timestamp"           # revision date/time
-      - changed_by             # SecureTrack admin_name (device admin via syslog for some vendors)
-      - action
-      - ticket                 # ticket_cr / ticket id linked to the change
-      - policy_package
-      - authorization_status
-      - comment
+      - revision.id            # RevisionDTO.id (global id, used by /revisions/{id})
+      - revision.number        # RevisionDTO.revisionId (order on the device)
+      - "@timestamp"           # RevisionDTO.date + time
+      - changed_by             # RevisionDTO.admin (device admin via syslog for some vendors)
+      - gui_client             # RevisionDTO.guiClient (client/tool that made the change)
+      - action                 # RevisionDTO.action
+      - ticket                 # RevisionDTO.tickets.ticket[].id linked to the change
+      - policy_package         # RevisionDTO.policyPackage
+      - authorization_status   # RevisionDTO.authorizationStatus
+      - comment                # RevisionDTO.comment.comment
     notes: >-
       GET /securetrack/api/devices/{id}/revisions.json for each device (scan
-      capped to bound REST calls; rows capped by limit). Each revision is a
-      point-in-time snapshot; the admin who made the change is exposed directly
+      capped to bound REST calls; rows capped by limit). Field mapping confirmed
+      against RevisionDTO (R25-2): id + revisionId, split date/time, admin,
+      guiClient, action, nested comment, and a tickets wrapper (ticket[].id).
+      The DTO also carries auditLog and manualAuthorization (status/user/dateTime
+      — who authorized the change and when). The acting admin is exposed directly
       for most vendors, and via syslog monitoring for Cisco/Fortinet/Juniper/
       Palo Alto. Supports the time-range control to bound to recent changes.
     recommended_refresh_frequency: Every 5-15 minutes

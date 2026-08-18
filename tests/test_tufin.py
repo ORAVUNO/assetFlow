@@ -88,28 +88,37 @@ def test_devices_resource_is_host_keyed():
 
 
 def test_revisions_expose_who_what_when():
+    # Shape mirrors SecureTrack R25-2 RevisionDTO: id/revisionId, split
+    # date+time, admin, guiClient, nested comment, and a tickets wrapper.
     mapping = dict(DEVICES)
     mapping["devices/1/revisions.json"] = {
         "revisions": [
             {
-                "revision_id": "1052",
-                "date": "2026-07-26T19:42:11Z",
-                "admin_name": "jane.admin",
-                "action": "created",
-                "ticket_cr": "CR-100",
-                "policy_package": "HQ perimeter policy",
-                "authorization_status": "authorized",
-                "comment": "added vendor VPN rule",
+                "id": "1052",
+                "revisionId": "37",
+                "date": "2026-07-26",
+                "time": "19:42:11",
+                "admin": "jane.admin",
+                "guiClient": "SmartConsole@10.2.44.18",
+                "action": "Policy Installed",
+                "policyPackage": "HQ perimeter policy",
+                "authorizationStatus": "authorized",
+                "comment": {"comment": "added vendor VPN rule", "editor": "jane.admin"},
+                "tickets": {"ticket": [{"id": "CR-100", "source": "SecureChange"}]},
             }
         ]
     }
     result = tufin_runner_mod.run_query(FakeClient(mapping), _q("revisions"))
     row = dict(zip(result.column_names, result.rows[0]))
     assert row["host.name"] == "HQ-Perimeter-FW"
-    assert row["changed_by"] == "jane.admin"
-    assert row["ticket"] == "CR-100"
     assert row["revision.id"] == "1052"
-    assert row["action"] == "created"
+    assert row["revision.number"] == "37"
+    assert row["changed_by"] == "jane.admin"
+    assert row["gui_client"] == "SmartConsole@10.2.44.18"
+    assert row["ticket"] == "CR-100"
+    assert row["policy_package"] == "HQ perimeter policy"
+    assert row["action"] == "Policy Installed"
+    assert row["comment"] == "added vendor VPN rule"
 
 
 def test_rules_flatten_nested_fields():
@@ -137,7 +146,7 @@ def test_rules_flatten_nested_fields():
 def test_limit_caps_rows():
     mapping = dict(DEVICES)
     mapping["devices/1/revisions.json"] = {
-        "revisions": [{"revision_id": str(i), "date": "2026-07-26T00:00:00Z"} for i in range(10)]
+        "revisions": [{"id": str(i), "date": "2026-07-26", "time": "00:00:00"} for i in range(10)]
     }
     result = tufin_runner_mod.run_query(FakeClient(mapping), _q("revisions"), limit=3)
     assert result.row_count == 3
@@ -149,8 +158,8 @@ def test_time_range_filters_old_revisions():
     mapping = dict(DEVICES)
     mapping["devices/1/revisions.json"] = {
         "revisions": [
-            {"revision_id": "new", "date": recent, "admin_name": "a"},
-            {"revision_id": "old", "date": old, "admin_name": "b"},
+            {"id": "new", "date": recent, "admin": "a"},
+            {"id": "old", "date": old, "admin": "b"},
         ]
     }
     result = tufin_runner_mod.run_query(FakeClient(mapping), _q("revisions"), time_range="24h")

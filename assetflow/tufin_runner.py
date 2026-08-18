@@ -84,6 +84,37 @@ def _first(record: dict, *keys: str) -> Any:
     return ""
 
 
+def _nested(record: dict, outer: str, inner: str) -> Any:
+    """Pull ``record[outer][inner]`` when ``outer`` is a nested object."""
+    value = record.get(outer)
+    if isinstance(value, dict):
+        return value.get(inner, "")
+    return ""
+
+
+def _join_datetime(record: dict) -> str:
+    """SecureTrack splits a revision into ``date`` + ``time``; join them."""
+    date = str(_first(record, "date"))
+    time = str(_first(record, "time"))
+    joined = f"{date} {time}".strip()
+    return joined or str(_first(record, "created_at", "timestamp"))
+
+
+def _tickets(record: dict) -> str:
+    """Flatten a RevisionDTO ``tickets.ticket[]`` wrapper into ticket ids."""
+    wrapper = record.get("tickets")
+    items: List[dict] = []
+    if isinstance(wrapper, dict):
+        items = unwrap_items(wrapper, ("ticket",))
+    elif isinstance(wrapper, list):
+        items = [t for t in wrapper if isinstance(t, dict)]
+    ids = [str(t.get("id")) for t in items if t.get("id") not in (None, "")]
+    if ids:
+        return ", ".join(ids)
+    # Older/flat shapes seen in the wild.
+    return textish(_first(record, "ticket_cr", "ticket_id", "ticket"))
+
+
 def _result(columns: List[str], rows: List[List[Any]], limit: Optional[int]) -> QueryResult:
     if limit is not None:
         rows = rows[: int(limit)]
@@ -169,18 +200,27 @@ def _device_key(device: dict) -> Tuple[str, str]:
 # --------------------------------------------------------------------------- #
 
 def _collect_devices(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
-    columns = ["host.name", "device.id", "device.vendor", "device.model", "host.ip", "os.version", "device.domain"]
+    # Field names confirmed against DetailedDeviceDTO (SecureTrack R25-2).
+    columns = [
+        "host.name", "device.id", "device.vendor", "device.model", "host.ip",
+        "os.version", "device.domain", "device.status", "installed_policy",
+    ]
     rows = []
     for device in _fetch_devices(client):
         device_id, name = _device_key(device)
+        status = textish(_first(device, "status"))
+        if not status and "offline" in device:
+            status = "offline" if device.get("offline") else "online"
         rows.append([
             name,
             device_id,
             textish(_first(device, "vendor", "vendor_name")),
             textish(_first(device, "model", "type", "device_type")),
-            textish(_first(device, "management_ip", "ip", "host")),
-            textish(_first(device, "os_version", "version")),
-            textish(_first(device, "domain", "domain_name")),
+            textish(_first(device, "ip", "management_ip", "host")),
+            textish(_first(device, "OS_Version", "os_version", "version")),
+            textish(_first(device, "domain_name", "domain")),
+            status,
+            textish(_first(device, "installed_policy")),
         ])
     return columns, rows
 
@@ -205,29 +245,34 @@ def _collect_per_device(
 
 
 def _collect_revisions(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
+    # Field names confirmed against RevisionDTO (SecureTrack R25-2). The API
+    # splits time into date+time, nests the comment and tickets, and exposes the
+    # acting admin as `admin` and the client/tool as `guiClient`.
     columns = [
-        "host.name", "revision.id", "@timestamp", "changed_by", "action",
-        "ticket", "policy_package", "authorization_status", "comment",
+        "host.name", "revision.id", "revision.number", "@timestamp", "changed_by",
+        "gui_client", "action", "ticket", "policy_package", "authorization_status", "comment",
     ]
 
     def paths_for(device_id: str, name: str, device: dict) -> Tuple[str, ...]:
         return (
             f"devices/{device_id}/revisions.json",
             f"devices/{device_id}/revisions",
-            f"revisions.json?device_id={device_id}",
         )
 
     def row_for(rev: dict, device_id: str, name: str) -> List[Any]:
+        comment = _nested(rev, "comment", "comment") or _first(rev, "description", "message")
         return [
             name,
-            str(_first(rev, "revision_id", "id", "number")),
-            textish(_first(rev, "date", "time", "created_at", "timestamp")),
-            textish(_first(rev, "admin_name", "changed_by", "user", "admin", "actor")),
+            str(_first(rev, "id", "revisionId")),
+            str(_first(rev, "revisionId")),
+            _join_datetime(rev),
+            textish(_first(rev, "admin", "admin_name", "changed_by", "user", "actor")),
+            textish(_first(rev, "guiClient", "gui_client")),
             textish(_first(rev, "action")),
-            textish(_first(rev, "ticket_cr", "ticket_id", "ticket")),
-            textish(_first(rev, "policy_package", "policy", "policy_name")),
-            textish(_first(rev, "authorization_status", "guidelines_status", "status")),
-            textish(_first(rev, "comment", "description", "message")),
+            _tickets(rev),
+            textish(_first(rev, "policyPackage", "policy_package", "policy")),
+            textish(_first(rev, "authorizationStatus", "automaticAuthorizationStatus", "authorization_status")),
+            textish(comment),
         ]
 
     return _collect_per_device(client, scan, paths_for, ("revisions", "revision"), columns, row_for)
@@ -283,7 +328,7 @@ def _collect_network_objects(client, scan: int) -> Tuple[List[str], List[List[An
             name,
             str(_first(obj, "id", "uid")),
             textish(_first(obj, "display_name", "name")),
-            textish(_first(obj, "type", "class_name")),
+            textish(_first(obj, "@xsi.type", "type", "class_name")),
             textish(_first(obj, "ip", "ip_address", "value")),
             textish(_first(obj, "comment")),
         ]
@@ -303,13 +348,18 @@ def _collect_services(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
         )
 
     def row_for(svc: dict, device_id: str, name: str) -> List[Any]:
+        # SecureTrack singleServiceDTO exposes a numeric protocol and a min/max
+        # port range; collapse an equal range to a single port.
+        lo = textish(_first(svc, "min", "port", "min_port", "dst_port"))
+        hi = textish(_first(svc, "max", "max_port"))
+        port = lo if (not hi or hi == lo) else f"{lo}-{hi}"
         return [
             name,
             str(_first(svc, "id", "uid")),
             textish(_first(svc, "display_name", "name")),
             textish(_first(svc, "protocol", "ip_protocol")),
-            textish(_first(svc, "port", "min", "min_port", "dst_port")),
-            textish(_first(svc, "type", "class_name")),
+            port,
+            textish(_first(svc, "@xsi.type", "type", "class_name")),
         ]
 
     return _collect_per_device(client, scan, paths_for, ("services", "service"), columns, row_for)
