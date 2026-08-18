@@ -110,7 +110,7 @@ categories, and feeds pointing at missing queries all fail the load).
 | Service Change Intelligence | AI007–AI009 | service installed/created, startup-type changes (7045/4697/7040) |
 | Application Discovery | AI010–AI012, AI016 | app/service footprint, software versions |
 | Database Discovery | AI013–AI015 | DB process/host/version discovery |
-| File Integrity Monitoring | AI017 | placeholder |
+| File Integrity Monitoring | AI017 | file create/modify/delete events (needs an FIM source) |
 | Authentication & Access Changes | AI018–AI021 | privileged logon, lockout, password reset, failed logon (4672/4740/4724/4625) |
 | Security Configuration Changes | AI022–AI025 | scheduled task, audit-policy change, log cleared, firewall rule change (4698/4719/1102/4946–4948) |
 
@@ -125,9 +125,11 @@ The feeds split into two shapes, which matters for how change is detected:
 
 Each query has a **status** (`validated` / `partially_validated` /
 `investigation_required` / `not_validated`) and `expected_output_fields`.
-`AI016`/`AI017` are placeholders with empty `esql_query` → `is_runnable` is
-false, so they are skipped by run-all and `run-feed` and rejected (422) by a
-direct run.
+Every shipped query now carries an ES|QL body, so all are runnable. `AI016`
+(software versions via `package.*`) and `AI017` (file-integrity events) depend
+on data sources that may not be ingested in every environment, so they return no
+rows there — that's expected, not a failure. A query with an empty `esql_query`
+would still be skipped by run-all/`run-feed` and rejected (422) by a direct run.
 
 ## Runner: ES|QL execution
 
@@ -295,7 +297,8 @@ categories, `validated` flag matches status, feeds reference real queries).
 - **Field mappings vary by data source.** Several queries are
   `partially_validated` / `investigation_required` because field availability
   (e.g. `winlog.event_data.*`, `process.pe.*`) depends on the ingest pipeline;
-  placeholders (AI016/AI017) have no ES|QL yet.
+  AI016/AI017 return rows only where a software-inventory / FIM source is
+  ingested.
 - **Heavy aggregations.** All-index `STATS` queries (AI001) can be slow — use
   the time-range control and row limit, or raise the request timeout in the
   connection panel.

@@ -54,11 +54,12 @@ def test_validated_queries_are_runnable(registry: Registry):
             assert q.is_runnable, f"{q.id} is validated but has no ES|QL"
 
 
-def test_placeholders_not_runnable(registry: Registry):
-    placeholders = [q for q in registry.queries if q.status is Status.not_validated]
-    assert placeholders  # AI016, AI017
-    for q in placeholders:
-        assert not q.is_runnable
+def test_runnable_flag_matches_esql_presence(registry: Registry):
+    # Every shipped ES query now carries an ES|QL body, so all are runnable;
+    # a query is runnable iff its esql_query is non-empty.
+    for q in registry.queries:
+        assert q.is_runnable == bool(q.esql_query.strip())
+    assert all(q.is_runnable for q in registry.queries)
 
 
 def test_lookup_helpers(registry: Registry):

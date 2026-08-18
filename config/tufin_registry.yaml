@@ -108,8 +108,8 @@ queries:
   - id: TUF001
     category: Device Inventory
     name: Device Inventory
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: devices
     purpose: Inventory every device SecureTrack manages, with vendor, model, management IP, and OS version.
     expected_output_fields:
@@ -134,8 +134,8 @@ queries:
   - id: TUF002
     category: Change History
     name: Device Revisions (Who Changed What, When)
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: revisions
     purpose: >-
       Retrieve the policy revision history per device — the core change-intelligence
@@ -166,8 +166,8 @@ queries:
   - id: TUF003
     category: Policy Rules
     name: Effective Policy Rules
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: rules
     purpose: List the effective (latest-revision) firewall rulebase per device.
     expected_output_fields:
@@ -190,8 +190,8 @@ queries:
   - id: TUF004
     category: Network Objects & Services
     name: Network Objects
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: network_objects
     purpose: Inventory network objects (hosts, subnets, ranges, groups) defined on each device.
     expected_output_fields:
@@ -210,8 +210,8 @@ queries:
   - id: TUF005
     category: Network Objects & Services
     name: Services
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: services
     purpose: Inventory the port/protocol service objects defined on each device.
     expected_output_fields:
@@ -228,46 +228,50 @@ queries:
 
   - id: TUF006
     category: Segmentation & Topology
-    name: Zones
-    status: investigation_required
+    name: Device Zones
+    status: partially_validated
     validated: false
     resource: zones
-    purpose: List SecureTrack zones used for segmentation matrices and topology.
+    purpose: List the zones defined on each device (for zone-based firewalls and segmentation).
     expected_output_fields:
+      - host.name
       - zone.id
       - zone.name
-      - domain
-      - comment
+      - global
     notes: >-
-      GET /securetrack/api/zones.json. Not device-keyed, so it appears as a
-      standalone sheet in the unified view. Zone membership and topology paths
-      (topology_interfaces, security_policies matrices) are richer follow-ups.
+      GET /securetrack/api/devices/{id}/zones.json per device (PolicyZoneListDTO).
+      R25-2 has no global /zones endpoint, so device zones are used instead —
+      now host-keyed, joining the unified view. Empty for devices/vendors that
+      don't expose named zones. Global segmentation matrices live under
+      security_policies (a richer follow-up).
     recommended_refresh_frequency: Weekly
 
   - id: TUF007
     category: Policy Hygiene
-    name: Rule Cleanups (Shadowed / Unused)
-    status: investigation_required
+    name: Rule Cleanups (Fully Shadowed)
+    status: partially_validated
     validated: false
     resource: cleanups
-    purpose: Surface shadowed, unused, and disabled rules that indicate policy drift and risk.
+    purpose: Surface fully shadowed rules — dead rules that can never match, a policy-hygiene signal.
     expected_output_fields:
       - host.name
       - cleanup.type
       - rule.uid
-      - count
+      - rule.name
       - comment
     notes: >-
-      GET /securetrack/api/devices/{id}/cleanups.json. Response shape depends on
-      the enabled cleanup checks and TOS version; treat field mapping as
-      provisional until confirmed against a live release.
+      GET /securetrack/api/devices/{id}/cleanups.json?code=C01 per device. R25-2
+      requires the cleanup category code and only supports C01 (fully shadowed
+      rules); results nest under shadowed_rule. Empty when a device has no fully
+      shadowed rules. Other cleanup categories are exposed via the estate-wide
+      /cleanup results endpoint (a follow-up).
     recommended_refresh_frequency: Weekly
 
   - id: TUF008
     category: Change Detection
     name: Change Detail (Revision Diff)
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: change_detail
     purpose: >-
       Compute per-change detail by diffing each device's most recent revisions:
