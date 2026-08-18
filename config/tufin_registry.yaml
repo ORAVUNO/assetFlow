@@ -290,8 +290,13 @@ queries:
       "what changed" is computed: for each device the two most recent revisions
       are fetched (GET /devices/{id}/revisions), their rulebases pulled (GET
       /revisions/{id}/rules) and diffed by rule uid (a rename alone is not a
-      change — the fingerprint excludes the rule name). The authorized/requester
-      columns come from GET /change_authorization?old_version=&new_version=,
+      change — the fingerprint excludes the rule name). The time-range control
+      (24h/7d/30d/90d) selects which revisions to compare: every revision in the
+      window plus the one immediately before it (the baseline), diffing each
+      consecutive pair so you see every change in the period with its own actor
+      and timestamp; with no range it diffs just the latest two. The number of
+      pairs per device is capped for safety. The authorized/requester columns
+      come from GET /change_authorization?old_version=&new_version=,
       which requires "Authorize Revisions with Tickets" enabled in SecureTrack;
       when it is off those columns are blank. Heavier than the other resources
       (several REST calls per device), so the device scan is capped. This is the

@@ -402,8 +402,12 @@ def _collect_zones(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
     return columns, rows
 
 
-# How many of the most recent revisions per device to diff (consecutive pairs).
+# With no time range, how many of the most recent revisions to diff per device
+# (2 revisions = the single latest change). A time range overrides this.
 DEFAULT_CHANGE_REVISIONS = 2
+# Safety cap on how many consecutive revision pairs to diff per device in one
+# fetch, so a wide range on a busy device can't fan out into unbounded calls.
+MAX_CHANGE_PAIRS = 25
 
 
 def _rule_key(rule: dict) -> str:
@@ -452,6 +456,47 @@ def _revisions_sorted(client, device_id: str) -> List[dict]:
     return sorted(revs, key=order)
 
 
+def _revision_time(rev: dict):
+    return _parse_time(_join_datetime(rev))
+
+
+def _select_change_pairs(
+    revisions: List[dict], time_range: Optional[str], max_pairs: int
+) -> List[Tuple[dict, dict]]:
+    """Pick which consecutive revision pairs to diff.
+
+    With a time range (24h/7d/30d/90d), select every revision whose date falls
+    in the window **plus the one immediately before it** (the baseline, so the
+    first in-window change has a "before" state), then diff each consecutive
+    pair. With no range, fall back to the latest ``DEFAULT_CHANGE_REVISIONS``.
+    Either way the number of pairs is capped at ``max_pairs`` (keeping the most
+    recent) to bound the REST calls.
+    """
+    if len(revisions) < 2:
+        return []
+
+    days = _RANGE_DAYS.get((time_range or "").lower())
+    if not days:
+        window = revisions[-max(2, DEFAULT_CHANGE_REVISIONS):]
+    else:
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        first_in = None
+        for i, rev in enumerate(revisions):
+            ts = _revision_time(rev)
+            if ts is None or ts >= cutoff:  # unparseable dates are kept, not dropped
+                first_in = i
+                break
+        if first_in is None:
+            return []
+        window = revisions[max(0, first_in - 1):]  # include the baseline revision
+
+    if len(window) > max_pairs + 1:
+        window = window[-(max_pairs + 1):]
+    return list(zip(window, window[1:]))
+
+
 def _revision_rules(client, revision_id: str) -> Dict[str, dict]:
     payload = _first_payload(
         client,
@@ -487,13 +532,17 @@ def _authorization(client, old_id: str, new_id: str) -> Tuple[str, str]:
     return status, requester
 
 
-def _collect_change_detail(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
-    """Diff each device's most recent revisions into per-change rows.
+def _collect_change_detail(
+    client, scan: int, time_range: Optional[str] = None
+) -> Tuple[List[str], List[List[Any]]]:
+    """Diff each device's revisions in the selected window into per-change rows.
 
     Answers *what changed, who changed it, when* — and, when SecureChange
     ticket authorization is enabled, whether the change was authorized (with the
     requester). The API exposes revision *snapshots*, so the change list is
-    computed by comparing consecutive revisions' rulebases.
+    computed by comparing consecutive revisions' rulebases. ``time_range`` picks
+    which revisions to compare (see ``_select_change_pairs``); rules for a given
+    revision are fetched once and reused across adjacent pairs.
     """
     columns = [
         "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
@@ -503,14 +552,19 @@ def _collect_change_detail(client, scan: int) -> Tuple[List[str], List[List[Any]
     for device in _fetch_devices(client)[:scan]:
         device_id, name = _device_key(device)
         revisions = _revisions_sorted(client, device_id)
-        if len(revisions) < 2:
-            continue
-        window = revisions[-(DEFAULT_CHANGE_REVISIONS):]
-        for older, newer in zip(window, window[1:]):
+        pairs = _select_change_pairs(revisions, time_range, MAX_CHANGE_PAIRS)
+        rules_cache: Dict[str, Dict[str, dict]] = {}
+
+        def rules_for(rev_id: str) -> Dict[str, dict]:
+            if rev_id not in rules_cache:
+                rules_cache[rev_id] = _revision_rules(client, rev_id)
+            return rules_cache[rev_id]
+
+        for older, newer in pairs:
             old_id = str(_first(older, "id", "revisionId"))
             new_id = str(_first(newer, "id", "revisionId"))
-            before_rules = _revision_rules(client, old_id)
-            after_rules = _revision_rules(client, new_id)
+            before_rules = rules_for(old_id)
+            after_rules = rules_for(new_id)
             if not before_rules and not after_rules:
                 continue
             when = _join_datetime(newer)
@@ -537,7 +591,7 @@ def _collect_change_detail(client, scan: int) -> Tuple[List[str], List[List[Any]
     return columns, rows
 
 
-_COLLECTORS: Dict[str, Callable[[Any, int], Tuple[List[str], List[List[Any]]]]] = {
+_COLLECTORS: Dict[str, Callable[..., Tuple[List[str], List[List[Any]]]]] = {
     "devices": _collect_devices,
     "revisions": _collect_revisions,
     "rules": _collect_rules,
@@ -568,6 +622,12 @@ def run_query(
             f"query {query.id} names unknown Tufin resource {resource!r}; "
             f"known resources: {', '.join(sorted(_COLLECTORS))}"
         )
-    columns, rows = collector(client, device_scan_limit)
-    rows = _apply_time_range(columns, rows, time_range)
+    if resource == "change_detail":
+        # This resource selects its own revision window from the time range
+        # (it decides which revisions to fetch and diff), so it is not also
+        # row-filtered afterwards.
+        columns, rows = _collect_change_detail(client, device_scan_limit, time_range)
+    else:
+        columns, rows = collector(client, device_scan_limit)
+        rows = _apply_time_range(columns, rows, time_range)
     return _result(columns, rows, limit)

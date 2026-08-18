@@ -238,6 +238,40 @@ def test_change_detail_single_revision_skipped():
     assert result.row_count == 0
 
 
+def _rev(rid, days_ago, action_svc):
+    ts = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return {"id": rid, "date": ts.strftime("%Y-%m-%d"), "time": ts.strftime("%H:%M:%S"), "admin": f"admin{rid}"}
+
+
+def test_change_detail_time_range_walks_window_with_baseline():
+    # Four revisions: r1 (100d ago) baseline, then r2 (10d), r3 (5d), r4 (1d).
+    # A 7-day range should diff r2->r3 and r3->r4 (r2 is the pre-window baseline
+    # that lets the first in-window change be detected), i.e. changes at r3 & r4.
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {
+        "revisions": [_rev("1", 100, None), _rev("2", 10, None), _rev("3", 5, None), _rev("4", 1, None)],
+    }
+    mapping["revisions/2/rules.json"] = {"rules": [{"uid": "a", "service": "tcp/1", "action": "accept"}]}
+    mapping["revisions/3/rules.json"] = {"rules": [{"uid": "a", "service": "tcp/2", "action": "accept"}]}  # modified at r3
+    mapping["revisions/4/rules.json"] = {"rules": [{"uid": "a", "service": "tcp/2", "action": "accept"}, {"uid": "b", "service": "tcp/9", "action": "drop"}]}  # added b at r4
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"), time_range="7d")
+    rows = [dict(zip(result.column_names, r)) for r in result.rows]
+    changed_revs = sorted({r["revision.id"] for r in rows})
+    assert changed_revs == ["3", "4"]  # r2->r3 modified, r3->r4 added; r1->r2 excluded
+    assert {(r["change_type"], r["rule.uid"]) for r in rows} == {("modified", "a"), ("added", "b")}
+
+
+def test_change_detail_range_excludes_old_only_history():
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {
+        "revisions": [_rev("1", 400, None), _rev("2", 380, None)],
+    }
+    mapping["revisions/1/rules.json"] = {"rules": [{"uid": "a", "service": "tcp/1", "action": "accept"}]}
+    mapping["revisions/2/rules.json"] = {"rules": [{"uid": "a", "service": "tcp/2", "action": "accept"}]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"), time_range="24h")
+    assert result.row_count == 0  # nothing changed inside the last 24h
+
+
 # --------------------------------------------------------------------------- #
 # Adapter wiring
 # --------------------------------------------------------------------------- #
