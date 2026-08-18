@@ -38,6 +38,7 @@ class Query(BaseModel):
     status: Status
     purpose: str
     esql_query: str = ""
+    resource: str = ""
     validated: bool = False
     notes: str = ""
     expected_output_fields: List[str] = Field(default_factory=list)
@@ -45,8 +46,13 @@ class Query(BaseModel):
 
     @property
     def is_runnable(self) -> bool:
-        """True when the query has a non-empty ES|QL body to execute."""
-        return bool(self.esql_query.strip())
+        """True when the query has something to execute.
+
+        Elasticsearch queries carry an ES|QL body (``esql_query``); other
+        adapters (e.g. Tufin) instead name a ``resource`` the adapter knows how
+        to fetch. Either one makes the query runnable.
+        """
+        return bool(self.esql_query.strip() or self.resource.strip())
 
 
 class Feed(BaseModel):

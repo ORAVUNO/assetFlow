@@ -15,9 +15,10 @@ def manager():
     return adapters_mod.default_manager()
 
 
-def test_default_manager_has_elasticsearch(manager):
+def test_default_manager_has_elasticsearch_and_tufin(manager):
     ids = [a.info.id for a in manager.list()]
-    assert ids == ["elasticsearch"]
+    assert "elasticsearch" in ids
+    assert "tufin" in ids
     a = manager.get("elasticsearch")
     assert a.info.category == "SIEM / Log Analytics"
     assert len(a.registry.queries) == 17
@@ -26,6 +27,7 @@ def test_default_manager_has_elasticsearch(manager):
 def test_by_category(manager):
     cats = manager.by_category()
     assert "SIEM / Log Analytics" in cats
+    assert "Network Security Policy" in cats
 
 
 def test_connect_and_run(manager, monkeypatch):

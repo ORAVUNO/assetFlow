@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 
 from . import client as client_mod
 from . import runner as runner_mod
+from . import tufin_client as tufin_client_mod
+from . import tufin_runner as tufin_runner_mod
 from .models import Query, Registry
 from .registry import load_registry
 from .runner import QueryResult
@@ -25,7 +27,7 @@ class AdapterInfo:
     name: str
     category: str
     description: str
-    kind: str  # e.g. "elasticsearch" — drives which connection fields the UI shows
+    kind: str  # e.g. "elasticsearch" / "tufin" — drives the UI's connection fields
 
 
 class Adapter:
@@ -45,8 +47,17 @@ class Adapter:
     def conn_info(self) -> Optional[dict]:
         return self._conn_info
 
-    def connect(self, **cfg) -> dict:  # pragma: no cover - overridden
+    def connect_form(self, form: dict) -> dict:  # pragma: no cover - overridden
+        """Connect using the web UI's raw connection form fields.
+
+        Each adapter interprets the shared form (host, port, username, …) in its
+        own terms and returns a connection-info dict (raising on failure).
+        """
         raise NotImplementedError
+
+    def try_auto_connect(self) -> bool:
+        """Best-effort connect from environment variables at startup."""
+        return False
 
     def ping(self) -> dict:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -83,7 +94,30 @@ class ElasticsearchAdapter(Adapter):
         self._conn_info = info
         return info
 
-    def try_connect_from_env(self) -> bool:
+    def connect_form(self, form: dict) -> dict:
+        """Resolve the shared form into an Elasticsearch URL and connect.
+
+        A bare host plus a port becomes ``host:port``; ``normalize_host`` then
+        adds the scheme (and default 9200). Returns the cluster info plus the
+        resolved URL.
+        """
+        target = (form.get("url") or form.get("host") or "").strip()
+        port = (form.get("port") or "").strip()
+        if target and port and "://" not in target and ":" not in target.split("/", 1)[0]:
+            target = f"{target}:{port}"
+        url = client_mod.normalize_host(target) if target else None
+        info = self.connect(
+            url=url,
+            cloud_id=(form.get("cloud_id") or None),
+            api_key=(form.get("api_key") or None),
+            username=(form.get("username") or None),
+            password=(form.get("password") or None),
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 60)),
+        )
+        return {"resolved_url": url, **info}
+
+    def try_auto_connect(self) -> bool:
         """Best-effort auto-connect from environment variables at startup."""
         try:
             candidate = client_mod.build_client_from_env()
@@ -107,6 +141,66 @@ class ElasticsearchAdapter(Adapter):
         return runner_mod.run_query(self._client, query, limit=limit, time_range=time_range)
 
 
+class TufinAdapter(Adapter):
+    """Tufin SecureTrack source: fetches configuration, revision, and change
+    intelligence over the SecureTrack REST API."""
+
+    def connect(
+        self,
+        *,
+        host: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        base_path: str = "/securetrack/api",
+        verify_certs: bool = True,
+        request_timeout: int = 30,
+    ) -> dict:
+        candidate = tufin_client_mod.build_client(
+            host=host or "",
+            username=username or "",
+            password=password or "",
+            base_path=base_path or "/securetrack/api",
+            verify_certs=verify_certs,
+            request_timeout=request_timeout,
+        )
+        info = tufin_client_mod.ping(candidate)  # raises on failure
+        self._client = candidate
+        self._conn_info = info
+        return info
+
+    def connect_form(self, form: dict) -> dict:
+        return self.connect(
+            host=(form.get("host") or form.get("url") or None),
+            username=(form.get("username") or None),
+            password=(form.get("password") or None),
+            base_path=(form.get("base_path") or "/securetrack/api"),
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 30)),
+        )
+
+    def try_auto_connect(self) -> bool:
+        try:
+            candidate = tufin_client_mod.build_client_from_env()
+            info = tufin_client_mod.ping(candidate)
+        except Exception:
+            return False
+        self._client = candidate
+        self._conn_info = info
+        return True
+
+    def ping(self) -> dict:
+        if self._client is None:
+            raise tufin_client_mod.TufinConfigError("adapter is not connected")
+        info = tufin_client_mod.ping(self._client)
+        self._conn_info = info
+        return info
+
+    def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
+        if self._client is None:
+            raise tufin_client_mod.TufinConfigError("adapter is not connected")
+        return tufin_runner_mod.run_query(self._client, query, limit=limit, time_range=time_range)
+
+
 class AdapterManager:
     def __init__(self, adapters: List[Adapter]):
         self._by_id: Dict[str, Adapter] = {a.info.id: a for a in adapters}
@@ -126,9 +220,22 @@ class AdapterManager:
         return cats
 
 
+def _find_registry(*candidates: str) -> Optional[str]:
+    """Return the first registry path that exists, near cwd or the repo root."""
+    from pathlib import Path
+
+    roots = [Path.cwd(), Path(__file__).resolve().parent.parent]
+    for root in roots:
+        for candidate in candidates:
+            path = root / candidate
+            if path.is_file():
+                return str(path)
+    return None
+
+
 def default_manager(registry_path: Optional[str] = None) -> AdapterManager:
-    """Build the adapter manager. Currently a single Elasticsearch adapter
-    backed by the shipped ES|QL registry."""
+    """Build the adapter manager: the Elasticsearch adapter (ES|QL registry) and
+    the Tufin adapter (SecureTrack REST registry), grouped by category."""
     reg = load_registry(registry_path)
     elasticsearch = ElasticsearchAdapter(
         AdapterInfo(
@@ -143,4 +250,27 @@ def default_manager(registry_path: Optional[str] = None) -> AdapterManager:
         ),
         reg,
     )
-    return AdapterManager([elasticsearch])
+
+    adapters: List[Adapter] = [elasticsearch]
+
+    tufin_path = _find_registry(
+        "config/tufin_registry.yaml", "tufin_registry.yaml"
+    )
+    if tufin_path:
+        tufin = TufinAdapter(
+            AdapterInfo(
+                id="tufin",
+                name="Tufin SecureTrack",
+                category="Network Security Policy",
+                description=(
+                    "Tufin SecureTrack — device inventory, per-revision change "
+                    "history (who changed what, when), rulebase, network objects, "
+                    "and policy hygiene via the SecureTrack REST API."
+                ),
+                kind="tufin",
+            ),
+            load_registry(tufin_path),
+        )
+        adapters.append(tufin)
+
+    return AdapterManager(adapters)

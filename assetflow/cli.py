@@ -177,8 +177,13 @@ def show(ctx: click.Context, query_id: str) -> None:
         console.print("output   : " + ", ".join(q.expected_output_fields))
     if q.notes:
         console.print(f"notes    : {q.notes}")
-    console.print("\n[bold]ES|QL[/bold]:")
-    console.print(q.esql_query.strip() or "[dim](none — placeholder)[/dim]")
+    if q.esql_query.strip():
+        console.print("\n[bold]ES|QL[/bold]:")
+        console.print(q.esql_query.strip())
+    elif q.resource:
+        console.print(f"\n[bold]resource[/bold]: {q.resource}  [dim](fetched via the Tufin adapter)[/dim]")
+    else:
+        console.print("\n[dim](no query — placeholder)[/dim]")
 
 
 @main.command(name="test-connection")

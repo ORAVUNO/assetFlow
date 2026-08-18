@@ -1,0 +1,289 @@
+# =============================================================================
+# Tufin SecureTrack Asset Intelligence Registry
+# =============================================================================
+# Resource registry for the Tufin adapter. Where the Elasticsearch registry
+# carries ES|QL query bodies, each entry here names a `resource` that the Tufin
+# runner maps to one or more SecureTrack REST endpoints and normalizes into the
+# same column/row shape (see assetflow/tufin_runner.py).
+#
+# Endpoint paths follow Tufin's official SecureTrack REST API and pytos SDK:
+#   GET /securetrack/api/devices
+#   GET /securetrack/api/devices/{id}/revisions      <- who / what / when
+#   GET /securetrack/api/revisions/{id}/rules
+#   GET /securetrack/api/devices/{id}/rules
+#   GET /securetrack/api/devices/{id}/network_objects
+#   GET /securetrack/api/devices/{id}/services
+#   GET /securetrack/api/devices/{id}/cleanups
+#   GET /securetrack/api/zones
+#   GET /securetrack/api/audit_logs (availability varies by TOS version)
+#
+# Status meanings match the Elasticsearch registry:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Endpoint path confirmed from Tufin's REST API /
+#                              pytos SDK; field mapping is best-effort and
+#                              needs confirmation against a live TOS release.
+#   - investigation_required : Endpoint exists but response shape / availability
+#                              varies by TOS version, vendor, or licensing.
+#   - not_validated          : Not yet exercised against live data.
+# =============================================================================
+
+metadata:
+  version: 1
+  description: >-
+    Tufin SecureTrack configuration, change-history, and asset-intelligence
+    resources. Endpoint paths and field mappings confirmed against the
+    SecureTrack REST API for TOS R25-2 (SecureTrack 25.2 Swagger).
+  query_language: SecureTrack REST
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Device Inventory
+    - Change History
+    - Policy Rules
+    - Network Objects & Services
+    - Segmentation & Topology
+    - Policy Hygiene
+    - Audit & Change Events
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+feeds:
+  - id: FEED-TUF-INVENTORY
+    name: Device Inventory
+    category: Device Inventory
+    description: Managed firewalls, routers, and security devices with vendor, model, and OS version.
+    query_ids: [TUF001]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TUF-CHANGE
+    name: Change History
+    category: Change History
+    description: Per-revision change history — who changed the policy, when, under which ticket and action.
+    query_ids: [TUF002]
+    recommended_refresh_frequency: Every 5-15 minutes
+
+  - id: FEED-TUF-RULES
+    name: Policy Rules
+    category: Policy Rules
+    description: The effective (latest-revision) rulebase per device — source, destination, service, action.
+    query_ids: [TUF003]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TUF-OBJECTS
+    name: Network Objects & Services
+    category: Network Objects & Services
+    description: Network object and service inventory per device — hosts, subnets, groups, and port/protocol services.
+    query_ids: [TUF004, TUF005]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TUF-TOPOLOGY
+    name: Segmentation & Topology
+    category: Segmentation & Topology
+    description: SecureTrack zones used for segmentation matrices and topology context.
+    query_ids: [TUF006]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-TUF-HYGIENE
+    name: Policy Hygiene
+    category: Policy Hygiene
+    description: Cleanup findings — shadowed, unused, and disabled rules that indicate policy drift and risk.
+    query_ids: [TUF007]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-TUF-AUDIT
+    name: Audit & Change Events
+    category: Audit & Change Events
+    description: SecureTrack audit / change-log events with actor, source IP, and change type (when exposed).
+    query_ids: [TUF008]
+    recommended_refresh_frequency: Every 5-15 minutes
+
+# =============================================================================
+# QUERIES (resources)
+# =============================================================================
+queries:
+  - id: TUF001
+    category: Device Inventory
+    name: Device Inventory
+    status: partially_validated
+    validated: false
+    resource: devices
+    purpose: Inventory every device SecureTrack manages, with vendor, model, management IP, and OS version.
+    expected_output_fields:
+      - host.name          # device / CI name (DetailedDeviceDTO.name)
+      - device.id
+      - device.vendor      # DetailedDeviceDTO.vendor
+      - device.model       # DetailedDeviceDTO.model
+      - host.ip            # DetailedDeviceDTO.ip
+      - os.version         # DetailedDeviceDTO.OS_Version
+      - device.domain      # DetailedDeviceDTO.domain_name
+      - device.status      # DetailedDeviceDTO.status / offline
+      - installed_policy   # DetailedDeviceDTO.installed_policy
+    notes: >-
+      GET /securetrack/api/devices.json?show_os_version=true. Fields confirmed
+      against DetailedDeviceDTO (R25-2): name, vendor, model, ip, OS_Version,
+      domain_name, status, installed_policy (also exposes offline flag,
+      latest_revision, licenses, topology). host.name is the device name so the
+      row folds into the unified host view; it is the anchor for every other
+      Tufin resource, which is keyed by device id.
+    recommended_refresh_frequency: Daily
+
+  - id: TUF002
+    category: Change History
+    name: Device Revisions (Who Changed What, When)
+    status: partially_validated
+    validated: false
+    resource: revisions
+    purpose: >-
+      Retrieve the policy revision history per device — the core change-intelligence
+      signal: which administrator changed the policy, when, under which ticket and action.
+    expected_output_fields:
+      - host.name              # device
+      - revision.id            # RevisionDTO.id (global id, used by /revisions/{id})
+      - revision.number        # RevisionDTO.revisionId (order on the device)
+      - "@timestamp"           # RevisionDTO.date + time
+      - changed_by             # RevisionDTO.admin (device admin via syslog for some vendors)
+      - gui_client             # RevisionDTO.guiClient (client/tool that made the change)
+      - action                 # RevisionDTO.action
+      - ticket                 # RevisionDTO.tickets.ticket[].id linked to the change
+      - policy_package         # RevisionDTO.policyPackage
+      - authorization_status   # RevisionDTO.authorizationStatus
+      - comment                # RevisionDTO.comment.comment
+    notes: >-
+      GET /securetrack/api/devices/{id}/revisions.json for each device (scan
+      capped to bound REST calls; rows capped by limit). Field mapping confirmed
+      against RevisionDTO (R25-2): id + revisionId, split date/time, admin,
+      guiClient, action, nested comment, and a tickets wrapper (ticket[].id).
+      The DTO also carries auditLog and manualAuthorization (status/user/dateTime
+      — who authorized the change and when). The acting admin is exposed directly
+      for most vendors, and via syslog monitoring for Cisco/Fortinet/Juniper/
+      Palo Alto. Supports the time-range control to bound to recent changes.
+    recommended_refresh_frequency: Every 5-15 minutes
+
+  - id: TUF003
+    category: Policy Rules
+    name: Effective Policy Rules
+    status: partially_validated
+    validated: false
+    resource: rules
+    purpose: List the effective (latest-revision) firewall rulebase per device.
+    expected_output_fields:
+      - host.name
+      - rule.uid
+      - rule.name
+      - source
+      - destination
+      - service
+      - action
+      - track
+      - disabled
+      - comment
+    notes: >-
+      GET /securetrack/api/revisions/{latest}/rules.json, falling back to
+      /securetrack/api/devices/{id}/rules.json. Source/destination/service can be
+      object references or lists; they are flattened to readable text.
+    recommended_refresh_frequency: Daily
+
+  - id: TUF004
+    category: Network Objects & Services
+    name: Network Objects
+    status: partially_validated
+    validated: false
+    resource: network_objects
+    purpose: Inventory network objects (hosts, subnets, ranges, groups) defined on each device.
+    expected_output_fields:
+      - host.name
+      - object.id
+      - object.name
+      - object.type
+      - object.ip
+      - comment
+    notes: >-
+      GET /securetrack/api/devices/{id}/network_objects.json. Feeds asset
+      discovery — object name/IP maps devices to the hosts and subnets they
+      protect. A global /network_objects/search endpoint also exists for lookups.
+    recommended_refresh_frequency: Daily
+
+  - id: TUF005
+    category: Network Objects & Services
+    name: Services
+    status: partially_validated
+    validated: false
+    resource: services
+    purpose: Inventory the port/protocol service objects defined on each device.
+    expected_output_fields:
+      - host.name
+      - service.id
+      - service.name
+      - protocol
+      - port
+      - type
+    notes: >-
+      GET /securetrack/api/devices/{id}/services.json. Complements network
+      objects for understanding what each rulebase actually permits.
+    recommended_refresh_frequency: Daily
+
+  - id: TUF006
+    category: Segmentation & Topology
+    name: Zones
+    status: investigation_required
+    validated: false
+    resource: zones
+    purpose: List SecureTrack zones used for segmentation matrices and topology.
+    expected_output_fields:
+      - zone.id
+      - zone.name
+      - domain
+      - comment
+    notes: >-
+      GET /securetrack/api/zones.json. Not device-keyed, so it appears as a
+      standalone sheet in the unified view. Zone membership and topology paths
+      (topology_interfaces, security_policies matrices) are richer follow-ups.
+    recommended_refresh_frequency: Weekly
+
+  - id: TUF007
+    category: Policy Hygiene
+    name: Rule Cleanups (Shadowed / Unused)
+    status: investigation_required
+    validated: false
+    resource: cleanups
+    purpose: Surface shadowed, unused, and disabled rules that indicate policy drift and risk.
+    expected_output_fields:
+      - host.name
+      - cleanup.type
+      - rule.uid
+      - count
+      - comment
+    notes: >-
+      GET /securetrack/api/devices/{id}/cleanups.json. Response shape depends on
+      the enabled cleanup checks and TOS version; treat field mapping as
+      provisional until confirmed against a live release.
+    recommended_refresh_frequency: Weekly
+
+  - id: TUF008
+    category: Audit & Change Events
+    name: Audit / Change Events
+    status: not_validated
+    validated: false
+    resource: audit_logs
+    purpose: >-
+      Retrieve SecureTrack audit / change-log events with actor, source IP, and
+      change type — the richest change signal when the log endpoint is exposed.
+    expected_output_fields:
+      - host.name
+      - event.id
+      - "@timestamp"
+      - changed_by
+      - source.ip
+      - event.type
+      - message
+    notes: >-
+      Attempts audit_logs / change_logs / changes endpoints; availability varies
+      by TOS version, product (SecureTrack vs SecureChange), and permissions.
+      Audit-log events carry the actor, actor role, source IP, and auth method,
+      which is richer than a revision snapshot. Left not_validated until an
+      endpoint is confirmed in the target environment.
+    recommended_refresh_frequency: Every 5-15 minutes

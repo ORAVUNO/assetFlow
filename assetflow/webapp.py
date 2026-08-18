@@ -17,7 +17,6 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from . import adapters as adapters_mod
-from . import client as client_mod
 from . import db
 from . import export as export_mod
 from . import merge as merge_mod
@@ -34,6 +33,7 @@ class ConnectRequest(BaseModel):
     username: str = ""
     password: str = ""
     api_key: str = ""
+    base_path: str = ""  # Tufin SecureTrack API base path
     verify_certs: bool = True
     request_timeout: int = 60
 
@@ -60,6 +60,7 @@ def _query_public(adapter: adapters_mod.Adapter, query) -> dict:
         "purpose": query.purpose,
         "notes": query.notes,
         "esql_query": query.esql_query,
+        "resource": query.resource,
         "expected_output_fields": query.expected_output_fields,
         "recommended_refresh_frequency": query.recommended_refresh_frequency,
         "is_runnable": query.is_runnable,
@@ -74,8 +75,7 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
 
     # Best-effort auto-connect each adapter from environment variables.
     for adapter in manager.list():
-        if isinstance(adapter, adapters_mod.ElasticsearchAdapter):
-            adapter.try_connect_from_env()
+        adapter.try_auto_connect()
 
     app = FastAPI(title="assetFlow", docs_url=None, redoc_url=None)
 
@@ -136,26 +136,11 @@ def create_app(registry_path: Optional[str] = None, db_url: Optional[str] = None
     @app.post("/api/adapters/{adapter_id}/connect")
     def api_connect(adapter_id: str, req: ConnectRequest) -> JSONResponse:
         a = _get_adapter(adapter_id)
-        target = (req.url or req.host or "").strip()
-        port = req.port.strip()
-        if target and port and "://" not in target and ":" not in target.split("/", 1)[0]:
-            target = f"{target}:{port}"
-        url = client_mod.normalize_host(target) if target else None
         try:
-            info = a.connect(
-                url=url,
-                cloud_id=(req.cloud_id or None),
-                api_key=(req.api_key or None),
-                username=(req.username or None),
-                password=(req.password or None),
-                verify_certs=req.verify_certs,
-                request_timeout=max(1, int(req.request_timeout or 60)),
-            )
-        except client_mod.ConnectionConfigError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
+            info = a.connect_form(req.model_dump())
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
-        return JSONResponse({"ok": True, "resolved_url": url, **info})
+        return JSONResponse({"ok": True, **info})
 
     @app.post("/api/adapters/{adapter_id}/run/{query_id}")
     def api_run(
@@ -419,7 +404,8 @@ INDEX_HTML = r"""<!doctype html>
     <label>Hostname or IP / URL
       <input type="text" id="c_host" placeholder="10.0.0.5  ·  host:9200  ·  https://host:9200"/>
     </label>
-    <label>Port <input type="text" id="c_port" placeholder="9200" style="min-width:90px"/></label>
+    <label id="f_port">Port <input type="text" id="c_port" placeholder="9200" style="min-width:90px"/></label>
+    <label id="f_basepath" class="hidden">API base path <input type="text" id="c_basepath" value="/securetrack/api" style="min-width:160px"/></label>
     <label>Username <input type="text" id="c_user" autocomplete="off" placeholder="elastic"/></label>
     <label>Password <input type="password" id="c_pass" autocomplete="off"/></label>
     <label>Timeout (s) <input type="text" id="c_timeout" value="60" style="min-width:80px"/></label>
@@ -427,7 +413,7 @@ INDEX_HTML = r"""<!doctype html>
     <button id="c_btn" onclick="connect()">Test &amp; connect</button>
   </div>
   <div class="cstat" id="c_status"></div>
-  <div class="chint">Credentials are held in this local server's memory only — never written to disk.
+  <div class="chint" id="c_hint">Credentials are held in this local server's memory only — never written to disk.
     Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.</div>
 </div>
 
@@ -491,11 +477,29 @@ async function openAdapter(id){
                '<a href="/api/adapters/'+id+'/export-all.zip">ZIP</a>';
   ax.classList.remove('hidden');
   document.getElementById('crumb').textContent='› '+DETAIL.name;
+  applyKind(DETAIL.kind);
   setConn(DETAIL.connected, DETAIL.conn_info||{});
   togglePanel(!DETAIL.connected);
   renderSidebar();
   document.getElementById('main').innerHTML='<p class="hint">Select a query on the left.</p>';
   CURRENT=null;
+}
+
+/* show the connection fields that fit the adapter kind */
+function applyKind(kind){
+  const tufin = (kind==='tufin');
+  document.getElementById('f_port').classList.toggle('hidden', tufin);
+  document.getElementById('f_basepath').classList.toggle('hidden', !tufin);
+  document.getElementById('c_host').placeholder = tufin
+    ? 'securetrack.example.com  ·  10.0.0.5'
+    : '10.0.0.5  ·  host:9200  ·  https://host:9200';
+  document.getElementById('c_user').placeholder = tufin ? 'securetrack-api-user' : 'elastic';
+  document.getElementById('c_timeout').value = tufin ? '30' : '60';
+  document.getElementById('c_hint').innerHTML = tufin
+    ? 'Credentials are held in this local server\'s memory only — never written to disk. '+
+      'Connects to the SecureTrack REST API at <code>https://host/securetrack/api</code>.'
+    : 'Credentials are held in this local server\'s memory only — never written to disk. '+
+      'Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.';
 }
 
 /* generic sortable/filterable table mounted into any container */
@@ -588,7 +592,7 @@ function select(id){
     '<h2>'+esc(q.id)+' — '+esc(q.name)+' <span class="badge b-'+q.status+'">'+q.status.replace(/_/g,' ')+'</span></h2>'+
     '<div class="sub">'+esc(q.purpose)+'</div>'+
     (q.expected_output_fields.length?'<div class="fields">Fields: '+q.expected_output_fields.map(esc).join(', ')+'</div>':'')+
-    '<pre>'+esc(q.esql_query.trim()||'(no query — placeholder)')+'</pre>'+
+    '<pre>'+esc(q.esql_query.trim()||(q.resource?('SecureTrack resource: '+q.resource):'(no query — placeholder)'))+'</pre>'+
     '<div class="controls">'+
       (q.is_runnable
         ? '<button id="runbtn">Run</button>'+
@@ -660,9 +664,15 @@ function drawTable(){
 }
 
 /* ---------- connection ---------- */
+function connSummary(d){
+  if(!d) return '';
+  if(d.summary) return d.summary;
+  const parts=[]; if(d.cluster_name) parts.push(d.cluster_name); if(d.version) parts.push('v'+d.version);
+  return parts.join(' · ');
+}
 function setConn(ok,d){
   const el=document.getElementById('conn');
-  if(ok){el.innerHTML='<span class="dot ok"></span>connected · '+esc((d&&d.cluster_name)||'')+' · v'+esc((d&&d.version)||'');}
+  if(ok){el.innerHTML='<span class="dot ok"></span>connected · '+esc(connSummary(d));}
   else{el.innerHTML='<span class="dot bad"></span>'+esc((d&&d.error)||'not connected');}
 }
 function togglePanel(force){
@@ -676,13 +686,14 @@ async function connect(){
   btn.disabled=true; const label=btn.textContent; btn.textContent='Connecting…'; st.textContent='';
   const body={host:val('c_host'),port:val('c_port'),username:val('c_user'),
               password:document.getElementById('c_pass').value||'',
+              base_path:val('c_basepath'),
               verify_certs:document.getElementById('c_verify').checked,
               request_timeout:parseInt(val('c_timeout'))||60};
   try{
     const d=await j('/api/adapters/'+ADAPTER+'/connect',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(d.ok){
-      st.innerHTML='<span style="color:var(--ok)">✓ Connected · '+esc(d.cluster_name)+' · v'+esc(d.version)+'</span>';
+      st.innerHTML='<span style="color:var(--ok)">✓ Connected · '+esc(connSummary(d))+'</span>';
       setConn(true,d); setTimeout(()=>togglePanel(false),900);
     }else{ st.innerHTML='<span style="color:var(--bad)">✗ '+esc(d.error)+'</span>'; setConn(false,d);}
   }catch(e){st.innerHTML='<span style="color:var(--bad)">✗ '+esc(e.message)+'</span>';}
