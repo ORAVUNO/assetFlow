@@ -280,10 +280,16 @@ on for production certs; disable only for a lab/self-signed environment). Or set
 to auto-connect on startup. As with Elasticsearch, credentials entered in the
 form are held in the local server's memory only and never written to disk.
 
+> **Developer guide.** For a full walkthrough of how the Tufin integration
+> works — architecture, module map, data flow, change-detection logic, and how
+> to add a new resource — see
+> [`docs/tufin_integration.md`](docs/tufin_integration.md). The confirmed
+> endpoint/DTO field reference is
+> [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md).
+
 > **Validation status.** Endpoint paths **and** field mappings are confirmed
-> against the **SecureTrack 25.2 (TOS R25-2)** Swagger — see
-> [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md)
-> for the DTO field reference. Resources stay marked `partially_validated` /
+> against the **SecureTrack 25.2 (TOS R25-2)** Swagger — see the field reference
+> above for the DTO details. Resources stay marked `partially_validated` /
 > `investigation_required` until also run against a live TOS box (the same
 > honest labeling the Elasticsearch registry uses); the schema is now accurate,
 > the live run is the remaining step. Point the adapter at a different release
