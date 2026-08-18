@@ -62,6 +62,23 @@ class FetchRun(Base):
         return rec
 
 
+class ChangeWatermark(Base):
+    """Last revision id already processed per (adapter, device).
+
+    Powers the Tufin change-detail "since last seen" mode: each incremental
+    fetch diffs only the revisions newer than this watermark, then advances it —
+    so every change is reported exactly once, with no missed intermediate
+    revisions and no re-processing of history.
+    """
+
+    __tablename__ = "tufin_change_watermarks"
+
+    adapter: Mapped[str] = mapped_column(String(64), primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision_id: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 _engine = None
 _Session: Optional[sessionmaker] = None
 
@@ -148,6 +165,49 @@ def latest_all(adapter: Optional[str] = None, include_data: bool = True) -> List
             .order_by(FetchRun.adapter, FetchRun.query_id)
         )
         return [r.to_record(include_data) for r in s.scalars(stmt).all()]
+
+
+def get_change_watermark(adapter: str, device_id: str) -> Optional[str]:
+    """Return the last processed revision id for a device, or None."""
+    with _session() as s:
+        row = s.get(ChangeWatermark, {"adapter": adapter, "device_id": device_id})
+        return row.revision_id if row else None
+
+
+def set_change_watermark(adapter: str, device_id: str, revision_id: str) -> None:
+    """Record the newest revision id processed for a device."""
+    with _session() as s:
+        row = s.get(ChangeWatermark, {"adapter": adapter, "device_id": device_id})
+        if row is None:
+            s.add(
+                ChangeWatermark(
+                    adapter=adapter,
+                    device_id=device_id,
+                    revision_id=revision_id,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+        else:
+            row.revision_id = revision_id
+            row.updated_at = datetime.now(timezone.utc)
+        s.commit()
+
+
+class _DbWatermarkStore:
+    """Adapter-scoped view over the change watermark table (get/set by device)."""
+
+    def __init__(self, adapter: str):
+        self.adapter = adapter
+
+    def get(self, device_id: str) -> Optional[str]:
+        return get_change_watermark(self.adapter, device_id)
+
+    def set(self, device_id: str, revision_id: str) -> None:
+        set_change_watermark(self.adapter, device_id, revision_id)
+
+
+def watermark_store(adapter: str) -> _DbWatermarkStore:
+    return _DbWatermarkStore(adapter)
 
 
 def history(adapter: str, query_id: str, limit: int = 25) -> List[dict]:

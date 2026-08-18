@@ -598,6 +598,7 @@ function select(id){
         ? '<button id="runbtn">Run</button>'+
           '<label class="hint">limit <input type="number" id="limit" min="1" value="100"></label>'+
           '<label class="hint">range <select id="range">'+
+            (q.resource==='change_detail'?'<option value="incremental">Since last check</option>':'')+
             '<option value="all">All time</option><option value="24h">Last 24h</option>'+
             '<option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>'+
             '<option value="90d">Last 90 days</option></select></label>'

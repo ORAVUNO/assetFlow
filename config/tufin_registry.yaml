@@ -294,8 +294,12 @@ queries:
       (24h/7d/30d/90d) selects which revisions to compare: every revision in the
       window plus the one immediately before it (the baseline), diffing each
       consecutive pair so you see every change in the period with its own actor
-      and timestamp; with no range it diffs just the latest two. The number of
-      pairs per device is capped for safety. The authorized/requester columns
+      and timestamp; with no range it diffs just the latest two. The "Since last
+      check" option runs the incremental change-monitoring mode: it diffs only
+      the revisions newer than each device's stored watermark, then advances the
+      watermark — so every change is reported exactly once with no missed
+      intermediate revisions (the first run just records a baseline). The number
+      of pairs per device is capped for safety. The authorized/requester columns
       come from GET /change_authorization?old_version=&new_version=,
       which requires "Authorize Revisions with Tickets" enabled in SecureTrack;
       when it is off those columns are blank. Heavier than the other resources
