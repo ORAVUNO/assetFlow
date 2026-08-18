@@ -413,6 +413,21 @@ def test_scheduler_tick_runs_due_schedule(tmp_path, monkeypatch):
     assert outs and all(o["status"] == "skipped-disconnected" for o in outs)
 
 
+def test_scheduler_status_reports_heartbeat():
+    from assetflow import adapters as adapters_mod, scheduler as scheduler_mod
+    manager = adapters_mod.default_manager()
+    sched = scheduler_mod.Scheduler(manager, tick=999)
+    assert sched.status()["running"] is False
+    sched.start()
+    try:
+        st = sched.status()
+        assert st["running"] is True
+        assert st["tick_seconds"] == 999
+        assert st["started_at"] is not None
+    finally:
+        sched.stop()
+
+
 def test_db_change_watermark_roundtrip(tmp_path):
     from assetflow import db
     db.init_engine(f"sqlite:///{tmp_path}/w.db")

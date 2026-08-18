@@ -203,6 +203,13 @@ def create_app(
             raise HTTPException(status_code=400, detail="adapter is not connected")
         return service_mod.run_all(a, limit=limit, time_range=range)
 
+    @app.get("/api/scheduler")
+    def api_scheduler() -> dict:
+        sch = _state.get("scheduler")
+        if sch is None:
+            return {"running": False}
+        return sch.status()
+
     @app.get("/api/schedules")
     def api_schedules() -> dict:
         return {"schedules": db.list_schedules()}
@@ -502,6 +509,7 @@ INDEX_HTML = r"""<!doctype html>
     <label>Limit <input type="text" id="s_limit" placeholder="(none)" style="min-width:80px"/></label>
     <button onclick="addSchedule()">Add schedule</button>
   </div>
+  <div id="s_status" class="cstat"></div>
   <div id="s_list"></div>
   <div class="chint">Schedules run in the background while the app is running, and only while the adapter is connected.
     Pick <b>All endpoints</b> + <b>Since last check</b> for continuous change monitoring.</div>
@@ -547,6 +555,7 @@ function showGallery(){
   document.getElementById('workspace').classList.add('hidden');
   document.getElementById('connpanel').classList.add('hidden');
   document.getElementById('schedpanel').classList.add('hidden');
+  stopSchedPoll();
   document.getElementById('conn').classList.add('hidden');
   document.getElementById('conntoggle').classList.add('hidden');
   document.getElementById('fetchall').classList.add('hidden');
@@ -560,6 +569,8 @@ function showGallery(){
 /* ---------- workspace ---------- */
 async function openAdapter(id){
   ADAPTER=id;
+  stopSchedPoll();
+  document.getElementById('schedpanel').classList.add('hidden');
   DETAIL=await j('/api/adapters/'+id);
   document.getElementById('gallery').classList.add('hidden');
   document.getElementById('workspace').classList.remove('hidden');
@@ -797,11 +808,26 @@ async function runAll(){
 }
 
 /* ---------- schedules ---------- */
+let SCHED_TIMER=null;
 function toggleSched(){
   const p=document.getElementById('schedpanel');
   const open=p.classList.contains('hidden');
   p.classList.toggle('hidden',!open);
-  if(open){ fillSchedQuery(); loadSchedules(); }
+  if(open){ fillSchedQuery(); refreshSched(); SCHED_TIMER=setInterval(refreshSched,5000); }
+  else stopSchedPoll();
+}
+function stopSchedPoll(){ if(SCHED_TIMER){ clearInterval(SCHED_TIMER); SCHED_TIMER=null; } }
+async function refreshSched(){ await loadSchedStatus(); await loadSchedules(); }
+async function loadSchedStatus(){
+  const el=document.getElementById('s_status');
+  let s; try{ s=await j('/api/scheduler'); }catch(e){ el.textContent=''; return; }
+  if(s.running){
+    const tick=s.last_tick_at?new Date(s.last_tick_at).toLocaleTimeString():'—';
+    el.innerHTML='<span style="color:var(--ok)">● scheduler running</span> · every '+Math.round(s.tick_seconds)+'s'+
+      ' · last tick '+esc(tick)+(s.last_ran_count?(' · '+s.last_ran_count+' ran'):'');
+  }else{
+    el.innerHTML='<span style="color:var(--warn)">○ scheduler not running</span> — start the app with <code>assetflow serve</code>';
+  }
 }
 function fillSchedQuery(){
   const sel=document.getElementById('s_query');
@@ -819,8 +845,9 @@ async function loadSchedules(){
     const q=(s.query_id==='*'?'All endpoints':s.query_id);
     const mode=s.time_range?s.time_range:'all time';
     const nxt=s.next_run_at?new Date(s.next_run_at).toLocaleTimeString():'due now';
+    const last=s.last_run_at?('last '+new Date(s.last_run_at).toLocaleTimeString()):'not run yet';
     return '<div class="schedrow"><span>'+esc(q)+' · every '+mins+'m · '+esc(mode)+
-      (s.limit?(' · limit '+s.limit):'')+' · '+(s.enabled?('next '+esc(nxt)):'<i>disabled</i>')+'</span>'+
+      (s.limit?(' · limit '+s.limit):'')+' · '+esc(last)+' · '+(s.enabled?('next '+esc(nxt)):'<i>disabled</i>')+'</span>'+
       '<span class="stog" onclick="toggleSchedule('+s.id+','+(!s.enabled)+')">'+(s.enabled?'disable':'enable')+'</span>'+
       '<span class="sdel" onclick="deleteSchedule('+s.id+')">delete</span></div>';
   }).join('');

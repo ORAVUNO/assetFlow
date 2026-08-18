@@ -60,10 +60,14 @@ class Scheduler:
         self.tick = tick
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.started_at: Optional[datetime] = None
+        self.last_tick_at: Optional[datetime] = None
+        self.last_ran_count: int = 0
 
     def start(self) -> "Scheduler":
         if self._thread is not None:
             return self
+        self.started_at = datetime.now(timezone.utc)
         self._thread = threading.Thread(target=self._loop, name="assetflow-scheduler", daemon=True)
         self._thread.start()
         return self
@@ -71,10 +75,24 @@ class Scheduler:
     def stop(self) -> None:
         self._stop.set()
 
+    def status(self) -> dict:
+        running = self._thread is not None and self._thread.is_alive()
+        return {
+            "running": running,
+            "tick_seconds": self.tick,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+            "last_ran_count": self.last_ran_count,
+        }
+
     def _loop(self) -> None:
         while not self._stop.wait(self.tick):
+            self.last_tick_at = datetime.now(timezone.utc)
             try:
-                tick_once(self.manager)
+                outcomes = tick_once(self.manager)
+                self.last_ran_count = sum(
+                    1 for o in outcomes if o.get("status") in ("ran", "ran-all")
+                )
             except Exception:
                 # A scheduler tick must never take the thread down.
                 pass
