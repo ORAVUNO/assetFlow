@@ -33,6 +33,7 @@ metadata:
     - File Integrity Monitoring
     - Authentication & Access Changes
     - Security Configuration Changes
+    - Asset Inventory
 
 # =============================================================================
 # FEEDS
@@ -99,6 +100,13 @@ feeds:
     description: Scheduled task creation, audit-policy change, event-log clearing, and host firewall rule changes.
     query_ids: [AI022, AI023, AI024, AI025]
     recommended_refresh_frequency: Hourly
+
+  - id: FEED-ASSET-INVENTORY
+    name: Asset Inventory
+    category: Asset Inventory
+    description: Host inventory — one row per host with OS, IP, agent, and cloud metadata.
+    query_ids: [AI026]
+    recommended_refresh_frequency: Daily
 
 queries:
   # ===========================================================================
@@ -744,3 +752,43 @@ queries:
       Windows firewall rule change events: 4946 (added), 4947 (modified),
       4948 (deleted). event.code identifies the change type.
     recommended_refresh_frequency: Hourly
+
+  # ===========================================================================
+  # ASSET INVENTORY
+  # ===========================================================================
+
+  - id: AI026
+    category: Asset Inventory
+    name: Host Inventory
+    status: partially_validated
+    validated: false
+    purpose: Build a host inventory — one row per host with OS, IP, agent, and cloud metadata.
+    esql_query: |
+      FROM logs-*
+      | WHERE host.name IS NOT NULL
+      | STATS
+          OS = VALUES(host.os.name),
+          OSVersion = VALUES(host.os.version),
+          IPs = VALUES(host.ip),
+          Agent = VALUES(agent.type),
+          Cloud = VALUES(cloud.provider),
+          LastSeen = MAX(@timestamp)
+      BY host.name
+      | SORT host.name ASC
+    expected_output_fields:
+      - host.name
+      - OS
+      - OSVersion
+      - IPs
+      - Agent
+      - Cloud
+      - LastSeen
+    notes: >-
+      The Elasticsearch analogue of the Tufin device inventory: one golden row
+      per host from standard ECS fields (host.os.*, host.ip, agent.type,
+      cloud.provider). Host-keyed, so it feeds the unified view and inventory
+      drift — new hosts appear as added, hosts that stop reporting show in the
+      previous snapshot only. Fields that aren't ingested come back empty; for a
+      richer, deduplicated host entity, Elastic's Asset Inventory / entity store
+      (the .entities indices) is a follow-up source.
+    recommended_refresh_frequency: Daily
