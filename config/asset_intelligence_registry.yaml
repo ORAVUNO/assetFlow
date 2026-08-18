@@ -762,27 +762,20 @@ queries:
     name: Host Inventory
     status: partially_validated
     validated: false
-    purpose: Build a rich host inventory — one row per host with OS, hardware, network, agent, and cloud metadata.
+    purpose: Build a host inventory — one row per host with OS, network, users, and activity.
     esql_query: |
       FROM logs-*
       | WHERE host.name IS NOT NULL
       | STATS
           OS = VALUES(host.os.name),
           OSVersion = VALUES(host.os.version),
-          OSFamily = VALUES(host.os.family),
-          Kernel = VALUES(host.os.kernel),
-          Arch = VALUES(host.architecture),
           Domain = VALUES(host.domain),
           IPs = VALUES(host.ip),
           MACs = VALUES(host.mac),
           Agent = VALUES(agent.type),
-          AgentVersion = VALUES(agent.version),
-          CloudProvider = VALUES(cloud.provider),
-          CloudRegion = VALUES(cloud.region),
-          CloudInstance = VALUES(cloud.instance.id),
-          CloudAccount = VALUES(cloud.account.id),
-          Users = COUNT_DISTINCT(user.name),
-          Services = COUNT_DISTINCT(service.name),
+          Users = VALUES(user.name),
+          Services = VALUES(service.name),
+          Events = COUNT(),
           FirstSeen = MIN(@timestamp),
           LastSeen = MAX(@timestamp)
       BY host.name
@@ -791,30 +784,25 @@ queries:
       - host.name
       - OS
       - OSVersion
-      - OSFamily
-      - Kernel
-      - Arch
       - Domain
       - IPs
       - MACs
       - Agent
-      - AgentVersion
-      - CloudProvider
-      - CloudRegion
-      - CloudInstance
-      - CloudAccount
       - Users
       - Services
+      - Events
       - FirstSeen
       - LastSeen
     notes: >-
-      The Elasticsearch analogue of the Tufin device inventory, enriched: one
-      golden row per host from standard ECS fields — OS/kernel/family,
-      architecture, domain, IPs, MACs, agent type+version, full cloud metadata
-      (provider/region/instance/account), plus distinct user and service counts
-      and first/last seen. Host-keyed, so it feeds the unified view and inventory
-      drift (new IP, OS upgrade, new host, host gone dark). Fields not ingested
-      come back empty. For a pre-deduplicated, risk-scored host entity see AI027.
+      The Elasticsearch analogue of the Tufin device inventory: one golden row
+      per host from ECS fields that on-prem Windows/log data reliably carries —
+      OS name/version, domain, IPs, MACs, agent type, the users and services seen
+      on the host, event volume, and first/last seen. (Dropped cloud.*, host OS
+      family/kernel, and architecture — those are typically empty for on-prem
+      Windows event logs. Users/Services list the actual values so you can see
+      what populates.) Host-keyed, so it feeds the unified view and inventory
+      drift (new IP/MAC, OS upgrade, new host, host gone dark). Any field your
+      ingest doesn't set simply comes back empty.
     recommended_refresh_frequency: Daily
 
   - id: AI027
@@ -841,12 +829,14 @@ queries:
       - entity.first_seen_timestamp
       - entity.last_seen_timestamp
     notes: >-
-      Requires the Elastic Security **Entity Store / Asset Inventory** to be
-      enabled. The index name and entity fields vary by Elastic version and space
-      — this targets the default-space host entity index
-      (.entities.v1.latest.security_host_default). If your deployment differs,
-      adjust the FROM index (e.g. a different space suffix, or the risk-score
-      latest index risk-score.risk-score-latest-<space>) and the risk/criticality
-      field names. Marked investigation_required until confirmed against your
-      cluster; it errors (rather than returns empty) if the index is absent.
+      OPTIONAL — only for deployments with the Elastic Security **Entity Store /
+      Asset Inventory** enabled (Kibana → Security → Manage → Entity Store, GA in
+      8.16+). Without it, running this errors with
+      "Unknown index [.entities.v1.latest.security_host_default]" — that is the
+      signal the entity store isn't enabled, not a bug. The index name and entity
+      fields vary by version and space; adjust the FROM index (a different space
+      suffix, or the risk-score latest index risk-score.risk-score-latest-<space>
+      if you use the Risk Engine instead) and the risk/criticality field names to
+      match your cluster. Stays investigation_required until confirmed on a
+      cluster that has the entity store.
     recommended_refresh_frequency: Daily
