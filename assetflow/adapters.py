@@ -1,14 +1,17 @@
 """Adapter model: pluggable data sources, grouped by category.
 
-An **adapter** is a source assetFlow can fetch assets from. Elasticsearch is
-the first one; more (cloud, network, endpoint, CMDB, …) will follow. Each
-adapter carries its own metadata, its own query registry, and its own live
-connection. The UI lists adapters by category and opens one panel per adapter;
-merging data across adapters comes later and builds on this seam.
+An **adapter** is a source assetFlow can fetch assets from. Each adapter *kind*
+(Elasticsearch, Tufin, …) is a template carrying its metadata and query
+registry; you can create **multiple connection instances** of the same kind —
+e.g. two Tufin servers or three Elasticsearch clusters — each with its own
+user-chosen label and live connection. Instances are keyed by id, which is what
+the database scopes each connection's data by; the unified inventory then
+correlates assets across every instance.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -256,9 +259,48 @@ class TufinAdapter(Adapter):
         )
 
 
+@dataclass
+class AdapterKind:
+    """A *type* of data source (Elasticsearch, Tufin, …) — the template from
+    which connection instances are made. Its registry is shared by every
+    instance of the kind; each instance carries its own label and connection."""
+
+    kind: str          # machine id, e.g. "elasticsearch"
+    name: str          # human name, e.g. "Elasticsearch"
+    category: str
+    description: str
+    registry: Registry
+    adapter_cls: type  # Adapter subclass to instantiate
+
+
+def _slugify(text: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", str(text).strip().lower()).strip("-")
+    return s or "connection"
+
+
 class AdapterManager:
-    def __init__(self, adapters: List[Adapter]):
-        self._by_id: Dict[str, Adapter] = {a.info.id: a for a in adapters}
+    """Holds the available adapter *kinds* and the live *instances* (connections).
+
+    Multiple instances of the same kind can coexist — e.g. two Tufin servers —
+    each with its own id, label, and connection. Instances are keyed by id; the
+    id is what the database scopes fetched data by.
+    """
+
+    def __init__(self, kinds: Optional[Dict[str, AdapterKind]] = None):
+        self._kinds: Dict[str, AdapterKind] = dict(kinds or {})
+        self._by_id: Dict[str, Adapter] = {}
+
+    # -- kinds --------------------------------------------------------------
+
+    def kinds(self) -> List[AdapterKind]:
+        return list(self._kinds.values())
+
+    def get_kind(self, kind_id: str) -> AdapterKind:
+        if kind_id not in self._kinds:
+            raise KeyError(f"no adapter kind {kind_id!r}")
+        return self._kinds[kind_id]
+
+    # -- instances ----------------------------------------------------------
 
     def list(self) -> List[Adapter]:
         return list(self._by_id.values())
@@ -274,6 +316,48 @@ class AdapterManager:
             cats.setdefault(a.info.category, []).append(a)
         return cats
 
+    def unique_label(self, label: str, exclude: Optional[str] = None) -> str:
+        """Return ``label``, suffixed if another instance already uses it, so
+        connection labels stay distinct (they key the unified-inventory columns)."""
+        label = (label or "").strip() or "Connection"
+        existing = {a.info.name for a in self._by_id.values() if a.info.id != exclude}
+        if label not in existing:
+            return label
+        n = 2
+        while f"{label} ({n})" in existing:
+            n += 1
+        return f"{label} ({n})"
+
+    def add_instance(
+        self, kind_id: str, label: str, instance_id: Optional[str] = None
+    ) -> Adapter:
+        kind = self.get_kind(kind_id)
+        label = self.unique_label(label or kind.name)
+        if instance_id is None:
+            base = _slugify(label) or kind_id
+            instance_id, n = base, 2
+            while instance_id in self._by_id:
+                instance_id = f"{base}-{n}"
+                n += 1
+        info = AdapterInfo(
+            id=instance_id,
+            name=label,
+            category=kind.category,
+            description=kind.description,
+            kind=kind.kind,
+        )
+        adapter = kind.adapter_cls(info, kind.registry)
+        self._by_id[instance_id] = adapter
+        return adapter
+
+    def rename(self, adapter_id: str, label: str) -> Adapter:
+        a = self.get(adapter_id)
+        a.info.name = self.unique_label(label, exclude=adapter_id)
+        return a
+
+    def remove(self, adapter_id: str) -> None:
+        self._by_id.pop(adapter_id, None)
+
 
 def _find_registry(*candidates: str) -> Optional[str]:
     """Return the first registry path that exists, near cwd or the repo root."""
@@ -288,44 +372,46 @@ def _find_registry(*candidates: str) -> Optional[str]:
     return None
 
 
-def default_manager(registry_path: Optional[str] = None) -> AdapterManager:
-    """Build the adapter manager: the Elasticsearch adapter (ES|QL registry) and
-    the Tufin adapter (SecureTrack REST registry), grouped by category."""
-    reg = load_registry(registry_path)
-    elasticsearch = ElasticsearchAdapter(
-        AdapterInfo(
-            id="elasticsearch",
+def available_kinds(registry_path: Optional[str] = None) -> Dict[str, AdapterKind]:
+    """Build the adapter kinds available on this machine: Elasticsearch (its
+    ES|QL registry) and — when its registry is present — Tufin SecureTrack."""
+    kinds: Dict[str, AdapterKind] = {
+        "elasticsearch": AdapterKind(
+            kind="elasticsearch",
             name="Elasticsearch",
             category="SIEM / Log Analytics",
             description=(
                 "Elastic Security / logs-* — identity, service, application, and "
                 "database asset intelligence via ES|QL."
             ),
-            kind="elasticsearch",
-        ),
-        reg,
-    )
-
-    adapters: List[Adapter] = [elasticsearch]
-
-    tufin_path = _find_registry(
-        "config/tufin_registry.yaml", "tufin_registry.yaml"
-    )
-    if tufin_path:
-        tufin = TufinAdapter(
-            AdapterInfo(
-                id="tufin",
-                name="Tufin SecureTrack",
-                category="Network Security Policy",
-                description=(
-                    "Tufin SecureTrack — device inventory, per-revision change "
-                    "history (who changed what, when), rulebase, network objects, "
-                    "and policy hygiene via the SecureTrack REST API."
-                ),
-                kind="tufin",
-            ),
-            load_registry(tufin_path),
+            registry=load_registry(registry_path),
+            adapter_cls=ElasticsearchAdapter,
         )
-        adapters.append(tufin)
+    }
 
-    return AdapterManager(adapters)
+    tufin_path = _find_registry("config/tufin_registry.yaml", "tufin_registry.yaml")
+    if tufin_path:
+        kinds["tufin"] = AdapterKind(
+            kind="tufin",
+            name="Tufin SecureTrack",
+            category="Network Security Policy",
+            description=(
+                "Tufin SecureTrack — device inventory, per-revision change "
+                "history (who changed what, when), rulebase, network objects, "
+                "and policy hygiene via the SecureTrack REST API."
+            ),
+            registry=load_registry(tufin_path),
+            adapter_cls=TufinAdapter,
+        )
+    return kinds
+
+
+def default_manager(registry_path: Optional[str] = None) -> AdapterManager:
+    """A manager seeded with one default instance per available kind (instance
+    id == kind). This is the in-memory default used outside the web app; the web
+    app persists instances in the database instead (see ``webapp.create_app``)."""
+    kinds = available_kinds(registry_path)
+    manager = AdapterManager(kinds)
+    for kind in kinds.values():
+        manager.add_instance(kind.kind, kind.name, instance_id=kind.kind)
+    return manager

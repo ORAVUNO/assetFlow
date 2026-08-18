@@ -17,7 +17,6 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from . import adapters as adapters_mod
-from . import credstore as credstore_mod
 from . import db
 from . import export as export_mod
 from . import merge as merge_mod
@@ -41,6 +40,15 @@ class ConnectRequest(BaseModel):
     verify_certs: bool = True
     request_timeout: int = 60
     remember: bool = False  # opt-in: save this connection to .env on success
+
+
+class ConnectionCreateRequest(BaseModel):
+    kind: str
+    label: str = ""
+
+
+class ConnectionRenameRequest(BaseModel):
+    label: str
 
 
 class ScheduleRequest(BaseModel):
@@ -88,12 +96,34 @@ def create_app(
     start_scheduler: bool = False,
 ) -> FastAPI:
     db.init_engine(db_url)
-    manager = adapters_mod.default_manager(registry_path)
+
+    # Adapter kinds are templates; connections (instances) are persisted in the
+    # database so multiple instances of a kind — e.g. two Tufin servers — survive
+    # restarts. On a fresh database, seed one default connection per kind.
+    kinds = adapters_mod.available_kinds(registry_path)
+    manager = adapters_mod.AdapterManager(kinds)
+    conns = db.list_connections()
+    if not conns:
+        for kind in kinds.values():
+            db.add_connection(kind.kind, kind.kind, kind.name)
+        conns = db.list_connections()
+    for c in conns:
+        if c["kind"] in kinds:
+            manager.add_instance(c["kind"], c["label"], instance_id=c["id"])
     _state["manager"] = manager
 
-    # Best-effort auto-connect each adapter from environment variables.
+    # Best-effort auto-connect: remembered credentials first, else (for the
+    # default per-kind instance) environment variables.
     for adapter in manager.list():
-        adapter.try_auto_connect()
+        secrets = db.get_connection_secrets(adapter.info.id)
+        if secrets:
+            try:
+                adapter.connect_form(secrets)
+                continue
+            except Exception:
+                pass
+        if adapter.info.id == adapter.info.kind:
+            adapter.try_auto_connect()
 
     if start_scheduler:
         _state["scheduler"] = scheduler_mod.Scheduler(manager).start()
@@ -128,6 +158,45 @@ def create_app(
             ]
         }
 
+    @app.get("/api/kinds")
+    def api_kinds() -> dict:
+        """Adapter kinds that can be instantiated as new connections."""
+        return {
+            "kinds": [
+                {
+                    "kind": k.kind,
+                    "name": k.name,
+                    "category": k.category,
+                    "description": k.description,
+                }
+                for k in manager.kinds()
+            ]
+        }
+
+    @app.post("/api/connections")
+    def api_connection_create(req: "ConnectionCreateRequest") -> dict:
+        try:
+            kind = manager.get_kind(req.kind)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown adapter kind {req.kind}")
+        adapter = manager.add_instance(kind.kind, req.label or kind.name)
+        db.add_connection(adapter.info.id, adapter.info.kind, adapter.info.name)
+        return {"id": adapter.info.id, "name": adapter.info.name, "kind": adapter.info.kind}
+
+    @app.patch("/api/connections/{adapter_id}")
+    def api_connection_rename(adapter_id: str, req: "ConnectionRenameRequest") -> dict:
+        a = _get_adapter(adapter_id)
+        manager.rename(adapter_id, req.label)
+        db.update_connection_label(adapter_id, a.info.name)
+        return {"id": a.info.id, "name": a.info.name}
+
+    @app.delete("/api/connections/{adapter_id}")
+    def api_connection_delete(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        manager.remove(adapter_id)
+        db.delete_connection(adapter_id)
+        return {"ok": True}
+
     @app.get("/api/adapters/{adapter_id}")
     def api_adapter(adapter_id: str) -> dict:
         a = _get_adapter(adapter_id)
@@ -140,7 +209,7 @@ def create_app(
             "kind": a.info.kind,
             "connected": a.connected,
             "conn_info": a.conn_info,
-            "has_saved": credstore_mod.has_saved(a.managed_env_keys()),
+            "has_saved": db.get_connection_secrets(a.info.id) is not None,
             "feeds": [
                 {
                     "id": f.id,
@@ -166,7 +235,10 @@ def create_app(
         saved = False
         if req.remember:
             try:
-                credstore_mod.save(a.managed_env_keys(), a.env_for_form(form))
+                # Persist this instance's connection form (minus the flag) so it
+                # reconnects on restart. Local plaintext, same posture as .env.
+                secrets = {k: v for k, v in form.items() if k != "remember"}
+                db.set_connection_secrets(a.info.id, secrets)
                 saved = True
             except Exception:
                 saved = False  # persistence is best-effort; the connection stands
@@ -175,7 +247,7 @@ def create_app(
     @app.delete("/api/adapters/{adapter_id}/saved-connection")
     def api_forget_connection(adapter_id: str) -> dict:
         a = _get_adapter(adapter_id)
-        credstore_mod.forget(a.managed_env_keys())
+        db.set_connection_secrets(a.info.id, None)
         return {"ok": True}
 
     @app.post("/api/adapters/{adapter_id}/run/{query_id}")
@@ -495,6 +567,9 @@ INDEX_HTML = r"""<!doctype html>
   .card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
   .card p{margin:6px 0 12px;color:var(--muted);font-size:12.5px;min-height:34px}
   .card .foot{display:flex;justify-content:space-between;align-items:center;font-size:11.5px;color:var(--muted)}
+  .cardactions{display:flex;gap:14px;margin-top:10px;padding-top:9px;border-top:1px solid var(--border);font-size:11.5px}
+  .cardactions span{color:var(--accent);cursor:pointer;font-weight:600}
+  .cardactions span.danger{color:var(--bad)}
   .kind{font-size:10px;padding:1px 7px;border-radius:20px;background:var(--code);color:var(--muted);font-weight:600}
   /* workspace */
   .wrap{display:flex;min-height:calc(100vh - 49px)}
@@ -616,26 +691,69 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','
 function val(id){return (document.getElementById(id).value||'').trim();}
 
 /* ---------- gallery ---------- */
+let KINDS=[];
 async function loadGallery(){
-  const g=document.getElementById('gallery'); g.innerHTML='<p class="hint">Loading adapters…</p>';
+  const g=document.getElementById('gallery'); g.innerHTML='<p class="hint">Loading connections…</p>';
   const d=await j('/api/adapters');
+  try{ KINDS=(await j('/api/kinds')).kinds; }catch(e){ KINDS=[]; }
+  let kopts=KINDS.map(k=>'<option value="'+esc(k.kind)+'">'+esc(k.name)+'</option>').join('');
   let h='<div class="gbar"><button class="invbtn" onclick="openInventory()">★ Unified inventory</button>'+
-        '<span style="margin-left:auto">Export all saved data (every adapter): '+
+        '<button class="invbtn" style="background:transparent;color:var(--accent);border:1px solid var(--border)" '+
+          'onclick="toggleAddConn()">＋ Add connection</button>'+
+        '<span style="margin-left:auto">Export all saved data (every connection): '+
         '<span class="exp"><a href="/api/export-all.json">JSON</a> · '+
-        '<a href="/api/export-all.zip">ZIP</a></span></span></div>';
+        '<a href="/api/export-all.zip">ZIP</a></span></span></div>'+
+    '<div id="addconn" class="connpanel hidden" style="border:1px solid var(--border);border-radius:10px;margin-bottom:14px">'+
+      '<div class="connrow">'+
+        '<label>Adapter type <select id="ac_kind">'+kopts+'</select></label>'+
+        '<label>Connection label <input type="text" id="ac_label" placeholder="e.g. Tufin HQ, Elastic – EU"/></label>'+
+        '<button onclick="addConnection()">Create connection</button>'+
+      '</div>'+
+      '<div class="chint">Add another instance of an adapter — e.g. a second Tufin server or a '+
+      'separate Elasticsearch cluster. Each connection keeps its own data and appears '+
+      'separately in the unified inventory.</div></div>';
   d.categories.forEach(cat=>{
     h+='<div class="gcat">'+esc(cat.name)+'</div><div class="cards">';
     cat.adapters.forEach(a=>{
-      h+='<div class="card" onclick="openAdapter(\''+a.id+'\')">'+
+      h+='<div class="card" onclick="openAdapter(\''+esc(a.id)+'\')">'+
          '<h3>'+esc(a.name)+' <span class="kind">'+esc(a.kind)+'</span></h3>'+
          '<p>'+esc(a.description)+'</p>'+
          '<div class="foot"><span>'+a.query_count+' queries · '+a.feed_count+' feeds</span>'+
          '<span>'+(a.connected?'<span class="dot ok"></span>connected':'<span class="dot"></span>not connected')+'</span></div>'+
+         '<div class="cardactions">'+
+           '<span onclick="event.stopPropagation();renameConnection(\''+esc(a.id)+'\',\''+esc(a.name).replace(/'/g,"\\'")+'\')">Rename</span>'+
+           '<span class="danger" onclick="event.stopPropagation();removeConnection(\''+esc(a.id)+'\',\''+esc(a.name).replace(/'/g,"\\'")+'\')">Remove</span>'+
+         '</div>'+
          '</div>';
     });
     h+='</div>';
   });
   g.innerHTML=h;
+}
+function toggleAddConn(){ const p=document.getElementById('addconn'); if(p) p.classList.toggle('hidden'); }
+async function addConnection(){
+  const kind=val('ac_kind')||(KINDS[0]&&KINDS[0].kind);
+  const label=val('ac_label');
+  if(!kind){ alert('No adapter types available.'); return; }
+  try{
+    const r=await j('/api/connections',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:kind,label:label})});
+    await loadGallery(); openAdapter(r.id);
+  }catch(e){ alert('Could not add connection: '+e.message); }
+}
+async function renameConnection(id,current){
+  const label=prompt('New label for this connection:',current||'');
+  if(label==null) return;
+  try{ await j('/api/connections/'+encodeURIComponent(id),{method:'PATCH',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})});
+       loadGallery(); }
+  catch(e){ alert('Could not rename: '+e.message); }
+}
+async function removeConnection(id,label){
+  if(!confirm('Remove connection "'+(label||id)+'"? Its saved data stays in the database but it '+
+              'will no longer appear until re-added.')) return;
+  try{ await j('/api/connections/'+encodeURIComponent(id),{method:'DELETE'}); loadGallery(); }
+  catch(e){ alert('Could not remove: '+e.message); }
 }
 function showGallery(){
   document.getElementById('workspace').classList.add('hidden');
@@ -807,7 +925,7 @@ function updateForget(){
   const el=document.getElementById('c_forget');
   const rem=document.getElementById('c_remember');
   if(DETAIL && DETAIL.has_saved){
-    el.innerHTML='✓ Saved on this machine (in <code>.env</code>) — auto-connects on startup. '+
+    el.innerHTML='✓ Saved on this machine (local database) — this connection auto-connects on startup. '+
       '<a href="#" onclick="forgetConn();return false;" style="color:var(--accent)">Forget saved credentials</a>';
     if(rem) rem.checked=true;
   }else{
@@ -833,9 +951,9 @@ function applyKind(kind){
   document.getElementById('c_user').placeholder = tufin ? 'securetrack-api-user' : 'elastic';
   document.getElementById('c_timeout').value = tufin ? '30' : '60';
   document.getElementById('c_hint').innerHTML = tufin
-    ? 'Credentials are held in this local server\'s memory only — never written to disk. '+
+    ? 'Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). '+
       'Connects to the SecureTrack REST API at <code>https://host/securetrack/api</code>.'
-    : 'Credentials are held in this local server\'s memory only — never written to disk. '+
+    : 'Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). '+
       'Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.';
 }
 

@@ -160,6 +160,72 @@ def test_inventory_asset_detail(client):
     assert client.get("/api/inventory/asset?host=nope").status_code == 404
 
 
+def test_kinds_listing(client):
+    d = client.get("/api/kinds").json()
+    kinds = {k["kind"] for k in d["kinds"]}
+    assert "elasticsearch" in kinds and "tufin" in kinds
+
+
+def test_multiple_connections_lifecycle(client):
+    # default per-kind connections are seeded on a fresh db
+    cats = client.get("/api/adapters").json()["categories"]
+    ids = {a["id"] for c in cats for a in c["adapters"]}
+    assert {"elasticsearch", "tufin"} <= ids
+
+    # add a second Tufin instance with a label
+    r = client.post("/api/connections", json={"kind": "tufin", "label": "Tufin HQ"})
+    assert r.status_code == 200
+    new_id = r.json()["id"]
+    assert new_id != "tufin" and r.json()["name"] == "Tufin HQ"
+
+    # it shows up in the gallery and has its own workspace
+    cats = client.get("/api/adapters").json()["categories"]
+    ids = {a["id"] for c in cats for a in c["adapters"]}
+    assert new_id in ids
+    assert client.get(f"/api/adapters/{new_id}").json()["name"] == "Tufin HQ"
+
+    # rename it
+    rn = client.patch(f"/api/connections/{new_id}", json={"label": "Tufin HQ – EU"})
+    assert rn.status_code == 200 and rn.json()["name"] == "Tufin HQ – EU"
+
+    # remove it
+    assert client.delete(f"/api/connections/{new_id}").status_code == 200
+    ids = {a["id"] for c in client.get("/api/adapters").json()["categories"] for a in c["adapters"]}
+    assert new_id not in ids
+
+    # unknown kind rejected
+    assert client.post("/api/connections", json={"kind": "vmware", "label": "x"}).status_code == 404
+
+
+def test_inventory_spans_multiple_instances(client):
+    # two Elasticsearch instances, each with its own saved data
+    r = client.post("/api/connections", json={"kind": "elasticsearch", "label": "Elastic EU"})
+    eu = r.json()["id"]
+    # connect the new instance (build_client/ping are mocked in the fixture)
+    assert client.post(f"/api/adapters/{eu}/connect", json={"host": "10.0.0.9"}).json()["ok"]
+
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")   # default Elasticsearch
+    client.post(f"/api/adapters/{eu}/run/AI001?limit=5")  # Elastic EU
+
+    d = client.get("/api/inventory").json()
+    cols = [c["name"] for c in d["columns"]]
+    # both instances contribute their own per-connection column, by label
+    assert "Elasticsearch" in cols and "Elastic EU" in cols
+    # same hosts reported by both instances -> seen by 2 "adapters"
+    assert d["multi_adapter_count"] >= 1
+
+
+def test_remembered_connection_persists_secrets(client):
+    r = client.post(f"/api/adapters/{A}/connect",
+                    json={"host": "10.0.0.5", "username": "u", "password": "p", "remember": True})
+    assert r.status_code == 200 and r.json()["saved"] is True
+    # detail now reports saved credentials
+    assert client.get(f"/api/adapters/{A}").json()["has_saved"] is True
+    # forget clears them
+    assert client.delete(f"/api/adapters/{A}/saved-connection").status_code == 200
+    assert client.get(f"/api/adapters/{A}").json()["has_saved"] is False
+
+
 def test_run_placeholder_rejected(client):
     # All shipped queries are now runnable, so force one non-runnable to exercise
     # the 422 "no query defined" branch.

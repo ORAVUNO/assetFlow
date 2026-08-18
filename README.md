@@ -6,11 +6,15 @@ database. Elasticsearch is the first adapter and Tufin SecureTrack is the
 second; more sources plug in beside them, grouped by category, so results from
 many sources can later be merged.
 
-- **Adapters:** each adapter has its own metadata, query registry, and live
-  connection. The UI lists adapters by category; you open one adapter's panel
-  to connect and fetch. Today: **Elasticsearch** (category *SIEM / Log
-  Analytics*) and **Tufin SecureTrack** (category *Network Security Policy* —
-  see [Tufin adapter](#tufin-securetrack-adapter)).
+- **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, …) is a
+  template with its own metadata and query registry. You can create **multiple
+  connections** of the same kind — e.g. two Tufin servers or three Elasticsearch
+  clusters — each with a **label** of its own, its own live connection, and its
+  own saved data. The gallery lists connections by category; **＋ Add
+  connection** creates another instance, and each card can be renamed or removed.
+  Today's kinds: **Elasticsearch** (category *SIEM / Log Analytics*) and **Tufin
+  SecureTrack** (category *Network Security Policy* — see
+  [Tufin adapter](#tufin-securetrack-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity,
