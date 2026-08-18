@@ -301,7 +301,7 @@ def serve(ctx: click.Context, host: str, port: int) -> None:
 
     # Validate the registry up front so failures are clear, not buried in logs.
     _load(ctx.obj["registry_path"])
-    app = create_app(ctx.obj["registry_path"])
+    app = create_app(ctx.obj["registry_path"], start_scheduler=True)
     db_url = os.getenv("DATABASE_URL") or db_mod.DEFAULT_DB_URL
     console.print(f"[green]assetFlow UI[/green] → http://{host}:{port}  (Ctrl+C to stop)")
     console.print(f"[dim]results saved to {db_url}[/dim]")
