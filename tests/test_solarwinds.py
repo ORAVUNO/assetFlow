@@ -176,32 +176,38 @@ def test_classify_firewall_and_load_balancer():
 # --------------------------------------------------------------------------- #
 
 def test_config_inventory_latest_per_type():
+    # The archive is fetched without a join; captions come from NCM.Nodes.
     archive = [
-        {"NodeCaption": "core-rtr-1", "ConfigID": "c3", "ConfigType": "Running",
+        {"NodeID": "g1", "ConfigID": "c3", "ConfigType": "Running",
          "ConfigTitle": "running-3", "DownloadTime": "2026-08-19T02:00:00", "Baseline": False},
-        {"NodeCaption": "core-rtr-1", "ConfigID": "c2", "ConfigType": "Running",
+        {"NodeID": "g1", "ConfigID": "c2", "ConfigType": "Running",
          "ConfigTitle": "running-2", "DownloadTime": "2026-08-18T02:00:00", "Baseline": True},
-        {"NodeCaption": "core-rtr-1", "ConfigID": "c1", "ConfigType": "Startup",
+        {"NodeID": "g1", "ConfigID": "c1", "ConfigType": "Startup",
          "ConfigTitle": "startup-1", "DownloadTime": "2026-08-17T02:00:00", "Baseline": False},
     ]
-    client = FakeClient([("FROM NCM.ConfigArchive", archive)])
+    client = FakeClient([
+        ("FROM NCM.Nodes", [{"NodeID": "g1", "NodeCaption": "core-rtr-1"}]),
+        ("FROM NCM.ConfigArchive", archive),
+    ])
     result = sw_runner_mod.run_query(client, _q("config_inventory", "SW005", "Config Posture"))
     cols = result.column_names
     # Newest per (device, config type): the Running config keeps c3, not c2.
     running = [r for r in result.rows if r[cols.index("config.type")] == "Running"]
     assert len(running) == 1
     assert running[0][cols.index("config.id")] == "c3"
+    assert running[0][cols.index("host.name")] == "core-rtr-1"  # caption merged in
     startup = [r for r in result.rows if r[cols.index("config.type")] == "Startup"]
     assert len(startup) == 1
 
 
-def test_config_inventory_falls_back_to_cirrus():
-    archive = [{"NodeCaption": "sw1", "ConfigID": "x1", "ConfigType": "Running",
+def test_config_inventory_falls_back_to_cirrus_and_nodeid():
+    archive = [{"NodeID": "g9", "ConfigID": "x1", "ConfigType": "Running",
                 "ConfigTitle": "t", "DownloadTime": "2026-08-19T00:00:00", "Baseline": False}]
-    # Only the legacy Cirrus.* entity answers.
+    # Only the legacy Cirrus.* archive answers, and no caption lookup succeeds ->
+    # the row still appears, keyed by NodeID.
     client = FakeClient([("FROM Cirrus.ConfigArchive", archive)])
     result = sw_runner_mod.run_query(client, _q("config_inventory", "SW005", "Config Posture"))
-    assert result.rows[0][result.column_names.index("host.name")] == "sw1"
+    assert result.rows[0][result.column_names.index("host.name")] == "g9"
 
 
 # --------------------------------------------------------------------------- #

@@ -419,25 +419,24 @@ def _collect_config_inventory(client, scan: int) -> Tuple[List[str], List[List[A
         "host.name", "asset.type", "config.type", "config.title",
         "config.id", "captured_at", "baseline",
     ]
+    # Read the archive directly (no join) so a caption-lookup or NCM.Nodes quirk
+    # can't suppress the whole result; the node caption is merged in from a
+    # separate NCM.Nodes lookup by NodeID, falling back to the id itself.
     raw = _first_query(
         client,
         (
-            "SELECT n.NodeCaption, ca.ConfigID, ca.ConfigType, ca.ConfigTitle, "
-            "ca.DownloadTime, ca.Baseline "
-            "FROM NCM.ConfigArchive ca "
-            "INNER JOIN NCM.Nodes n ON ca.NodeID = n.NodeID "
-            "ORDER BY ca.DownloadTime DESC",
-            "SELECT n.NodeCaption, ca.ConfigID, ca.ConfigType, ca.ConfigTitle, "
-            "ca.DownloadTime, ca.Baseline "
-            "FROM Cirrus.ConfigArchive ca "
-            "INNER JOIN Cirrus.Nodes n ON ca.NodeID = n.NodeID "
-            "ORDER BY ca.DownloadTime DESC",
+            "SELECT NodeID, ConfigID, ConfigType, ConfigTitle, DownloadTime, Baseline "
+            "FROM NCM.ConfigArchive ORDER BY DownloadTime DESC",
+            "SELECT NodeID, ConfigID, ConfigType, ConfigTitle, DownloadTime, Baseline "
+            "FROM Cirrus.ConfigArchive ORDER BY DownloadTime DESC",
         ),
     )
+    captions = _ncm_caption_map(client)
     seen: set = set()
     rows: List[List[Any]] = []
     for r in raw:
-        caption = textish(_first(r, "NodeCaption")) or textish(_first(r, "ConfigID"))
+        node_id = textish(_first(r, "NodeID"))
+        caption = captions.get(node_id) or node_id or textish(_first(r, "ConfigID"))
         config_type = textish(_first(r, "ConfigType"))
         key = (caption, config_type)
         if key in seen:  # rows are newest-first, so the first per key wins
@@ -473,10 +472,20 @@ def _ncm_nodes(client) -> List[Tuple[str, str]]:
     return out
 
 
+def _ncm_caption_map(client) -> Dict[str, str]:
+    """Map NCM node id -> caption (for merging onto config-archive rows)."""
+    return {node_id: caption for node_id, caption in _ncm_nodes(client)}
+
+
 def _recent_running_configs(client, node_id: str, limit: int = 2) -> List[Dict[str, Any]]:
-    """The most recent Running configs (with text) for one NCM node, newest first."""
+    """The most recent configs (with text) for one NCM node, newest first.
+
+    Prefers the ``Running`` config type; if a device archives its configs under a
+    different type label (some NCM setups do), falls back to the most recent
+    configs of any type so a diff is still produced.
+    """
     safe_id = str(node_id).replace("'", "''")
-    return _first_query(
+    running = _first_query(
         client,
         (
             f"SELECT TOP {limit} ConfigID, ConfigType, DownloadTime, Config "
@@ -487,6 +496,20 @@ def _recent_running_configs(client, node_id: str, limit: int = 2) -> List[Dict[s
             "AND ConfigType = 'Running' ORDER BY DownloadTime DESC",
         ),
     )
+    if len(running) >= 2:
+        return running
+    any_type = _first_query(
+        client,
+        (
+            f"SELECT TOP {limit} ConfigID, ConfigType, DownloadTime, Config "
+            f"FROM NCM.ConfigArchive WHERE NodeID = '{safe_id}' "
+            "ORDER BY DownloadTime DESC",
+            f"SELECT TOP {limit} ConfigID, ConfigType, DownloadTime, Config "
+            f"FROM Cirrus.ConfigArchive WHERE NodeID = '{safe_id}' "
+            "ORDER BY DownloadTime DESC",
+        ),
+    )
+    return any_type if len(any_type) >= len(running) else running
 
 
 # Volatile config lines that change on every capture without being a real edit;

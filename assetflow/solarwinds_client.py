@@ -311,16 +311,48 @@ def ping(client: SolarWindsClient) -> dict:
     version = _orion_version(client)
     ncm = _ncm_available(client)
     summary = f"SolarWinds SWIS @ {client.host}:{client._active_port or client.port}"
+
+    # Report NCM data presence so the config-posture resources (SW005–SW007)
+    # aren't a black box: distinguish "NCM not detected" from "NCM present but no
+    # configs archived / no compliance run" — the two reasons those return empty.
+    ncm_nodes = _count(client, ("SELECT COUNT(NodeID) AS C FROM NCM.Nodes",
+                                "SELECT COUNT(NodeID) AS C FROM Cirrus.Nodes"))
+    ncm_configs = _count(client, ("SELECT COUNT(ConfigID) AS C FROM NCM.ConfigArchive",
+                                  "SELECT COUNT(ConfigID) AS C FROM Cirrus.ConfigArchive"))
     if not ncm:
-        summary += " · NCM not detected (config posture resources may be empty)"
+        summary += " · NCM not detected (config posture resources will be empty)"
+    else:
+        summary += (
+            f" · NCM: {ncm_nodes if ncm_nodes is not None else '?'} nodes, "
+            f"{ncm_configs if ncm_configs is not None else '?'} configs archived"
+        )
+        if ncm_configs == 0:
+            summary += " (no configs archived yet — SW005/SW006 will be empty)"
     return {
         "product": "SolarWinds Orion (SWIS)",
         "host": client.host,
         "port": client._active_port or client.port,
         "swis_version": version,
         "ncm": ncm,
+        "ncm_nodes": ncm_nodes,
+        "ncm_configs": ncm_configs,
         "summary": summary,
     }
+
+
+def _count(client: SolarWindsClient, swqls) -> Optional[int]:
+    """Best-effort COUNT from the first SWQL variant that runs; None on failure."""
+    for swql in swqls:
+        try:
+            rows = client.query_rows(swql)
+        except Exception:  # pragma: no cover - schema/permission dependent
+            continue
+        if rows:
+            try:
+                return int(rows[0].get("C", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _orion_version(client: SolarWindsClient) -> str:
