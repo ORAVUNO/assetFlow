@@ -111,12 +111,14 @@ queries:
     status: validated
     validated: true
     resource: devices
-    purpose: Inventory every device SecureTrack manages, with vendor, model, management IP, and OS version.
+    purpose: Inventory every device SecureTrack manages, with a derived asset type, vendor, model, IP, and OS version.
     expected_output_fields:
       - host.name          # device / CI name (DetailedDeviceDTO.name)
       - device.id
+      - asset.type         # derived: Firewall / Firewall Management / Virtual Firewall / Router-Switch / Load Balancer
       - device.vendor      # DetailedDeviceDTO.vendor
       - device.model       # DetailedDeviceDTO.model
+      - virtual_type       # DetailedDeviceDTO.virtual_type (vsys/vdom/context)
       - host.ip            # DetailedDeviceDTO.ip
       - os.version         # DetailedDeviceDTO.OS_Version
       - device.domain      # DetailedDeviceDTO.domain_name
@@ -124,11 +126,14 @@ queries:
       - installed_policy   # DetailedDeviceDTO.installed_policy
     notes: >-
       GET /securetrack/api/devices.json?show_os_version=true. Fields confirmed
-      against DetailedDeviceDTO (R25-2): name, vendor, model, ip, OS_Version,
-      domain_name, status, installed_policy (also exposes offline flag,
-      latest_revision, licenses, topology). host.name is the device name so the
-      row folds into the unified host view; it is the anchor for every other
-      Tufin resource, which is keyed by device id.
+      against DetailedDeviceDTO (R25-2). SecureTrack has no explicit device-type
+      field, so asset.type is DERIVED from model, virtual_type, and the
+      management hierarchy: a device that is the parent of other devices — or
+      whose model names a manager (Panorama, FMC, FortiManager, CMA, MDS…) — is
+      "Firewall Management"; a device with a virtual_type is a "Virtual Firewall";
+      router/switch and load-balancer models are labelled accordingly; everything
+      else defaults to "Firewall". host.name is the device name so the row folds
+      into the unified host view; it is the anchor for every other Tufin resource.
     recommended_refresh_frequency: Daily
 
   - id: TUF002

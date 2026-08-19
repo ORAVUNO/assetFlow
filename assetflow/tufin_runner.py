@@ -199,14 +199,50 @@ def _device_key(device: dict) -> Tuple[str, str]:
 # Per-resource collectors → (columns, rows)
 # --------------------------------------------------------------------------- #
 
+# Model substrings that identify a firewall-management server (not a firewall).
+_MGMT_MODEL_HINTS = (
+    "panorama", "fmc", "fpmc", "fortimanager", "cma", "mds", "management",
+    "smart", "mgmt", "cms", "nsx_manager", "meraki_dashboard",
+)
+_ROUTER_HINTS = ("router", "switch", "ios", "nexus")
+_LB_HINTS = ("load_balancer", "balancer", "bigip", "netscaler", "avi")
+
+
+def _asset_type(device: dict, parent_ids: set) -> str:
+    """Derive an asset type from a SecureTrack device record.
+
+    SecureTrack has no explicit device-type field, so this classifies from the
+    model, the virtual_type, and the management hierarchy (a device that is the
+    parent of other devices is a management server).
+    """
+    device_id = str(_first(device, "id", "device_id"))
+    model = str(_first(device, "model")).lower()
+    virtual_type = str(_first(device, "virtual_type")).lower()
+    if device_id in parent_ids or any(h in model for h in _MGMT_MODEL_HINTS):
+        return "Firewall Management"
+    if virtual_type:
+        return f"Virtual Firewall ({virtual_type})"
+    if any(h in model for h in _ROUTER_HINTS):
+        return "Router/Switch"
+    if any(h in model for h in _LB_HINTS):
+        return "Load Balancer"
+    return "Firewall"
+
+
 def _collect_devices(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
     # Field names confirmed against DetailedDeviceDTO (SecureTrack R25-2).
     columns = [
-        "host.name", "device.id", "device.vendor", "device.model", "host.ip",
-        "os.version", "device.domain", "device.status", "installed_policy",
+        "host.name", "device.id", "asset.type", "device.vendor", "device.model",
+        "virtual_type", "host.ip", "os.version", "device.domain", "device.status",
+        "installed_policy",
     ]
+    devices = _fetch_devices(client)
+    # A device that manages others (its id is some device's parent_id) is mgmt.
+    parent_ids = {
+        str(d.get("parent_id")) for d in devices if d.get("parent_id") not in (None, "")
+    }
     rows = []
-    for device in _fetch_devices(client):
+    for device in devices:
         device_id, name = _device_key(device)
         status = textish(_first(device, "status"))
         if not status and "offline" in device:
@@ -214,8 +250,10 @@ def _collect_devices(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
         rows.append([
             name,
             device_id,
+            _asset_type(device, parent_ids),
             textish(_first(device, "vendor", "vendor_name")),
             textish(_first(device, "model", "type", "device_type")),
+            textish(_first(device, "virtual_type")),
             textish(_first(device, "ip", "management_ip", "host")),
             textish(_first(device, "OS_Version", "os_version", "version")),
             textish(_first(device, "domain_name", "domain")),
