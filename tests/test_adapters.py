@@ -56,3 +56,37 @@ def test_run_before_connect_raises(manager):
 def test_unknown_adapter(manager):
     with pytest.raises(KeyError):
         manager.get("nope")
+
+
+def test_multiple_instances_of_same_kind(manager):
+    a = manager.add_instance("tufin", "Tufin HQ")
+    b = manager.add_instance("tufin", "Tufin DR")
+    assert a.info.id != b.info.id
+    assert a.info.kind == b.info.kind == "tufin"
+    # both share the kind's registry but are distinct instances
+    assert a.registry is b.registry
+    ids = [x.info.id for x in manager.list()]
+    assert a.info.id in ids and b.info.id in ids
+    # slug derives from the label
+    assert manager.get(a.info.id).info.name == "Tufin HQ"
+
+
+def test_unique_labels_are_suffixed(manager):
+    a = manager.add_instance("tufin", "Prod")
+    b = manager.add_instance("tufin", "Prod")
+    assert a.info.name == "Prod"
+    assert b.info.name == "Prod (2)"
+
+
+def test_rename_and_remove_instance(manager):
+    a = manager.add_instance("elasticsearch", "Cluster A")
+    manager.rename(a.info.id, "Cluster B")
+    assert manager.get(a.info.id).info.name == "Cluster B"
+    manager.remove(a.info.id)
+    with pytest.raises(KeyError):
+        manager.get(a.info.id)
+
+
+def test_add_instance_unknown_kind(manager):
+    with pytest.raises(KeyError):
+        manager.add_instance("vmware", "vCenter")

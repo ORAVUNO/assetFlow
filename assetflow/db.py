@@ -73,6 +73,34 @@ class FetchRun(Base):
         return rec
 
 
+class Connection(Base):
+    """A configured adapter **instance** (connection).
+
+    assetFlow supports many connections of the same adapter *kind* — e.g. two
+    Tufin servers or three Elasticsearch clusters — each with a user-chosen
+    ``label``. The connection ``id`` is the stable key everything else
+    (``fetch_runs``, ``schedules``, watermarks, changes) is scoped by, so each
+    instance keeps its own data. Remembered credentials are stored here as JSON
+    (plaintext, local file — the same posture as ``.env``; gitignored)."""
+
+    __tablename__ = "connections"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    label: Mapped[str] = mapped_column(String(256), default="")
+    secrets_json: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def to_record(self) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "label": self.label,
+            "has_secrets": bool(self.secrets_json),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class ChangeWatermark(Base):
     """Last revision id already processed per (adapter, device).
 
@@ -248,6 +276,76 @@ def _session() -> Session:
         init_engine()
     assert _Session is not None
     return _Session()
+
+
+# -- connections (adapter instances) ----------------------------------------
+
+
+def list_connections(kind: Optional[str] = None) -> List[dict]:
+    with _session() as s:
+        stmt = select(Connection)
+        if kind:
+            stmt = stmt.where(Connection.kind == kind)
+        return [c.to_record() for c in s.scalars(stmt.order_by(Connection.created_at, Connection.id))]
+
+
+def get_connection(connection_id: str) -> Optional[dict]:
+    with _session() as s:
+        row = s.get(Connection, connection_id)
+        return row.to_record() if row else None
+
+
+def add_connection(connection_id: str, kind: str, label: str) -> dict:
+    with _session() as s:
+        row = Connection(
+            id=connection_id, kind=kind, label=label,
+            secrets_json="", created_at=datetime.now(timezone.utc),
+        )
+        s.add(row)
+        s.commit()
+        return row.to_record()
+
+
+def update_connection_label(connection_id: str, label: str) -> Optional[dict]:
+    with _session() as s:
+        row = s.get(Connection, connection_id)
+        if row is None:
+            return None
+        row.label = label
+        s.commit()
+        return row.to_record()
+
+
+def delete_connection(connection_id: str) -> bool:
+    with _session() as s:
+        row = s.get(Connection, connection_id)
+        if row is None:
+            return False
+        s.delete(row)
+        s.commit()
+        return True
+
+
+def set_connection_secrets(connection_id: str, secrets: Optional[dict]) -> None:
+    """Store (or clear, when ``secrets`` is falsy) a connection's remembered
+    credentials as JSON."""
+    with _session() as s:
+        row = s.get(Connection, connection_id)
+        if row is None:
+            return
+        row.secrets_json = json.dumps(secrets) if secrets else ""
+        s.commit()
+
+
+def get_connection_secrets(connection_id: str) -> Optional[dict]:
+    with _session() as s:
+        row = s.get(Connection, connection_id)
+        if row is None or not row.secrets_json:
+            return None
+        try:
+            return json.loads(row.secrets_json)
+        except ValueError:
+            return None
 
 
 def save_fetch(

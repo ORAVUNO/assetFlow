@@ -122,6 +122,140 @@ def test_merged_view_and_export(client):
     assert client.get(f"/api/adapters/{A}/merged.json").status_code == 200
 
 
+def test_unified_inventory(client):
+    # host-keyed fetch feeds the cross-adapter inventory
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")
+    d = client.get("/api/inventory").json()
+    cols = [c["name"] for c in d["columns"]]
+    assert cols[:7] == [
+        "host.name", "aliases", "category", "identifiers", "seen_by", "adapter_count", "correlated_by",
+    ]
+    assert "Elasticsearch" in cols
+    assert d["asset_count"] >= 1
+    # only one adapter has data here, so nothing is multi-adapter
+    assert d["multi_adapter_count"] == 0
+    assert any(a["id"] == "elasticsearch" for a in d["adapters"])
+
+    hosts = {r[0] for r in d["rows"]}
+    assert {"host-a", "host-b"} <= hosts
+
+    # exports
+    csv = client.get("/api/inventory.csv")
+    assert csv.status_code == 200 and "seen_by" in csv.text
+    assert client.get("/api/inventory.json").status_code == 200
+    assert client.get("/api/inventory.xml").status_code == 400
+
+
+def test_inventory_asset_detail(client):
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")  # host.name + LoginCount
+    d = client.get("/api/inventory/asset?host=host-a").json()
+    assert d["found"] is True and d["host"] == "host-a"
+    assert any(a["id"] == "elasticsearch" for a in d["adapters"])
+    # LoginCount is a field of this single-adapter asset -> specific
+    lc = next((f for f in d["fields"] if f["name"] == "LoginCount"), None)
+    assert lc is not None and lc["scope"] == "specific"
+    # the AI001 result is available as a mini table
+    assert any(t["query_id"] == "AI001" for t in d["tables"])
+    # unknown host -> 404
+    assert client.get("/api/inventory/asset?host=nope").status_code == 404
+
+
+def test_inventory_types_and_switch(client):
+    # AI001 returns host.name + user.name -> feeds both device and user types
+    fake = QueryResult(
+        columns=[{"name": "host.name"}, {"name": "user.name"}],
+        rows=[["host-a", "admin"], ["host-b", "admin"]],
+    )
+    import assetflow.runner as rm
+    orig = rm.run_query
+    rm.run_query = lambda c, q, limit=None, time_range=None: fake
+    try:
+        client.post(f"/api/adapters/{A}/run/AI001?limit=5")
+    finally:
+        rm.run_query = orig
+
+    types = {t["type"]: t["count"] for t in client.get("/api/inventory/types").json()["types"]}
+    assert types["device"] == 2 and types["user"] == 1 and "application" in types
+
+    users = client.get("/api/inventory?type=user").json()
+    assert users["type"] == "user"
+    assert [c["name"] for c in users["columns"]][0] == "user.name"
+    assert {r[0] for r in users["rows"]} == {"admin"}
+
+    # asset detail for a user
+    d = client.get("/api/inventory/asset?host=admin&type=user").json()
+    assert d["found"] is True and d["type"] == "user"
+
+    # unknown type rejected
+    assert client.get("/api/inventory?type=vmware").status_code == 404
+
+
+def test_kinds_listing(client):
+    d = client.get("/api/kinds").json()
+    kinds = {k["kind"] for k in d["kinds"]}
+    assert "elasticsearch" in kinds and "tufin" in kinds
+
+
+def test_multiple_connections_lifecycle(client):
+    # default per-kind connections are seeded on a fresh db
+    cats = client.get("/api/adapters").json()["categories"]
+    ids = {a["id"] for c in cats for a in c["adapters"]}
+    assert {"elasticsearch", "tufin"} <= ids
+
+    # add a second Tufin instance with a label
+    r = client.post("/api/connections", json={"kind": "tufin", "label": "Tufin HQ"})
+    assert r.status_code == 200
+    new_id = r.json()["id"]
+    assert new_id != "tufin" and r.json()["name"] == "Tufin HQ"
+
+    # it shows up in the gallery and has its own workspace
+    cats = client.get("/api/adapters").json()["categories"]
+    ids = {a["id"] for c in cats for a in c["adapters"]}
+    assert new_id in ids
+    assert client.get(f"/api/adapters/{new_id}").json()["name"] == "Tufin HQ"
+
+    # rename it
+    rn = client.patch(f"/api/connections/{new_id}", json={"label": "Tufin HQ – EU"})
+    assert rn.status_code == 200 and rn.json()["name"] == "Tufin HQ – EU"
+
+    # remove it
+    assert client.delete(f"/api/connections/{new_id}").status_code == 200
+    ids = {a["id"] for c in client.get("/api/adapters").json()["categories"] for a in c["adapters"]}
+    assert new_id not in ids
+
+    # unknown kind rejected
+    assert client.post("/api/connections", json={"kind": "vmware", "label": "x"}).status_code == 404
+
+
+def test_inventory_spans_multiple_instances(client):
+    # two Elasticsearch instances, each with its own saved data
+    r = client.post("/api/connections", json={"kind": "elasticsearch", "label": "Elastic EU"})
+    eu = r.json()["id"]
+    # connect the new instance (build_client/ping are mocked in the fixture)
+    assert client.post(f"/api/adapters/{eu}/connect", json={"host": "10.0.0.9"}).json()["ok"]
+
+    client.post(f"/api/adapters/{A}/run/AI001?limit=5")   # default Elasticsearch
+    client.post(f"/api/adapters/{eu}/run/AI001?limit=5")  # Elastic EU
+
+    d = client.get("/api/inventory").json()
+    cols = [c["name"] for c in d["columns"]]
+    # both instances contribute their own per-connection column, by label
+    assert "Elasticsearch" in cols and "Elastic EU" in cols
+    # same hosts reported by both instances -> seen by 2 "adapters"
+    assert d["multi_adapter_count"] >= 1
+
+
+def test_remembered_connection_persists_secrets(client):
+    r = client.post(f"/api/adapters/{A}/connect",
+                    json={"host": "10.0.0.5", "username": "u", "password": "p", "remember": True})
+    assert r.status_code == 200 and r.json()["saved"] is True
+    # detail now reports saved credentials
+    assert client.get(f"/api/adapters/{A}").json()["has_saved"] is True
+    # forget clears them
+    assert client.delete(f"/api/adapters/{A}/saved-connection").status_code == 200
+    assert client.get(f"/api/adapters/{A}").json()["has_saved"] is False
+
+
 def test_run_placeholder_rejected(client):
     # All shipped queries are now runnable, so force one non-runnable to exercise
     # the 422 "no query defined" branch.

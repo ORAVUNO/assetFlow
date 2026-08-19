@@ -6,11 +6,15 @@ database. Elasticsearch is the first adapter and Tufin SecureTrack is the
 second; more sources plug in beside them, grouped by category, so results from
 many sources can later be merged.
 
-- **Adapters:** each adapter has its own metadata, query registry, and live
-  connection. The UI lists adapters by category; you open one adapter's panel
-  to connect and fetch. Today: **Elasticsearch** (category *SIEM / Log
-  Analytics*) and **Tufin SecureTrack** (category *Network Security Policy* —
-  see [Tufin adapter](#tufin-securetrack-adapter)).
+- **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, …) is a
+  template with its own metadata and query registry. You can create **multiple
+  connections** of the same kind — e.g. two Tufin servers or three Elasticsearch
+  clusters — each with a **label** of its own, its own live connection, and its
+  own saved data. The gallery lists connections by category; **＋ Add
+  connection** creates another instance, and each card can be renamed or removed.
+  Today's kinds: **Elasticsearch** (category *SIEM / Log Analytics*) and **Tufin
+  SecureTrack** (category *Network Security Policy* — see
+  [Tufin adapter](#tufin-securetrack-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity,
@@ -25,7 +29,9 @@ many sources can later be merged.
 - **CLI:** `assetflow` validates the registry, connects, runs queries, and
   serves the web UI.
 
-**Developer guides** (how the code works, per adapter):
+**Developer guides** (how the code works):
+[`docs/unified_inventory.md`](docs/unified_inventory.md) — cross-adapter
+correlation design, decisions & flow ·
 [`docs/elasticsearch_integration.md`](docs/elasticsearch_integration.md) ·
 [`docs/tufin_integration.md`](docs/tufin_integration.md) ·
 [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md).
@@ -133,9 +139,57 @@ builds a unified, host-keyed view from everything saved for that adapter:
 
 Queries that aren't host-keyed (e.g. service-aggregated `AI010`/`AI012`) can't
 be a host row; they're listed as *not host-keyed* and appear only as sheets.
-This is the intra-adapter merge; cross-adapter reconciliation (merging the same
-host/asset seen by multiple adapters) builds on the same shape in a later
-round.
+This is the intra-adapter merge.
+
+### Unified inventory (across all adapters)
+
+The **★ Unified inventory** button on the adapter gallery is the cross-adapter
+view: it folds every adapter's results into **one asset per entity** and shows
+*which adapters saw it*. This is where the same entity reported by more than one
+source is reconciled.
+
+- **Asset types.** The inventory has a type switch — **Devices**, **Users**, and
+  **Applications** — and each type is correlated **separately** in its own
+  namespace (a user is never merged into a device). Devices key on
+  hostname/IP/MAC/serial, users on name/email/SID/UPN, applications on their
+  name. A single query row can feed more than one type: a "user on host" row
+  contributes a Device *and* a User (so opening the `admin` user shows every host
+  it appears on).
+- **Device categories.** Router / firewall / switch / server aren't separate
+  types — they're one Device type with a derived **category** attribute,
+  classified from vendor / model / OS (e.g. Palo Alto → firewall, Catalyst →
+  switch, ASR → router, Windows Server → server), falling back to the source
+  adapter's data category. The Devices inventory shows a `category` column and a
+  category sub-filter, and the category appears on each asset's detail.
+
+- **Correlated on shared identifiers, not just the hostname.** Assets are merged
+  by matching any shared identifier — `host.name`, `host.ip`, `host.mac`,
+  serial, or cloud instance id (MACs are matched regardless of `:`/`-`
+  formatting; empty/loopback/all-zero placeholders are ignored). So a machine
+  reported as `WIN-DC01` by one adapter and `dc01.corp.local` by another
+  collapses into **one** asset when they share, e.g., an IP or MAC. The other
+  names appear in an **aliases** column, and a **correlated by** column shows
+  which identifier merged them.
+- **One row per asset**, with the primary `host.name`, `aliases`, `host.ip`, a
+  **Seen by** list of the adapters that reported it, an **adapter count**,
+  **correlated by**, and one column per adapter summarizing what it captured.
+- **Assets seen by multiple adapters surface first** and are highlighted, so
+  overlap between sources is immediately visible.
+- Downloadable as CSV/JSON, and available over the API at `/api/inventory`
+  (`/api/inventory.csv`, `/api/inventory.json`).
+
+**Click any asset row** to open its drill-down (API: `/api/inventory/asset?host=…`):
+
+- **All fields — aggregated & preferred.** Every attribute the adapters
+  reported, flattened to distinct values, each with a **preferred** best-guess
+  value (the value the most adapters agree on) and a per-adapter breakdown. Each
+  field is tagged **common** (reported by 2+ adapters) or **specific** (only one
+  source); a **differs** flag marks common fields whose adapters disagree.
+- **View by adapter.** A dropdown switches from the aggregated view to a single
+  adapter — showing exactly the fields *that* adapter provides, still tagged
+  common vs specific to it.
+- **Detail tables.** Multi-row fields (users, revisions, applications, …) are
+  kept as their original per-query tables and expand in place under the asset.
 
 **Connecting from the browser:** click **Connection** in the header to open a
 form — enter your **hostname or IP** (a bare host becomes `https://host:9200`;

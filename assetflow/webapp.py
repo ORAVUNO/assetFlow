@@ -17,7 +17,6 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from . import adapters as adapters_mod
-from . import credstore as credstore_mod
 from . import db
 from . import export as export_mod
 from . import merge as merge_mod
@@ -41,6 +40,15 @@ class ConnectRequest(BaseModel):
     verify_certs: bool = True
     request_timeout: int = 60
     remember: bool = False  # opt-in: save this connection to .env on success
+
+
+class ConnectionCreateRequest(BaseModel):
+    kind: str
+    label: str = ""
+
+
+class ConnectionRenameRequest(BaseModel):
+    label: str
 
 
 class ScheduleRequest(BaseModel):
@@ -88,12 +96,34 @@ def create_app(
     start_scheduler: bool = False,
 ) -> FastAPI:
     db.init_engine(db_url)
-    manager = adapters_mod.default_manager(registry_path)
+
+    # Adapter kinds are templates; connections (instances) are persisted in the
+    # database so multiple instances of a kind — e.g. two Tufin servers — survive
+    # restarts. On a fresh database, seed one default connection per kind.
+    kinds = adapters_mod.available_kinds(registry_path)
+    manager = adapters_mod.AdapterManager(kinds)
+    conns = db.list_connections()
+    if not conns:
+        for kind in kinds.values():
+            db.add_connection(kind.kind, kind.kind, kind.name)
+        conns = db.list_connections()
+    for c in conns:
+        if c["kind"] in kinds:
+            manager.add_instance(c["kind"], c["label"], instance_id=c["id"])
     _state["manager"] = manager
 
-    # Best-effort auto-connect each adapter from environment variables.
+    # Best-effort auto-connect: remembered credentials first, else (for the
+    # default per-kind instance) environment variables.
     for adapter in manager.list():
-        adapter.try_auto_connect()
+        secrets = db.get_connection_secrets(adapter.info.id)
+        if secrets:
+            try:
+                adapter.connect_form(secrets)
+                continue
+            except Exception:
+                pass
+        if adapter.info.id == adapter.info.kind:
+            adapter.try_auto_connect()
 
     if start_scheduler:
         _state["scheduler"] = scheduler_mod.Scheduler(manager).start()
@@ -128,6 +158,45 @@ def create_app(
             ]
         }
 
+    @app.get("/api/kinds")
+    def api_kinds() -> dict:
+        """Adapter kinds that can be instantiated as new connections."""
+        return {
+            "kinds": [
+                {
+                    "kind": k.kind,
+                    "name": k.name,
+                    "category": k.category,
+                    "description": k.description,
+                }
+                for k in manager.kinds()
+            ]
+        }
+
+    @app.post("/api/connections")
+    def api_connection_create(req: "ConnectionCreateRequest") -> dict:
+        try:
+            kind = manager.get_kind(req.kind)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown adapter kind {req.kind}")
+        adapter = manager.add_instance(kind.kind, req.label or kind.name)
+        db.add_connection(adapter.info.id, adapter.info.kind, adapter.info.name)
+        return {"id": adapter.info.id, "name": adapter.info.name, "kind": adapter.info.kind}
+
+    @app.patch("/api/connections/{adapter_id}")
+    def api_connection_rename(adapter_id: str, req: "ConnectionRenameRequest") -> dict:
+        a = _get_adapter(adapter_id)
+        manager.rename(adapter_id, req.label)
+        db.update_connection_label(adapter_id, a.info.name)
+        return {"id": a.info.id, "name": a.info.name}
+
+    @app.delete("/api/connections/{adapter_id}")
+    def api_connection_delete(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        manager.remove(adapter_id)
+        db.delete_connection(adapter_id)
+        return {"ok": True}
+
     @app.get("/api/adapters/{adapter_id}")
     def api_adapter(adapter_id: str) -> dict:
         a = _get_adapter(adapter_id)
@@ -140,7 +209,7 @@ def create_app(
             "kind": a.info.kind,
             "connected": a.connected,
             "conn_info": a.conn_info,
-            "has_saved": credstore_mod.has_saved(a.managed_env_keys()),
+            "has_saved": db.get_connection_secrets(a.info.id) is not None,
             "feeds": [
                 {
                     "id": f.id,
@@ -166,7 +235,10 @@ def create_app(
         saved = False
         if req.remember:
             try:
-                credstore_mod.save(a.managed_env_keys(), a.env_for_form(form))
+                # Persist this instance's connection form (minus the flag) so it
+                # reconnects on restart. Local plaintext, same posture as .env.
+                secrets = {k: v for k, v in form.items() if k != "remember"}
+                db.set_connection_secrets(a.info.id, secrets)
                 saved = True
             except Exception:
                 saved = False  # persistence is best-effort; the connection stands
@@ -175,7 +247,7 @@ def create_app(
     @app.delete("/api/adapters/{adapter_id}/saved-connection")
     def api_forget_connection(adapter_id: str) -> dict:
         a = _get_adapter(adapter_id)
-        credstore_mod.forget(a.managed_env_keys())
+        db.set_connection_secrets(a.info.id, None)
         return {"ok": True}
 
     @app.post("/api/adapters/{adapter_id}/run/{query_id}")
@@ -365,6 +437,56 @@ def create_app(
             )
         raise HTTPException(status_code=400, detail="format must be json or zip")
 
+    def _check_type(asset_type: str) -> str:
+        if asset_type not in merge_mod.ASSET_TYPES:
+            raise HTTPException(status_code=404, detail=f"unknown asset type {asset_type}")
+        return asset_type
+
+    @app.get("/api/inventory/types")
+    def api_inventory_types() -> dict:
+        """Asset types and how many correlated assets of each the data yields."""
+        return {"types": merge_mod.inventory_types(_blocks(None))}
+
+    @app.get("/api/inventory")
+    def api_inventory(type: str = QueryParam(default=merge_mod.DEFAULT_TYPE)) -> dict:
+        """Cross-adapter unified inventory for one asset type (device / user /
+        application): one asset per correlated entity, with the adapters that saw
+        it. Assets seen by multiple adapters surface first."""
+        return merge_mod.build_unified_inventory(_blocks(None), _check_type(type))
+
+    @app.get("/api/inventory.{fmt}")
+    def api_inventory_export(
+        fmt: str, type: str = QueryParam(default=merge_mod.DEFAULT_TYPE)
+    ) -> Response:
+        inv = merge_mod.build_unified_inventory(_blocks(None), _check_type(type))
+        result = QueryResult(columns=inv["columns"], rows=inv["rows"])
+        stem = f"assetflow-inventory-{type}"
+        if fmt == "csv":
+            return Response(
+                content=result.to_csv(),
+                media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{stem}.csv"'},
+            )
+        if fmt == "json":
+            return Response(
+                content=result.to_json(),
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="{stem}.json"'},
+            )
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+
+    @app.get("/api/inventory/asset")
+    def api_inventory_asset(
+        host: str = QueryParam(..., min_length=1),
+        type: str = QueryParam(default=merge_mod.DEFAULT_TYPE),
+    ) -> dict:
+        """Full cross-adapter detail for one asset: aggregated/preferred fields
+        (tagged common vs adapter-specific) and per-query mini tables."""
+        detail = merge_mod.build_asset_detail(_blocks(None), host, _check_type(type))
+        if not detail["found"]:
+            raise HTTPException(status_code=404, detail=f"no saved {type} data for {host!r}")
+        return detail
+
     @app.get("/api/export-all.{fmt}")
     def api_export_platform(fmt: str) -> Response:
         return _bundle_response("platform", _blocks(None), fmt, "assetflow-export")
@@ -462,6 +584,9 @@ INDEX_HTML = r"""<!doctype html>
   .card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
   .card p{margin:6px 0 12px;color:var(--muted);font-size:12.5px;min-height:34px}
   .card .foot{display:flex;justify-content:space-between;align-items:center;font-size:11.5px;color:var(--muted)}
+  .cardactions{display:flex;gap:14px;margin-top:10px;padding-top:9px;border-top:1px solid var(--border);font-size:11.5px}
+  .cardactions span{color:var(--accent);cursor:pointer;font-weight:600}
+  .cardactions span.danger{color:var(--bad)}
   .kind{font-size:10px;padding:1px 7px;border-radius:20px;background:var(--code);color:var(--muted);font-weight:600}
   /* workspace */
   .wrap{display:flex;min-height:calc(100vh - 49px)}
@@ -500,6 +625,25 @@ INDEX_HTML = r"""<!doctype html>
   .minihdr.dim{color:var(--muted);font-weight:500}
   .sheethdr{margin:18px 0 2px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
   .mini table{font-size:12px}
+  /* unified inventory */
+  tr.multi td{background:color-mix(in srgb,var(--accent) 12%,transparent) !important;font-weight:600}
+  .invbtn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
+          padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .backlink{color:var(--accent);cursor:pointer;font-weight:600}
+  .typeswitch{display:flex;gap:8px;margin:12px 0 4px;flex-wrap:wrap}
+  .typepill{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:20px;
+            padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .typepill.active{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+  .typepill .pilln{opacity:.7;font-weight:500;margin-left:4px}
+  .typepill.active .pilln{opacity:.85}
+  .scopetag{font-size:10px;padding:1px 7px;border-radius:20px;font-weight:600;white-space:nowrap}
+  .scopetag.common{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+  .scopetag.specific{background:color-mix(in srgb,var(--info) 20%,transparent);color:var(--info)}
+  .scopetag.conflict{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+  details.asset-det{border:1px solid var(--border);border-radius:8px;margin:8px 0;background:var(--panel)}
+  details.asset-det>summary{cursor:pointer;padding:9px 12px;font-size:12.5px;font-weight:600;user-select:none}
+  details.asset-det[open]>summary{border-bottom:1px solid var(--border)}
+  details.asset-det .mini{padding:10px 12px}
 </style>
 </head>
 <body>
@@ -570,25 +714,69 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','
 function val(id){return (document.getElementById(id).value||'').trim();}
 
 /* ---------- gallery ---------- */
+let KINDS=[];
 async function loadGallery(){
-  const g=document.getElementById('gallery'); g.innerHTML='<p class="hint">Loading adapters…</p>';
+  const g=document.getElementById('gallery'); g.innerHTML='<p class="hint">Loading connections…</p>';
   const d=await j('/api/adapters');
-  let h='<div class="gbar">Export all saved data (every adapter): '+
+  try{ KINDS=(await j('/api/kinds')).kinds; }catch(e){ KINDS=[]; }
+  let kopts=KINDS.map(k=>'<option value="'+esc(k.kind)+'">'+esc(k.name)+'</option>').join('');
+  let h='<div class="gbar"><button class="invbtn" onclick="openInventory()">★ Unified inventory</button>'+
+        '<button class="invbtn" style="background:transparent;color:var(--accent);border:1px solid var(--border)" '+
+          'onclick="toggleAddConn()">＋ Add connection</button>'+
+        '<span style="margin-left:auto">Export all saved data (every connection): '+
         '<span class="exp"><a href="/api/export-all.json">JSON</a> · '+
-        '<a href="/api/export-all.zip">ZIP</a></span></div>';
+        '<a href="/api/export-all.zip">ZIP</a></span></span></div>'+
+    '<div id="addconn" class="connpanel hidden" style="border:1px solid var(--border);border-radius:10px;margin-bottom:14px">'+
+      '<div class="connrow">'+
+        '<label>Adapter type <select id="ac_kind">'+kopts+'</select></label>'+
+        '<label>Connection label <input type="text" id="ac_label" placeholder="e.g. Tufin HQ, Elastic – EU"/></label>'+
+        '<button onclick="addConnection()">Create connection</button>'+
+      '</div>'+
+      '<div class="chint">Add another instance of an adapter — e.g. a second Tufin server or a '+
+      'separate Elasticsearch cluster. Each connection keeps its own data and appears '+
+      'separately in the unified inventory.</div></div>';
   d.categories.forEach(cat=>{
     h+='<div class="gcat">'+esc(cat.name)+'</div><div class="cards">';
     cat.adapters.forEach(a=>{
-      h+='<div class="card" onclick="openAdapter(\''+a.id+'\')">'+
+      h+='<div class="card" onclick="openAdapter(\''+esc(a.id)+'\')">'+
          '<h3>'+esc(a.name)+' <span class="kind">'+esc(a.kind)+'</span></h3>'+
          '<p>'+esc(a.description)+'</p>'+
          '<div class="foot"><span>'+a.query_count+' queries · '+a.feed_count+' feeds</span>'+
          '<span>'+(a.connected?'<span class="dot ok"></span>connected':'<span class="dot"></span>not connected')+'</span></div>'+
+         '<div class="cardactions">'+
+           '<span onclick="event.stopPropagation();renameConnection(\''+esc(a.id)+'\',\''+esc(a.name).replace(/'/g,"\\'")+'\')">Rename</span>'+
+           '<span class="danger" onclick="event.stopPropagation();removeConnection(\''+esc(a.id)+'\',\''+esc(a.name).replace(/'/g,"\\'")+'\')">Remove</span>'+
+         '</div>'+
          '</div>';
     });
     h+='</div>';
   });
   g.innerHTML=h;
+}
+function toggleAddConn(){ const p=document.getElementById('addconn'); if(p) p.classList.toggle('hidden'); }
+async function addConnection(){
+  const kind=val('ac_kind')||(KINDS[0]&&KINDS[0].kind);
+  const label=val('ac_label');
+  if(!kind){ alert('No adapter types available.'); return; }
+  try{
+    const r=await j('/api/connections',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:kind,label:label})});
+    await loadGallery(); openAdapter(r.id);
+  }catch(e){ alert('Could not add connection: '+e.message); }
+}
+async function renameConnection(id,current){
+  const label=prompt('New label for this connection:',current||'');
+  if(label==null) return;
+  try{ await j('/api/connections/'+encodeURIComponent(id),{method:'PATCH',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})});
+       loadGallery(); }
+  catch(e){ alert('Could not rename: '+e.message); }
+}
+async function removeConnection(id,label){
+  if(!confirm('Remove connection "'+(label||id)+'"? Its saved data stays in the database but it '+
+              'will no longer appear until re-added.')) return;
+  try{ await j('/api/connections/'+encodeURIComponent(id),{method:'DELETE'}); loadGallery(); }
+  catch(e){ alert('Could not remove: '+e.message); }
 }
 function showGallery(){
   document.getElementById('workspace').classList.add('hidden');
@@ -604,6 +792,157 @@ function showGallery(){
   document.getElementById('gallery').classList.remove('hidden');
   ADAPTER=null; loadGallery();
 }
+
+/* ---------- unified inventory (cross-adapter, layer 3) ---------- */
+let INV_TYPE='device', INV_TYPES=[];
+async function openInventory(type){
+  if(type) INV_TYPE=type;
+  const g=document.getElementById('gallery');
+  g.innerHTML='<p class="hint">Correlating assets across adapters…</p>';
+  try{ INV_TYPES=(await j('/api/inventory/types')).types; }catch(e){ INV_TYPES=[]; }
+  if(!INV_TYPES.some(t=>t.type===INV_TYPE) && INV_TYPES[0]) INV_TYPE=INV_TYPES[0].type;
+  let d; try{ d=await j('/api/inventory?type='+encodeURIComponent(INV_TYPE)); }
+  catch(e){ g.innerHTML='<div class="err">'+esc(e.message)+'</div>'+
+    '<p><span class="backlink" onclick="showGallery()">← Back to adapters</span></p>'; return; }
+  const names=d.adapters.map(a=>a.name);
+  const pills=INV_TYPES.map(t=>'<button class="typepill'+(t.type===INV_TYPE?' active':'')+'" '+
+    'onclick="openInventory(\''+esc(t.type)+'\')">'+esc(t.label)+' <span class="pilln">'+t.count+'</span></button>').join('');
+  let h='<div class="gbar"><span class="backlink" onclick="showGallery()">← Back to adapters</span></div>'+
+    '<h2 style="margin:6px 0 2px">Unified Inventory</h2>'+
+    '<div class="sub">One row per asset, correlated across every adapter by shared '+
+    'identifiers of its type. Each type (devices, users, applications) is correlated '+
+    'separately. Rows highlighted in blue are seen by more than one adapter. '+
+    '<b>Click a row</b> to open the asset.</div>'+
+    '<div class="typeswitch">'+pills+'</div>'+
+    '<div class="meta">'+d.asset_count+' asset(s) · '+d.multi_adapter_count+
+    ' seen by multiple adapters · '+(d.correlated_count||0)+' merged via shared identifiers'+
+    ' · adapters: '+esc(names.join(', ')||'none')+
+    ' · <a class="dl" href="/api/inventory.csv?type='+esc(INV_TYPE)+'">Download CSV</a>'+
+    ' · <a class="dl" href="/api/inventory.json?type='+esc(INV_TYPE)+'">Download JSON</a></div>'+
+    '<div id="invtable"></div>';
+  g.innerHTML=h;
+  const t=document.getElementById('invtable');
+  if(d.rows.length){
+    const cols=d.columns.map(c=>c.name);
+    const ci=cols.indexOf('adapter_count');
+    const cat=cols.indexOf('category');
+    let filtered=d.rows.slice();
+    const draw=(rows)=>mountTable(t, cols, rows, {
+      rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
+      onRow:r=>openAsset(r[0], INV_TYPE),
+    });
+    if(cat>=0){
+      const kinds=Array.from(new Set(d.rows.map(r=>r[cat]||'unknown'))).sort();
+      const sel=document.createElement('div'); sel.className='typeswitch';
+      sel.innerHTML='<label class="hint" style="display:flex;align-items:center;gap:6px">Category '+
+        '<select id="catfilter"><option value="">All ('+d.rows.length+')</option>'+
+        kinds.map(k=>{const n=d.rows.filter(r=>(r[cat]||'unknown')===k).length;
+          return '<option value="'+esc(k)+'">'+esc(k)+' ('+n+')</option>';}).join('')+
+        '</select></label>';
+      t.parentNode.insertBefore(sel, t);
+      sel.querySelector('#catfilter').onchange=e=>{
+        const v=e.target.value;
+        draw(v?d.rows.filter(r=>(r[cat]||'unknown')===v):d.rows);
+      };
+    }
+    draw(filtered);
+  }else{
+    t.innerHTML='<p class="hint">No '+esc(INV_TYPE)+' assets saved yet. Open a connection, connect, '+
+      'and fetch a query that returns this asset type — assets appear here as adapters report them.</p>';
+  }
+}
+
+/* ---------- asset drill-down (open one host) ---------- */
+let ASSET=null, ASSET_VIEW='__all__';
+async function openAsset(host, type){
+  const g=document.getElementById('gallery');
+  g.innerHTML='<p class="hint">Loading asset '+esc(host)+'…</p>';
+  const q='host='+encodeURIComponent(host)+'&type='+encodeURIComponent(type||INV_TYPE);
+  try{ ASSET=await j('/api/inventory/asset?'+q); }
+  catch(e){ g.innerHTML='<div class="err">'+esc(e.message)+'</div>'+
+    '<p><span class="backlink" onclick="openInventory()">← Back to inventory</span></p>'; return; }
+  ASSET_VIEW='__all__';
+  renderAsset();
+}
+function renderAsset(){
+  const g=document.getElementById('gallery'), a=ASSET; if(!a) return;
+  const adapters=a.adapters;
+  let opts='<option value="__all__">All adapters (aggregated)</option>';
+  adapters.forEach(ad=>{ opts+='<option value="'+esc(ad.id)+'"'+
+    (ASSET_VIEW===ad.id?' selected':'')+'>'+esc(ad.name)+'</option>'; });
+  const IDLBL={ip:'host.ip',mac:'host.mac',serial:'serial',uid:'id',name:'host.name'};
+  const cb=a.correlated_by||{};
+  const cbtxt=['mac','serial','uid','ip'].filter(k=>cb[k]&&cb[k].length)
+    .map(k=>esc(IDLBL[k])+' '+esc(cb[k].join(', '))).join(' · ');
+  const ident=a.identities||{};
+  const identtxt=['ip','mac','serial','uid'].filter(k=>ident[k]&&ident[k].length)
+    .map(k=>esc(IDLBL[k])+': '+esc(ident[k].join(', '))).join(' · ');
+  let h='<div class="gbar"><span class="backlink" onclick="openInventory()">← Back to inventory</span></div>'+
+    '<h2 style="margin:6px 0 2px">'+esc(a.host)+'</h2>'+
+    '<div class="sub">'+(a.category?('<span class="scopetag common">'+esc(a.category)+'</span> · '):'')+
+    'Seen by '+adapters.length+' adapter(s): '+esc(adapters.map(x=>x.name).join(', '))+
+    ((a.aliases&&a.aliases.length)?(' · also known as: '+esc(a.aliases.join(', '))):'')+'</div>'+
+    (identtxt?'<div class="meta">Identifiers: '+identtxt+'</div>':'')+
+    (cbtxt?'<div class="meta">🔗 Correlated across adapters by '+cbtxt+'</div>':'')+
+    '<div class="controls"><label class="hint">View by adapter '+
+      '<select id="assetview" onchange="setAssetView(this.value)">'+opts+'</select></label>'+
+      '<span class="hint">'+
+        '<span class="scopetag common">common</span> = seen by 2+ adapters · '+
+        '<span class="scopetag specific">specific</span> = only this source</span>'+
+    '</div>';
+
+  const view=ASSET_VIEW;
+  const perAdapter=(view!=='__all__');
+  // ----- fields (aggregated / preferred, or one adapter's fields) -----
+  const fields=a.fields.filter(f=>!perAdapter || f.adapter_ids.indexOf(view)>=0);
+  h+='<div class="minihdr">'+(perAdapter?'Fields from this adapter':'All fields — aggregated &amp; preferred')+
+     ' <span class="hint">('+fields.length+')</span></div>';
+  if(fields.length){
+    h+='<div class="tablewrap"><table><thead><tr><th>Field</th><th>Preferred</th><th>Scope</th>'+
+       (perAdapter?'<th>This adapter</th><th>Other adapters</th>':'<th>Reported by</th><th>Values by adapter</th>')+
+       '</tr></thead><tbody>';
+    fields.forEach(f=>{
+      const tag='<span class="scopetag '+f.scope+'">'+f.scope+'</span>'+
+        (f.scope==='common'&&!f.agree?' <span class="scopetag conflict">differs</span>':'');
+      let c3,c4;
+      if(perAdapter){
+        const selName=(adapters.find(x=>x.id===view)||{}).name;
+        c3=esc((f.values_by_adapter[selName]||[]).join(', '));
+        const others=f.adapters.filter(n=>n!==selName)
+          .map(n=>esc(n)+': '+esc((f.values_by_adapter[n]||[]).join(', ')));
+        c4=others.length?others.join('<br>'):'<span class="hint">—</span>';
+      }else{
+        c3=esc(f.adapters.join(', '));
+        c4=f.adapters.map(n=>esc(n)+': '+esc((f.values_by_adapter[n]||[]).join(', '))).join('<br>');
+      }
+      h+='<tr><td><b>'+esc(f.name)+'</b></td><td>'+esc(f.preferred==null?'':f.preferred)+'</td>'+
+         '<td>'+tag+'</td><td>'+c3+'</td><td>'+c4+'</td></tr>';
+    });
+    h+='</tbody></table></div>';
+  }else{ h+='<p class="hint">No scalar fields for this selection.</p>'; }
+
+  // ----- mini tables (users, revisions, applications, …) -----
+  const tbls=a.tables.filter(t=>!perAdapter || t.adapter_id===view);
+  h+='<div class="sheethdr">Detail tables — click to expand</div>';
+  if(tbls.length){
+    tbls.forEach((t,idx)=>{
+      const single=(a.adapters.length<2);
+      const src=perAdapter?'':(esc(t.adapter)+' · ');
+      h+='<details class="asset-det"'+(tbls.length===1?' open':'')+'>'+
+         '<summary>'+src+esc(t.query_id)+' — '+esc(t.query_name)+
+         ' <span class="hint">('+t.row_count+' row'+(t.row_count===1?'':'s')+')</span></summary>'+
+         '<div class="mini" data-t="'+idx+'"></div></details>';
+    });
+  }else{ h+='<p class="hint">No detail tables for this selection.</p>'; }
+  g.innerHTML=h;
+
+  tbls.forEach((t,idx)=>{
+    const el=g.querySelector('.mini[data-t="'+idx+'"]');
+    if(el && t.rows.length) mountTable(el, t.columns, t.rows, {filter:false});
+    else if(el) el.innerHTML='<p class="hint">(no rows)</p>';
+  });
+}
+function setAssetView(v){ ASSET_VIEW=v; renderAsset(); }
 
 /* ---------- workspace ---------- */
 async function openAdapter(id){
@@ -636,7 +975,7 @@ function updateForget(){
   const el=document.getElementById('c_forget');
   const rem=document.getElementById('c_remember');
   if(DETAIL && DETAIL.has_saved){
-    el.innerHTML='✓ Saved on this machine (in <code>.env</code>) — auto-connects on startup. '+
+    el.innerHTML='✓ Saved on this machine (local database) — this connection auto-connects on startup. '+
       '<a href="#" onclick="forgetConn();return false;" style="color:var(--accent)">Forget saved credentials</a>';
     if(rem) rem.checked=true;
   }else{
@@ -662,9 +1001,9 @@ function applyKind(kind){
   document.getElementById('c_user').placeholder = tufin ? 'securetrack-api-user' : 'elastic';
   document.getElementById('c_timeout').value = tufin ? '30' : '60';
   document.getElementById('c_hint').innerHTML = tufin
-    ? 'Credentials are held in this local server\'s memory only — never written to disk. '+
+    ? 'Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). '+
       'Connects to the SecureTrack REST API at <code>https://host/securetrack/api</code>.'
-    : 'Credentials are held in this local server\'s memory only — never written to disk. '+
+    : 'Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). '+
       'Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.';
 }
 
@@ -685,9 +1024,14 @@ function mountTable(container, cols, rows, opts){
       return String(x).localeCompare(String(y))*sort.dir;});}
     tw.innerHTML='<table><thead><tr>'+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
       (sort.col===i?(sort.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr></thead><tbody>'+
-      rs.map(r=>'<tr>'+r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+      rs.map(r=>'<tr'+(opts.rowClass?(' class="'+esc(opts.rowClass(r))+'"'):'')+'>'+
+        r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
     tw.querySelectorAll('th').forEach(th=>th.onclick=()=>{
       const i=+th.dataset.i; if(sort.col===i)sort.dir*=-1; else{sort.col=i;sort.dir=1;} draw();});
+    if(opts.onRow){
+      tw.querySelectorAll('tbody tr').forEach((tr,idx)=>{
+        tr.style.cursor='pointer'; tr.onclick=()=>opts.onRow(rs[idx]);});
+    }
   }
   if(fin) fin.oninput=draw;
   draw();
