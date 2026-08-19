@@ -475,6 +475,7 @@ def build_unified_inventory(
     spec = _type_spec(asset_type)
     res = correlate(blocks, asset_type)
     adapter_order = res["adapter_order"]
+    kind_by_id = {info.get("id"): info.get("kind", "") for info, _ in blocks}
     primary_cols = set(spec.primary)
     show_category = asset_type == "device"
 
@@ -543,7 +544,10 @@ def build_unified_inventory(
         "asset_count": len(rows),
         "multi_adapter_count": multi,
         "correlated_count": correlated,
-        "adapters": [{"id": aid, "name": aname} for aid, aname in adapter_order],
+        "adapters": [
+            {"id": aid, "name": aname, "kind": kind_by_id.get(aid, "")}
+            for aid, aname in adapter_order
+        ],
     }
 
 
