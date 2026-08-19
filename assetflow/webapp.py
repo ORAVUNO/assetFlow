@@ -661,6 +661,15 @@ INDEX_HTML = r"""<!doctype html>
   td .cell.list::after{content:'▸';color:var(--accent);font-size:10px;margin-left:3px}
   td .cell.open{max-width:560px;white-space:normal;overflow:visible;word-break:break-word}
   td .cell.open.list::after{content:'▾'}
+  /* unified-inventory breakdown chips + collapsible groups */
+  .chiprow{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0;align-items:center}
+  .chiplabel{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:2px}
+  .chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel);border:1px solid var(--border);
+        border-radius:20px;padding:4px 11px;font-size:12px;cursor:pointer;color:var(--text)}
+  .chip:hover{border-color:var(--accent)}
+  .chip.active{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+  .chip .cnt{opacity:.65;font-weight:600} .chip.active .cnt{opacity:.9}
+  details.invgroup>summary .srclogo{vertical-align:middle}
 </style>
 </head>
 <body>
@@ -857,43 +866,88 @@ async function openInventory(type){
     '<div id="invtable"></div>';
   g.innerHTML=h;
   const t=document.getElementById('invtable');
-  if(d.rows.length){
-    const cols=d.columns.map(c=>c.name);
-    const ci=cols.indexOf('adapter_count');
-    const cat=cols.indexOf('category');
-    const sb=cols.indexOf('seen_by');
-    // Map each connection name -> its adapter kind, for the pinned Source logos.
-    const akind={}; (d.adapters||[]).forEach(a=>{akind[a.name]=a.kind;});
-    const invPin=r=>{
-      const names=(sb>=0?String(r[sb]||''):'').split(/,\s*/).filter(Boolean);
-      const kinds=[...new Set(names.map(n=>akind[n]).filter(Boolean))];
-      return {kinds:kinds, label:names.join(', ')||'—'};
-    };
-    let filtered=d.rows.slice();
-    const draw=(rows)=>mountTable(t, cols, rows, {
-      rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
-      onRow:r=>openAsset(r[0], INV_TYPE),
-      pin:invPin,
-    });
-    if(cat>=0){
-      const kinds=Array.from(new Set(d.rows.map(r=>r[cat]||'unknown'))).sort();
-      const sel=document.createElement('div'); sel.className='typeswitch';
-      sel.innerHTML='<label class="hint" style="display:flex;align-items:center;gap:6px">Category '+
-        '<select id="catfilter"><option value="">All ('+d.rows.length+')</option>'+
-        kinds.map(k=>{const n=d.rows.filter(r=>(r[cat]||'unknown')===k).length;
-          return '<option value="'+esc(k)+'">'+esc(k)+' ('+n+')</option>';}).join('')+
-        '</select></label>';
-      t.parentNode.insertBefore(sel, t);
-      sel.querySelector('#catfilter').onchange=e=>{
-        const v=e.target.value;
-        draw(v?d.rows.filter(r=>(r[cat]||'unknown')===v):d.rows);
-      };
-    }
-    draw(filtered);
-  }else{
+  if(!d.rows.length){
     t.innerHTML='<p class="hint">No '+esc(INV_TYPE)+' assets saved yet. Open a connection, connect, '+
       'and fetch a query that returns this asset type — assets appear here as adapters report them.</p>';
+    return;
   }
+  const cols=d.columns.map(c=>c.name);
+  const ci=cols.indexOf('adapter_count');
+  const cat=cols.indexOf('category');
+  const sb=cols.indexOf('seen_by');
+  const akind={}; (d.adapters||[]).forEach(a=>{akind[a.name]=a.kind;});
+  const namesOf=r=>(sb>=0?String(r[sb]||''):'').split(/,\s*/).filter(Boolean);
+  const catOf=r=>(cat>=0?(r[cat]||'unknown'):'unknown');
+  const invPin=r=>{const nm=namesOf(r);
+    return {kinds:[...new Set(nm.map(n=>akind[n]).filter(Boolean))], label:nm.join(', ')||'—'};};
+  const state={cat:'',conn:'',multi:false,group:'none'};
+  const pass=r=>{
+    if(state.multi && !(ci>=0 && (+r[ci])>1)) return false;
+    if(state.cat && catOf(r)!==state.cat) return false;
+    if(state.conn && !namesOf(r).includes(state.conn)) return false;
+    return true;
+  };
+  const mkTable=(el,rows,showFilter)=>mountTable(el, cols, rows, {
+    rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
+    onRow:r=>openAsset(r[0], INV_TYPE), pin:invPin, filter: showFilter?undefined:false});
+
+  // controls: chip rows + group-by + multi-source toggle, inserted above the table
+  const ctrl=document.createElement('div');
+  ctrl.innerHTML='<div id="invchips"></div>'+
+    '<div class="typeswitch" style="align-items:center">'+
+      '<label class="hint" style="display:flex;align-items:center;gap:6px">Group by '+
+        '<select id="invgroupby"><option value="none">None (flat)</option>'+
+        '<option value="category">Category</option><option value="connection">Connection</option></select></label>'+
+      '<label class="hint" style="display:flex;align-items:center;gap:6px">'+
+        '<input type="checkbox" id="invmulti"/> Multi-source only</label>'+
+      '<span class="hint" id="invcount"></span></div>';
+  t.parentNode.insertBefore(ctrl, t);
+  document.getElementById('invgroupby').onchange=e=>{state.group=e.target.value; renderInv();};
+  document.getElementById('invmulti').onchange=e=>{state.multi=e.target.checked; renderInv();};
+
+  function renderInv(){
+    // breakdown chips: by source connection, and (devices) by category
+    let ch='<div class="chiprow"><span class="chiplabel">Sources</span>';
+    (d.adapters||[]).forEach(a=>{const n=d.rows.filter(r=>namesOf(r).includes(a.name)).length;
+      ch+='<span class="chip'+(state.conn===a.name?' active':'')+'" data-conn="'+esc(a.name)+'">'+
+        kindLogo(a.kind,16)+esc(a.name)+' <span class="cnt">'+n+'</span></span>';});
+    ch+='</div>';
+    if(cat>=0){
+      ch+='<div class="chiprow"><span class="chiplabel">Type</span>'+
+        '<span class="chip'+(state.cat===''?' active':'')+'" data-cat="">All <span class="cnt">'+d.rows.length+'</span></span>';
+      Array.from(new Set(d.rows.map(catOf))).sort().forEach(c=>{const n=d.rows.filter(r=>catOf(r)===c).length;
+        ch+='<span class="chip'+(state.cat===c?' active':'')+'" data-cat="'+esc(c)+'">'+esc(c)+' <span class="cnt">'+n+'</span></span>';});
+      ch+='</div>';
+    }
+    document.getElementById('invchips').innerHTML=ch;
+    document.querySelectorAll('#invchips .chip[data-conn]').forEach(el=>el.onclick=()=>{
+      state.conn=(state.conn===el.dataset.conn?'':el.dataset.conn); renderInv();});
+    document.querySelectorAll('#invchips .chip[data-cat]').forEach(el=>el.onclick=()=>{
+      state.cat=el.dataset.cat; renderInv();});
+
+    const rows=d.rows.filter(pass);
+    document.getElementById('invcount').textContent=rows.length+' shown'+
+      (rows.length!==d.rows.length?(' of '+d.rows.length):'');
+    if(state.group==='none'){
+      t.innerHTML=''; if(rows.length) mkTable(t, rows, true);
+      else t.innerHTML='<p class="hint">No assets match the current filters.</p>';
+      return;
+    }
+    let groups=[];
+    if(state.group==='category'){
+      groups=Array.from(new Set(rows.map(catOf))).sort()
+        .map(k=>({label:k, rows:rows.filter(r=>catOf(r)===k)}));
+    }else{
+      groups=(d.adapters||[]).map(a=>({label:a.name, kind:a.kind,
+        rows:rows.filter(r=>namesOf(r).includes(a.name))})).filter(gp=>gp.rows.length);
+    }
+    t.innerHTML=groups.length?groups.map((gp,i)=>'<details class="asset-det invgroup" open><summary>'+
+      (gp.kind?kindLogo(gp.kind,16)+' ':'')+esc(gp.label)+' <span class="hint">('+gp.rows.length+')</span></summary>'+
+      '<div class="mini" id="invg'+i+'"></div></details>').join(''):
+      '<p class="hint">No assets match the current filters.</p>';
+    groups.forEach((gp,i)=>mkTable(document.getElementById('invg'+i), gp.rows, false));
+  }
+  renderInv();
 }
 
 /* ---------- asset drill-down (open one host) ---------- */
