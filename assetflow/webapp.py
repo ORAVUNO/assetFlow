@@ -670,6 +670,13 @@ INDEX_HTML = r"""<!doctype html>
   .chip.active{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
   .chip .cnt{opacity:.65;font-weight:600} .chip.active .cnt{opacity:.9}
   details.invgroup>summary .srclogo{vertical-align:middle}
+  /* inline row expansion (per-connection breakdown) */
+  .exptog{display:inline-block;color:var(--accent);font-size:10px;width:11px;text-align:center}
+  tr.exprow>td{background:var(--code);padding:0;border-bottom:1px solid var(--border)}
+  .expbody{padding:12px 16px}
+  .expsrc{margin:0 0 12px} .expsrc:last-child{margin-bottom:2px}
+  .expsrc .hd{display:flex;align-items:center;gap:7px;font-weight:600;font-size:13px;margin-bottom:5px}
+  .expsrc table{width:auto;min-width:340px;font-size:12px}
 </style>
 </head>
 <body>
@@ -887,9 +894,16 @@ async function openInventory(type){
     if(state.conn && !namesOf(r).includes(state.conn)) return false;
     return true;
   };
+  async function invExpand(r, body){
+    body.innerHTML='<p class="hint">Loading per-connection detail…</p>';
+    try{ const a=await j('/api/inventory/asset?host='+encodeURIComponent(r[0])+
+      '&type='+encodeURIComponent(INV_TYPE));
+      body.innerHTML=renderInlineAsset(a);
+    }catch(e){ body.innerHTML='<div class="hint">'+esc(e.message)+'</div>'; }
+  }
   const mkTable=(el,rows,showFilter)=>mountTable(el, cols, rows, {
     rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
-    onRow:r=>openAsset(r[0], INV_TYPE), pin:invPin, filter: showFilter?undefined:false});
+    expand:invExpand, pin:invPin, filter: showFilter?undefined:false});
 
   // controls: chip rows + group-by + multi-source toggle, inserted above the table
   const ctrl=document.createElement('div');
@@ -948,6 +962,34 @@ async function openInventory(type){
     groups.forEach((gp,i)=>mkTable(document.getElementById('invg'+i), gp.rows, false));
   }
   renderInv();
+}
+
+/* Inline per-connection breakdown shown when a Unified Inventory row is expanded:
+   for each connection that saw the asset, the field/value(s) it contributed. */
+function renderInlineAsset(a){
+  if(!a || !a.found) return '<p class="hint">No detail available.</p>';
+  const cb=a.correlated_by||{};
+  const IDLBL={ip:'host.ip',mac:'host.mac',serial:'serial',uid:'id'};
+  const cbtxt=['mac','serial','uid','ip'].filter(k=>cb[k]&&cb[k].length)
+    .map(k=>esc(IDLBL[k])+' '+esc(cb[k].join(', '))).join(' · ');
+  let h=cbtxt?('<div class="meta" style="margin:0 0 8px">🔗 Correlated by '+cbtxt+'</div>'):'';
+  (a.adapters||[]).forEach(ad=>{
+    const fs=(a.fields||[]).filter(f=>(f.values_by_adapter[ad.name]||[]).length);
+    h+='<div class="expsrc"><div class="hd">'+kindLogo(ad.kind,16)+esc(ad.name)+
+       ' <span class="hint" style="font-weight:400">('+fs.length+' field'+(fs.length===1?'':'s')+')</span></div>';
+    if(fs.length){
+      h+='<div class="tablewrap"><table><thead><tr><th>Field</th><th>Value</th><th>Scope</th></tr></thead><tbody>'+
+        fs.map(f=>{const v=esc((f.values_by_adapter[ad.name]||[]).join(', '));
+          const tag='<span class="scopetag '+f.scope+'">'+f.scope+'</span>'+
+            (f.scope==='common'&&!f.agree?' <span class="scopetag conflict">differs</span>':'');
+          return '<tr><td><b>'+esc(f.name)+'</b></td><td>'+v+'</td><td>'+tag+'</td></tr>';}).join('')+
+        '</tbody></table></div>';
+    }else h+='<p class="hint">No scalar fields from this connection.</p>';
+    h+='</div>';
+  });
+  h+='<div style="margin-top:6px"><span class="backlink" onclick="event.stopPropagation();openAsset(\''+
+     esc(String(a.host).replace(/'/g,"\\'"))+'\',\''+esc(a.type||INV_TYPE)+'\')">Open full asset page →</span></div>';
+  return h;
 }
 
 /* ---------- asset drill-down (open one host) ---------- */
@@ -1164,21 +1206,35 @@ function mountTable(container, cols, rows, opts){
       if(!isNaN(nx)&&!isNaN(ny))return (nx-ny)*sort.dir;
       return String(x).localeCompare(String(y))*sort.dir;});}
     const pinHead=pinFn?'<th class="pin">Connection</th>':'';
+    const span=cols.length+(pinFn?1:0);
     tw.innerHTML='<table><thead><tr>'+pinHead+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
       (sort.col===i?(sort.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr></thead><tbody>'+
       rs.map(r=>{ let pc='';
         if(pinFn){const pi=pinInfo(r);
           pc='<td class="pin"><span class="srcwrap" title="'+esc(pi.label)+'">'+
+             (opts.expand?'<span class="exptog">▸</span>':'')+
              (pi.kinds.length?pi.kinds.map(k=>kindLogo(k,18)).join(''):kindLogo('',18))+
              '<span class="nm">'+esc(pi.label)+'</span></span></td>';}
-        return '<tr'+(opts.rowClass?(' class="'+esc(opts.rowClass(r))+'"'):'')+'>'+pc+
-          r.map(v=>'<td>'+cellHTML(v)+'</td>').join('')+'</tr>';}).join('')+'</tbody></table>';
+        const tr='<tr class="datarow'+(opts.rowClass?(' '+esc(opts.rowClass(r))):'')+'">'+pc+
+          r.map(v=>'<td>'+cellHTML(v)+'</td>').join('')+'</tr>';
+        return tr+(opts.expand?('<tr class="exprow" style="display:none"><td colspan="'+span+
+          '"><div class="expbody"></div></td></tr>'):'');}).join('')+'</tbody></table>';
     tw.querySelectorAll('th[data-i]').forEach(th=>th.onclick=()=>{
       const i=+th.dataset.i; if(sort.col===i)sort.dir*=-1; else{sort.col=i;sort.dir=1;} draw();});
     tw.querySelectorAll('td .cell.list, td .cell.long').forEach(el=>{
       el.onclick=e=>{e.stopPropagation(); el.classList.toggle('open');};});
-    if(opts.onRow){
-      tw.querySelectorAll('tbody tr').forEach((tr,idx)=>{
+    if(opts.expand){
+      tw.querySelectorAll('tbody tr.datarow').forEach((tr,idx)=>{
+        tr.style.cursor='pointer';
+        tr.onclick=()=>{ const det=tr.nextElementSibling; if(!det) return;
+          const wasOpen=det.style.display!=='none';
+          det.style.display=wasOpen?'none':''; const tog=tr.querySelector('.exptog');
+          if(tog) tog.textContent=wasOpen?'▸':'▾';
+          if(!wasOpen && !det.dataset.filled){det.dataset.filled='1';
+            opts.expand(rs[idx], det.querySelector('.expbody'));}};
+      });
+    }else if(opts.onRow){
+      tw.querySelectorAll('tbody tr.datarow').forEach((tr,idx)=>{
         tr.style.cursor='pointer'; tr.onclick=()=>opts.onRow(rs[idx]);});
     }
   }
