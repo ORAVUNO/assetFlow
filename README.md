@@ -29,7 +29,9 @@ many sources can later be merged.
 - **CLI:** `assetflow` validates the registry, connects, runs queries, and
   serves the web UI.
 
-**Developer guides** (how the code works, per adapter):
+**Developer guides** (how the code works):
+[`docs/unified_inventory.md`](docs/unified_inventory.md) — cross-adapter
+correlation design, decisions & flow ·
 [`docs/elasticsearch_integration.md`](docs/elasticsearch_integration.md) ·
 [`docs/tufin_integration.md`](docs/tufin_integration.md) ·
 [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md).
