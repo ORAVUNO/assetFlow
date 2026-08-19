@@ -333,6 +333,51 @@ def test_build_client_from_env(monkeypatch):
     assert client.port == 17778
 
 
+def test_query_surfaces_http_400_without_probing_other_ports():
+    # A 400 means the endpoint is a live SWIS server that rejected the SWQL; it
+    # must surface as a query error and pin the port, not fall through to the
+    # fallback port (which regressed connectivity errors on a live box).
+    client = sw_client_mod.build_client(host="10.0.0.1", username="u", password="p")
+
+    class FakeResp:
+        status_code = 400
+        text = "EntityName is not a valid property"
+
+    calls = []
+
+    def fake_post(url, swql):
+        calls.append(url)
+        exc = RuntimeError("400 Client Error")
+        exc.response = FakeResp()  # mimic requests.HTTPError
+        raise exc
+
+    client._post = fake_post
+    with pytest.raises(RuntimeError) as excinfo:
+        client.query("SELECT TOP 1 FullName FROM Metadata.Entity")
+    assert "HTTP 400 from SWIS" in str(excinfo.value)
+    assert "not a valid property" in str(excinfo.value)
+    # Only the default port was contacted — no fallback probe after a 400.
+    assert len(calls) == 1
+    assert client._active_port == sw_client_mod.DEFAULT_PORT
+
+
+def test_query_401_is_auth_error():
+    client = sw_client_mod.build_client(host="10.0.0.1", username="u", password="p")
+
+    class FakeResp:
+        status_code = 401
+        text = ""
+
+    def fake_post(url, swql):
+        exc = RuntimeError("401 Client Error")
+        exc.response = FakeResp()
+        raise exc
+
+    client._post = fake_post
+    with pytest.raises(sw_client_mod.SolarWindsConfigError):
+        client.query("SELECT TOP 1 FullName FROM Metadata.Entity")
+
+
 def test_build_client_from_env_missing(monkeypatch):
     for var in ("SWIS_HOSTNAME", "SOLARWINDS_HOST", "ORION_HOST",
                 "SWIS_USERNAME", "SWIS_PASSWORD"):
