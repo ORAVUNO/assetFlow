@@ -127,8 +127,8 @@ def test_unified_inventory(client):
     client.post(f"/api/adapters/{A}/run/AI001?limit=5")
     d = client.get("/api/inventory").json()
     cols = [c["name"] for c in d["columns"]]
-    assert cols[:6] == [
-        "host.name", "aliases", "identifiers", "seen_by", "adapter_count", "correlated_by",
+    assert cols[:7] == [
+        "host.name", "aliases", "category", "identifiers", "seen_by", "adapter_count", "correlated_by",
     ]
     assert "Elasticsearch" in cols
     assert d["asset_count"] >= 1

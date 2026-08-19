@@ -77,11 +77,11 @@ def test_unified_inventory_flags_multi_adapter_assets():
     inv = merge.build_unified_inventory([es, tufin])
 
     names = [c["name"] for c in inv["columns"]]
-    assert names[:6] == [
-        "host.name", "aliases", "identifiers", "seen_by", "adapter_count", "correlated_by",
+    assert names[:7] == [
+        "host.name", "aliases", "category", "identifiers", "seen_by", "adapter_count", "correlated_by",
     ]
     # one column per contributing adapter, in input order
-    assert names[6:] == ["Elasticsearch", "Tufin SecureTrack"]
+    assert names[7:] == ["Elasticsearch", "Tufin SecureTrack"]
 
     assert inv["asset_count"] == 2
     assert inv["multi_adapter_count"] == 1
@@ -159,7 +159,7 @@ def test_unified_inventory_skips_non_host_keyed():
     assert inv["asset_count"] == 0
     # no adapter contributed a host, so no per-adapter columns
     assert [c["name"] for c in inv["columns"]] == [
-        "host.name", "aliases", "identifiers", "seen_by", "adapter_count", "correlated_by",
+        "host.name", "aliases", "category", "identifiers", "seen_by", "adapter_count", "correlated_by",
     ]
     assert inv["adapters"] == []
 
@@ -239,6 +239,45 @@ def test_asset_detail_lookup_by_alias():
         assert "10.0.0.5" in d["correlated_by"].get("ip", [])
         # both adapters' fields present
         assert {"vendor", "user.name"} <= {f["name"] for f in d["fields"]}
+
+
+def test_device_category_derived_from_vendor_model_os():
+    tufin = _block("tufin", "Tufin SecureTrack", [
+        rec("TUF001", "Device Inventory",
+            ["host.name", "device.vendor", "device.model", "os.version"],
+            [["fw-hq", "Palo Alto Networks", "PA-3220", "PAN-OS 10.1"],
+             ["core-sw1", "Cisco", "Catalyst 9300", "IOS-XE 17.3"],
+             ["edge-rtr", "Cisco", "ASR 1001-X", "IOS-XE 17.6"]]),
+    ])
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI026", "Host Inventory", ["host.name", "os.name"],
+            [["app01", "Windows Server 2019"]]),
+    ])
+    inv = merge.build_unified_inventory([tufin, es], "device")
+    names = [c["name"] for c in inv["columns"]]
+    ci = names.index("category")
+    cat = {r[0]: r[ci] for r in inv["rows"]}
+    assert cat["fw-hq"] == "firewall"
+    assert cat["core-sw1"] == "switch"
+    assert cat["edge-rtr"] == "router"
+    assert cat["app01"] == "server"
+
+
+def test_device_category_falls_back_to_adapter_prior():
+    # No vendor/model/os columns -> classify from the adapter's data category.
+    net = ({"id": "tufin", "name": "Tufin", "category": "Network Security Policy"}, [
+        rec("TUF001", "Devices", ["host.name", "host.ip"], [["dev1", "10.0.0.1"]]),
+    ])
+    inv = merge.build_unified_inventory([net], "device")
+    names = [c["name"] for c in inv["columns"]]
+    assert inv["rows"][0][names.index("category")] == "network device"
+
+
+def test_user_inventory_has_no_category_column():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "x", ["host.name", "user.name"], [["h", "admin"]]),
+    ])
+    assert "category" not in [c["name"] for c in merge.build_unified_inventory([es], "user")["columns"]]
 
 
 def test_asset_types_are_correlated_separately():

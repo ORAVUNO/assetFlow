@@ -153,6 +153,12 @@ source is reconciled.
   name. A single query row can feed more than one type: a "user on host" row
   contributes a Device *and* a User (so opening the `admin` user shows every host
   it appears on).
+- **Device categories.** Router / firewall / switch / server aren't separate
+  types — they're one Device type with a derived **category** attribute,
+  classified from vendor / model / OS (e.g. Palo Alto → firewall, Catalyst →
+  switch, ASR → router, Windows Server → server), falling back to the source
+  adapter's data category. The Devices inventory shows a `category` column and a
+  category sub-filter, and the category appears on each asset's detail.
 
 - **Correlated on shared identifiers, not just the hostname.** Assets are merged
   by matching any shared identifier — `host.name`, `host.ip`, `host.mac`,

@@ -825,10 +825,27 @@ async function openInventory(type){
   if(d.rows.length){
     const cols=d.columns.map(c=>c.name);
     const ci=cols.indexOf('adapter_count');
-    mountTable(t, cols, d.rows, {
+    const cat=cols.indexOf('category');
+    let filtered=d.rows.slice();
+    const draw=(rows)=>mountTable(t, cols, rows, {
       rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
       onRow:r=>openAsset(r[0], INV_TYPE),
     });
+    if(cat>=0){
+      const kinds=Array.from(new Set(d.rows.map(r=>r[cat]||'unknown'))).sort();
+      const sel=document.createElement('div'); sel.className='typeswitch';
+      sel.innerHTML='<label class="hint" style="display:flex;align-items:center;gap:6px">Category '+
+        '<select id="catfilter"><option value="">All ('+d.rows.length+')</option>'+
+        kinds.map(k=>{const n=d.rows.filter(r=>(r[cat]||'unknown')===k).length;
+          return '<option value="'+esc(k)+'">'+esc(k)+' ('+n+')</option>';}).join('')+
+        '</select></label>';
+      t.parentNode.insertBefore(sel, t);
+      sel.querySelector('#catfilter').onchange=e=>{
+        const v=e.target.value;
+        draw(v?d.rows.filter(r=>(r[cat]||'unknown')===v):d.rows);
+      };
+    }
+    draw(filtered);
   }else{
     t.innerHTML='<p class="hint">No '+esc(INV_TYPE)+' assets saved yet. Open a connection, connect, '+
       'and fetch a query that returns this asset type — assets appear here as adapters report them.</p>';
@@ -862,7 +879,8 @@ function renderAsset(){
     .map(k=>esc(IDLBL[k])+': '+esc(ident[k].join(', '))).join(' · ');
   let h='<div class="gbar"><span class="backlink" onclick="openInventory()">← Back to inventory</span></div>'+
     '<h2 style="margin:6px 0 2px">'+esc(a.host)+'</h2>'+
-    '<div class="sub">Seen by '+adapters.length+' adapter(s): '+esc(adapters.map(x=>x.name).join(', '))+
+    '<div class="sub">'+(a.category?('<span class="scopetag common">'+esc(a.category)+'</span> · '):'')+
+    'Seen by '+adapters.length+' adapter(s): '+esc(adapters.map(x=>x.name).join(', '))+
     ((a.aliases&&a.aliases.length)?(' · also known as: '+esc(a.aliases.join(', '))):'')+'</div>'+
     (identtxt?'<div class="meta">Identifiers: '+identtxt+'</div>':'')+
     (cbtxt?'<div class="meta">🔗 Correlated across adapters by '+cbtxt+'</div>':'')+

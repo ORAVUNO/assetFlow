@@ -87,6 +87,54 @@ def _type_spec(asset_type: str) -> AssetType:
     return ASSET_TYPES[asset_type]
 
 
+# --- device categorization -------------------------------------------------
+#
+# Router / firewall / switch / server are not separate asset types — they are all
+# Devices, distinguished by a derived ``category`` attribute. We classify a
+# device from any vendor / model / OS / type columns its sources carry, falling
+# back to the contributing adapter's data category as a prior.
+
+_CLASSIFY_COLS: Dict[str, str] = {
+    "device.vendor": "vendor", "vendor": "vendor",
+    "device.model": "model", "model": "model",
+    "device.platform": "model", "platform": "model",
+    "device.type": "type", "device.category": "type", "device.role": "type",
+    "os.name": "os", "os.version": "os", "host.os.name": "os", "operating_system": "os",
+}
+
+# (category, matching tokens) — checked in order; first hit wins.
+_CATEGORY_RULES = [
+    ("firewall", ("firewall", "palo alto", "pan-os", "fortigate", "fortinet",
+                  "fortios", "check point", "checkpoint", "gaia", "asa",
+                  "firepower", "sonicwall", "srx", "sophos", "barracuda")),
+    ("switch", ("switch", "catalyst", "nexus", "nx-os", "arista", "procurve",
+                "aruba", "meraki ms")),
+    ("router", ("router", "isr", "asr", "ios-xe", "juniper mx", "mx series", "routing")),
+    ("load balancer", ("load balancer", "big-ip", "netscaler", "citrix adc", "haproxy")),
+    ("server", ("windows server", "linux", "ubuntu", "centos", "red hat", "rhel",
+                "debian", "suse", "esxi", "vmware", "server")),
+    ("workstation", ("windows 10", "windows 11", "windows 7", "macos", "mac os",
+                     "workstation", "laptop", "desktop")),
+]
+
+
+def _classify_device(values: Dict[str, set], adapter_cats: set) -> str:
+    """Derive a device category from its vendor/model/OS/type values, falling back
+    to the contributing adapters' data categories."""
+    text = " ".join(
+        sorted(str(v) for vals in values.values() for v in vals)
+    ).lower()
+    for category, tokens in _CATEGORY_RULES:
+        if any(t in text for t in tokens):
+            return category
+    ac = " ".join(str(c) for c in adapter_cats).lower()
+    if "network" in ac:
+        return "network device"
+    if any(k in ac for k in ("siem", "log", "endpoint", "edr", "cloud")):
+        return "server"
+    return "unknown"
+
+
 # Human labels for the "correlated by" / identifiers text, per identifier kind.
 _IDENT_LABELS = {
     "name": "name", "ip": "host.ip", "mac": "host.mac", "serial": "serial",
@@ -199,11 +247,13 @@ def correlate(blocks: List[Tuple[dict, List[dict]]], asset_type: str = DEFAULT_T
     uf = _UnionFind()
     adapter_order: List[Tuple[str, str]] = []
     seen_ids: set = set()
+    adapter_cat_map: Dict[str, str] = {}
     obs: List[Tuple[str, str, dict, list]] = []
 
     for info, records in blocks:
         aid = info.get("id", "?")
         aname = info.get("name", aid)
+        adapter_cat_map[aid] = info.get("category", "")
         for rec in records:
             cols = rec.get("columns", [])
             rowtoks = []
@@ -227,20 +277,31 @@ def correlate(blocks: List[Tuple[dict, List[dict]]], asset_type: str = DEFAULT_T
     # Group observations into asset clusters by their union-find root.
     acc: Dict[str, dict] = {}
     for aid, aname, rec, rowtoks in obs:
+        cols = rec.get("columns", [])
+        cidx = []
+        for i, c in enumerate(cols):
+            ckind = _CLASSIFY_COLS.get(str(c.get("name", "")).lower())
+            if ckind:
+                cidx.append((i, ckind))
         for row, toks, keys, disp in rowtoks:
             root = uf.find(keys[0]) if keys else f"disp:{disp.lower()}"
             a = acc.setdefault(root, {
                 "adapters": [], "adapter_ids": set(),
                 "name_counts": Counter(), "identities": {},
                 "token_adapters": {}, "obs": {},
+                "classify": {}, "adapter_cats": set(),
             })
             if aid not in a["adapter_ids"]:
                 a["adapter_ids"].add(aid)
                 a["adapters"].append((aid, aname))
             a["name_counts"][disp] += 1
+            a["adapter_cats"].add(adapter_cat_map.get(aid, ""))
             for k, v in toks:
                 a["identities"].setdefault(k, set()).add(v)
                 a["token_adapters"].setdefault(f"{k}:{v}", set()).add(aid)
+            for i, ckind in cidx:
+                if i < len(row):
+                    _collect(a["classify"].setdefault(ckind, set()), row[i])
             o = a["obs"].setdefault(
                 (aid, rec.get("query_id", "?")),
                 {"adapter_id": aid, "adapter": aname, "record": rec, "rows": []},
@@ -255,12 +316,17 @@ def correlate(blocks: List[Tuple[dict, List[dict]]], asset_type: str = DEFAULT_T
             kind, _, val = tok.partition(":")
             if kind != "name" and len(adset) >= 2:
                 match_by.setdefault(kind, set()).add(val)
+        category = (
+            _classify_device(a["classify"], a["adapter_cats"])
+            if asset_type == "device" else ""
+        )
         assets.append({
             "root": root,
             "primary_name": primary,
             "names": sorted(a["name_counts"]),
             "aliases": sorted(n for n in a["name_counts"] if n != primary),
             "identities": {k: sorted(v) for k, v in a["identities"].items()},
+            "category": category,
             "adapters": [(i, n) for i, n in a["adapters"]],
             "adapter_ids": [i for i, _ in a["adapters"]],
             "match_by": {k: sorted(v) for k, v in match_by.items()},
@@ -410,10 +476,13 @@ def build_unified_inventory(
     res = correlate(blocks, asset_type)
     adapter_order = res["adapter_order"]
     primary_cols = set(spec.primary)
+    show_category = asset_type == "device"
 
     columns = (
-        [{"name": spec.primary[0]}, {"name": "aliases"}, {"name": "identifiers"},
-         {"name": "seen_by"}, {"name": "adapter_count"}, {"name": "correlated_by"}]
+        [{"name": spec.primary[0]}, {"name": "aliases"}]
+        + ([{"name": "category"}] if show_category else [])
+        + [{"name": "identifiers"}, {"name": "seen_by"},
+           {"name": "adapter_count"}, {"name": "correlated_by"}]
         + [{"name": aname} for _, aname in adapter_order]
     )
 
@@ -454,9 +523,10 @@ def build_unified_inventory(
         if asset["match_by"]:
             correlated += 1
         seen_names = [aname for aid, aname in adapter_order if aid in by]
-        row = [
-            asset["primary_name"],
-            ", ".join(asset["aliases"]),
+        row = [asset["primary_name"], ", ".join(asset["aliases"])]
+        if show_category:
+            row.append(asset.get("category", ""))
+        row += [
             _identifiers_text(asset["identities"]),
             ", ".join(seen_names),
             len(by),
@@ -574,8 +644,8 @@ def build_asset_detail(
 
     if asset is None:
         return {"host": host, "type": asset_type, "found": False, "adapters": [],
-                "names": [], "aliases": [], "identities": {}, "correlated_by": {},
-                "fields": [], "tables": []}
+                "names": [], "aliases": [], "identities": {}, "category": "",
+                "correlated_by": {}, "fields": [], "tables": []}
 
     tables = []
     for (aid, qid), o in asset["obs"].items():
@@ -602,6 +672,7 @@ def build_asset_detail(
         "names": asset["names"],
         "aliases": asset["aliases"],
         "identities": asset["identities"],
+        "category": asset.get("category", ""),
         "correlated_by": asset["match_by"],
         "fields": _asset_fields(asset, primary_cols),
         "tables": tables,
