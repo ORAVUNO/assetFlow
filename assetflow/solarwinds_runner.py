@@ -419,24 +419,38 @@ def _collect_config_inventory(client, scan: int) -> Tuple[List[str], List[List[A
         "host.name", "asset.type", "config.type", "config.title",
         "config.id", "captured_at", "baseline",
     ]
-    # Read the archive directly (no join) so a caption-lookup or NCM.Nodes quirk
-    # can't suppress the whole result; the node caption is merged in from a
-    # separate NCM.Nodes lookup by NodeID, falling back to the id itself.
+    # Read the archive directly (no INNER JOIN). Try a rich column set first —
+    # the node caption comes inline from the NCM.ConfigArchive -> Node navigation
+    # property (c.Node.NodeCaption), plus title/baseline — then fall back to a
+    # minimal, always-present column set so a version lacking Baseline/ConfigTitle
+    # still returns rows rather than silently erroring to empty.
     raw = _first_query(
         client,
         (
-            "SELECT NodeID, ConfigID, ConfigType, ConfigTitle, DownloadTime, Baseline "
+            "SELECT c.NodeID, c.Node.NodeCaption AS NodeCaption, c.ConfigID, "
+            "c.ConfigType, c.ConfigTitle, c.DownloadTime, c.Baseline "
+            "FROM NCM.ConfigArchive c ORDER BY c.DownloadTime DESC",
+            "SELECT c.NodeID, c.Node.NodeCaption AS NodeCaption, c.ConfigID, "
+            "c.ConfigType, c.ConfigTitle, c.DownloadTime, c.Baseline "
+            "FROM Cirrus.ConfigArchive c ORDER BY c.DownloadTime DESC",
+            "SELECT NodeID, ConfigID, ConfigType, DownloadTime "
             "FROM NCM.ConfigArchive ORDER BY DownloadTime DESC",
-            "SELECT NodeID, ConfigID, ConfigType, ConfigTitle, DownloadTime, Baseline "
+            "SELECT NodeID, ConfigID, ConfigType, DownloadTime "
             "FROM Cirrus.ConfigArchive ORDER BY DownloadTime DESC",
         ),
     )
-    captions = _ncm_caption_map(client)
+    # Only pay for the caption lookup when the rich (inline-caption) query didn't win.
+    captions = _ncm_caption_map(client) if (raw and "NodeCaption" not in raw[0]) else {}
     seen: set = set()
     rows: List[List[Any]] = []
     for r in raw:
         node_id = textish(_first(r, "NodeID"))
-        caption = captions.get(node_id) or node_id or textish(_first(r, "ConfigID"))
+        caption = (
+            textish(_first(r, "NodeCaption"))
+            or captions.get(node_id)
+            or node_id
+            or textish(_first(r, "ConfigID"))
+        )
         config_type = textish(_first(r, "ConfigType"))
         key = (caption, config_type)
         if key in seen:  # rows are newest-first, so the first per key wins
