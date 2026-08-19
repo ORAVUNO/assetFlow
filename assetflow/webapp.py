@@ -417,7 +417,8 @@ def create_app(
         adapters = [_get_adapter(adapter_id)] if adapter_id else manager.list()
         blocks = []
         for a in adapters:
-            info = {"id": a.info.id, "name": a.info.name, "category": a.info.category}
+            info = {"id": a.info.id, "name": a.info.name,
+                    "category": a.info.category, "kind": a.info.kind}
             blocks.append((info, db.latest_all(a.info.id, include_data=True)))
         return blocks
 
@@ -644,6 +645,22 @@ INDEX_HTML = r"""<!doctype html>
   details.asset-det>summary{cursor:pointer;padding:9px 12px;font-size:12.5px;font-weight:600;user-select:none}
   details.asset-det[open]>summary{border-bottom:1px solid var(--border)}
   details.asset-det .mini{padding:10px 12px}
+  /* adapter source logos, pinned Source column, trimmed/expandable cells */
+  .srclogo{border-radius:5px;display:inline-block;vertical-align:middle;flex:none}
+  .card h3 .srclogo{margin-right:2px}
+  th{z-index:5}
+  th.pin,td.pin{position:sticky;left:0;background:var(--panel);box-shadow:1px 0 0 var(--border)}
+  td.pin{z-index:3} th.pin{top:0;z-index:8}
+  tr:nth-child(even) td.pin{background:var(--row)}
+  tr.multi td.pin{background:color-mix(in srgb,var(--accent) 12%,transparent) !important}
+  .srcwrap{display:inline-flex;align-items:center;gap:6px;max-width:190px}
+  .srcwrap .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--muted)}
+  td .cell{display:inline-block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
+           white-space:nowrap;vertical-align:bottom}
+  td .cell.list,td .cell.long{cursor:pointer}
+  td .cell.list::after{content:'▸';color:var(--accent);font-size:10px;margin-left:3px}
+  td .cell.open{max-width:560px;white-space:normal;overflow:visible;word-break:break-word}
+  td .cell.open.list::after{content:'▾'}
 </style>
 </head>
 <body>
@@ -713,6 +730,24 @@ async function j(url,opts){const r=await fetch(url,opts);const d=await r.json().
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function val(id){return (document.getElementById(id).value||'').trim();}
 
+/* ---------- adapter logos (demo marks) ---------- */
+const KIND_LOGO={
+  elasticsearch:{bg:'#FEC514',fg:'#1c1e24',txt:'es'},
+  tufin:{bg:'#12b886',fg:'#ffffff',txt:'T'},
+  vmware:{bg:'#607d8b',fg:'#ffffff',txt:'vm'},
+  solarwinds:{bg:'#f7941e',fg:'#1c1e24',txt:'SW'}
+};
+function kindMeta(kind){return KIND_LOGO[kind]||{bg:'#8a8f98',fg:'#ffffff',txt:String(kind||'?').slice(0,2)};}
+function kindName(kind){const k=(KINDS||[]).find(x=>x.kind===kind);return k?k.name:(kind||'');}
+function kindLogo(kind,size){size=size||18;const m=kindMeta(kind);const fs=m.txt.length>1?9:11;
+  return '<svg class="srclogo" width="'+size+'" height="'+size+'" viewBox="0 0 24 24" '+
+    'role="img" aria-label="'+esc(kindName(kind)||kind||'source')+'">'+
+    '<rect x="1" y="1" width="22" height="22" rx="5" fill="'+m.bg+'"/>'+
+    '<text x="12" y="16.5" text-anchor="middle" font-family="ui-sans-serif,system-ui,sans-serif" '+
+    'font-size="'+fs+'" font-weight="700" fill="'+m.fg+'">'+esc(m.txt)+'</text></svg>';}
+/* pin descriptor for the currently-open connection (the pinned Source column) */
+function srcPin(){return DETAIL?{kind:DETAIL.kind,label:DETAIL.name}:null;}
+
 /* ---------- gallery ---------- */
 let KINDS=[];
 async function loadGallery(){
@@ -739,7 +774,7 @@ async function loadGallery(){
     h+='<div class="gcat">'+esc(cat.name)+'</div><div class="cards">';
     cat.adapters.forEach(a=>{
       h+='<div class="card" onclick="openAdapter(\''+esc(a.id)+'\')">'+
-         '<h3>'+esc(a.name)+' <span class="kind">'+esc(a.kind)+'</span></h3>'+
+         '<h3>'+kindLogo(a.kind,20)+'<span>'+esc(a.name)+'</span> <span class="kind">'+esc(a.kind)+'</span></h3>'+
          '<p>'+esc(a.description)+'</p>'+
          '<div class="foot"><span>'+a.query_count+' queries · '+a.feed_count+' feeds</span>'+
          '<span>'+(a.connected?'<span class="dot ok"></span>connected':'<span class="dot"></span>not connected')+'</span></div>'+
@@ -826,10 +861,19 @@ async function openInventory(type){
     const cols=d.columns.map(c=>c.name);
     const ci=cols.indexOf('adapter_count');
     const cat=cols.indexOf('category');
+    const sb=cols.indexOf('seen_by');
+    // Map each connection name -> its adapter kind, for the pinned Source logos.
+    const akind={}; (d.adapters||[]).forEach(a=>{akind[a.name]=a.kind;});
+    const invPin=r=>{
+      const names=(sb>=0?String(r[sb]||''):'').split(/,\s*/).filter(Boolean);
+      const kinds=[...new Set(names.map(n=>akind[n]).filter(Boolean))];
+      return {kinds:kinds, label:names.join(', ')||'—'};
+    };
     let filtered=d.rows.slice();
     const draw=(rows)=>mountTable(t, cols, rows, {
       rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
       onRow:r=>openAsset(r[0], INV_TYPE),
+      pin:invPin,
     });
     if(cat>=0){
       const kinds=Array.from(new Set(d.rows.map(r=>r[cat]||'unknown'))).sort();
@@ -960,7 +1004,8 @@ async function openAdapter(id){
   ax.innerHTML='export this adapter: <a href="/api/adapters/'+id+'/export-all.json">JSON</a> · '+
                '<a href="/api/adapters/'+id+'/export-all.zip">ZIP</a>';
   ax.classList.remove('hidden');
-  document.getElementById('crumb').textContent='› '+DETAIL.name;
+  document.getElementById('crumb').innerHTML='› '+kindLogo(DETAIL.kind,18)+
+    ' <span style="vertical-align:middle">'+esc(DETAIL.name)+'</span>';
   applyKind(DETAIL.kind);
   updateForget();
   setConn(DETAIL.connected, DETAIL.conn_info||{});
@@ -1034,26 +1079,50 @@ function applyKind(kind){
 }
 
 /* generic sortable/filterable table mounted into any container */
+/* one table cell: trim long text (hover shows full), make comma-lists expandable */
+function cellHTML(v){
+  const s=String(v==null?'':v);
+  const parts=s.split(/,\s+/).filter(x=>x.length);
+  const isList=parts.length>=2 && s.length>26;
+  const isLong=!isList && s.length>64;
+  const cls='cell'+(isList?' list':(isLong?' long':''));
+  const attr=(isList||isLong)?(' title="'+esc(s)+'"'):'';
+  return '<span class="'+cls+'"'+attr+'>'+esc(s)+'</span>';
+}
 function mountTable(container, cols, rows, opts){
   opts=opts||{}; let sort={col:null,dir:1};
+  // opts.pin: a constant {kind,label} / {kinds:[...],label} or a function(row)->same.
+  const pinFn = (typeof opts.pin==='function') ? opts.pin : (opts.pin?()=>opts.pin:null);
+  function pinInfo(row){ if(!pinFn) return null; const p=pinFn(row)||{};
+    const kinds=p.kinds||(p.kind?[p.kind]:[]); const label=p.label||kinds.map(kindName).join(', ');
+    return {kinds:kinds,label:label}; }
   container.innerHTML=(opts.filter===false?'':'<input type="text" class="tfilter" placeholder="filter…"/>')+
     '<div class="tablewrap"></div>';
   const tw=container.querySelector('.tablewrap'), fin=container.querySelector('.tfilter');
   function draw(){
     let rs=rows.slice();
     const f=fin?fin.value.toLowerCase():'';
-    if(f) rs=rs.filter(r=>r.some(v=>String(v==null?'':v).toLowerCase().includes(f)));
+    if(f) rs=rs.filter(r=>{const pi=pinInfo(r);const extra=pi?pi.label:'';
+      return r.some(v=>String(v==null?'':v).toLowerCase().includes(f))||extra.toLowerCase().includes(f);});
     if(sort.col!==null){const i=sort.col; rs.sort((a,b)=>{
       const x=a[i],y=b[i]; if(x==null)return 1; if(y==null)return -1;
       const nx=parseFloat(x),ny=parseFloat(y);
       if(!isNaN(nx)&&!isNaN(ny))return (nx-ny)*sort.dir;
       return String(x).localeCompare(String(y))*sort.dir;});}
-    tw.innerHTML='<table><thead><tr>'+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
+    const pinHead=pinFn?'<th class="pin">Connection</th>':'';
+    tw.innerHTML='<table><thead><tr>'+pinHead+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
       (sort.col===i?(sort.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr></thead><tbody>'+
-      rs.map(r=>'<tr'+(opts.rowClass?(' class="'+esc(opts.rowClass(r))+'"'):'')+'>'+
-        r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
-    tw.querySelectorAll('th').forEach(th=>th.onclick=()=>{
+      rs.map(r=>{ let pc='';
+        if(pinFn){const pi=pinInfo(r);
+          pc='<td class="pin"><span class="srcwrap" title="'+esc(pi.label)+'">'+
+             (pi.kinds.length?pi.kinds.map(k=>kindLogo(k,18)).join(''):kindLogo('',18))+
+             '<span class="nm">'+esc(pi.label)+'</span></span></td>';}
+        return '<tr'+(opts.rowClass?(' class="'+esc(opts.rowClass(r))+'"'):'')+'>'+pc+
+          r.map(v=>'<td>'+cellHTML(v)+'</td>').join('')+'</tr>';}).join('')+'</tbody></table>';
+    tw.querySelectorAll('th[data-i]').forEach(th=>th.onclick=()=>{
       const i=+th.dataset.i; if(sort.col===i)sort.dir*=-1; else{sort.col=i;sort.dir=1;} draw();});
+    tw.querySelectorAll('td .cell.list, td .cell.long').forEach(el=>{
+      el.onclick=e=>{e.stopPropagation(); el.classList.toggle('open');};});
     if(opts.onRow){
       tw.querySelectorAll('tbody tr').forEach((tr,idx)=>{
         tr.style.cursor='pointer'; tr.onclick=()=>opts.onRow(rs[idx]);});
@@ -1092,11 +1161,11 @@ async function openMerged(){
   });
   m.innerHTML=h;
   const mt=document.getElementById('maintable');
-  if(main.rows.length) mountTable(mt, main.columns.map(c=>c.name), main.rows, {});
+  if(main.rows.length) mountTable(mt, main.columns.map(c=>c.name), main.rows, {pin:srcPin()});
   else mt.innerHTML='<p class="hint">No host-keyed results saved yet. Run a host query (e.g. AI001) first.</p>';
   d.sheets.forEach(sh=>sh.queries.forEach(q=>{ if(q.has_data){
     const el=document.querySelector('.mini[data-q="'+q.query_id+'"]');
-    if(el) mountTable(el, q.columns.map(c=>c.name), q.rows, {filter:false});
+    if(el) mountTable(el, q.columns.map(c=>c.name), q.rows, {filter:false, pin:srcPin()});
   }}));
 }
 
@@ -1113,7 +1182,7 @@ async function openChangeLog(){
     '<div class="meta">'+d.rows.length+' change(s)</div><div id="cltable"></div>';
   m.innerHTML=h;
   const t=document.getElementById('cltable');
-  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {});
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {pin:srcPin()});
   else t.innerHTML='<p class="hint">No changes recorded yet. Run a Change Detail query (Tufin TUF008, SolarWinds SW006) — its rows accumulate here.</p>';
 }
 
@@ -1130,7 +1199,7 @@ async function openDrift(){
     '<div class="meta">'+d.rows.length+' change(s)</div><div id="drifttable"></div>';
   m.innerHTML=h;
   const t=document.getElementById('drifttable');
-  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {});
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {pin:srcPin()});
   else t.innerHTML='<p class="hint">No drift recorded yet. Fetch an inventory query (e.g. AI011) at least twice — added/removed items land here.</p>';
 }
 
@@ -1144,7 +1213,7 @@ async function openChangeDetail(qid){
     (d.prev_ran_at?(' · vs '+new Date(d.prev_ran_at).toLocaleString()):'')+'</div><div id="ddtable"></div>';
   out.innerHTML=h;
   const t=document.getElementById('ddtable');
-  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {});
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {pin:srcPin()});
   else t.innerHTML='<p class="hint">No differences between the last two fetches.</p>';
 }
 
@@ -1239,28 +1308,9 @@ function render(rec){
       ' · <a class="dl" href="/api/adapters/'+ADAPTER+'/export/'+rec.query_id+'.json">Download JSON</a>'+
       (inventory?(' · <a class="dl" href="#" onclick="openChangeDetail(\''+rec.query_id+'\');return false;">⇄ Diff vs previous fetch</a>'):'')+
       '</div>'+
-    '<input type="text" id="filter" placeholder="filter rows…"/>'+
-    '<div class="tablewrap" id="tw"></div>'+
+    '<div id="tw"></div>'+
     '<div id="diffout"></div>';
-  document.getElementById('filter').oninput=drawTable;
-  drawTable();
-}
-
-function drawTable(){
-  const cols=LASTROWS.cols; let rows=LASTROWS.rows.slice();
-  const f=(document.getElementById('filter')||{}).value||'';
-  if(f){const nf=f.toLowerCase(); rows=rows.filter(r=>r.some(v=>String(v==null?'':v).toLowerCase().includes(nf)));}
-  if(SORT.col!==null){const i=SORT.col; rows.sort((a,b)=>{
-    const x=a[i],y=b[i]; if(x==null)return 1; if(y==null)return -1;
-    const nx=parseFloat(x),ny=parseFloat(y);
-    if(!isNaN(nx)&&!isNaN(ny))return (nx-ny)*SORT.dir;
-    return String(x).localeCompare(String(y))*SORT.dir;});}
-  let h='<table><thead><tr>'+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
-    (SORT.col===i?(SORT.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr></thead><tbody>'+
-    rows.map(r=>'<tr>'+r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
-  const tw=document.getElementById('tw'); tw.innerHTML=h;
-  tw.querySelectorAll('th').forEach(th=>th.onclick=()=>{
-    const i=+th.dataset.i; if(SORT.col===i)SORT.dir*=-1; else{SORT.col=i;SORT.dir=1;} drawTable();});
+  mountTable(document.getElementById('tw'), LASTROWS.cols, LASTROWS.rows, {pin:srcPin()});
 }
 
 /* ---------- fetch all ---------- */
