@@ -11,15 +11,18 @@ values of the query's most identifying column (a ``*.name``/``*Name`` field, or
 the sole value column), or a plain record count when there's no obvious one.
 
 Layer 3 — cross-adapter reconciliation — lives here too: ``correlate`` resolves
-rows from *every* adapter into one asset per physical machine by matching shared
-identifiers (hostname, IP, MAC, serial, cloud id), and ``build_unified_inventory``
-/ ``build_asset_detail`` present that correlated view.
+rows from *every* adapter into one asset per correlated entity by matching shared
+identifiers. Assets come in **types** (devices, users, applications); each type
+is correlated in its own namespace (a device never merges into a user), keying on
+that type's identifiers. ``build_unified_inventory`` / ``build_asset_detail`` /
+``inventory_types`` present the correlated view per type.
 """
 
 from __future__ import annotations
 
 import re
 from collections import Counter
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 HOST_KEY = "host.name"
@@ -28,30 +31,72 @@ _SAMPLE_CAP = 6
 
 # --- cross-adapter identity correlation ------------------------------------
 #
-# The same physical asset can arrive from different adapters under different
-# hostnames (short name vs FQDN, NetBIOS vs DNS). To merge those into one asset
-# we correlate on shared **identifiers**, not just the hostname — the way
-# Axonius-style CAASM tools do. IDENTITY_FIELDS maps a result column (matched
-# case-insensitively) to the kind of identifier it carries; two observations
-# that share any non-junk identifier value are the same asset.
+# Assets come in several **types** — devices, users, applications — and each type
+# is correlated in its own namespace, the way Axonius-style CAASM tools separate
+# Devices from Users. Two rows merge only when they share a non-junk identifier
+# *of the same type*: a device never merges into a user, even if a value happens
+# to match. Each AssetType lists the columns (matched case-insensitively) that
+# carry its identifiers, mapped to the *kind* of identifier, plus the ordered
+# ``primary`` columns used for the asset's display name. A single result row can
+# feed more than one type (a "user on host" row is both a device and a user).
 
-IDENTITY_FIELDS: Dict[str, str] = {
-    "host.name": "name",
-    "host.ip": "ip",
-    "ips": "ip",              # VALUES(host.ip) aggregate
-    "host.mac": "mac",
-    "macs": "mac",            # VALUES(host.mac) aggregate
-    "host.serial": "serial",
-    "serial.number": "serial",
-    "host.id": "uid",
-    "cloud.instance.id": "uid",
+
+@dataclass(frozen=True)
+class AssetType:
+    type: str
+    label: str
+    primary: Tuple[str, ...]   # display-name columns, in preference order
+    identity: Dict[str, str]   # column (lowercased) -> identifier kind
+
+
+ASSET_TYPES: Dict[str, AssetType] = {
+    "device": AssetType(
+        type="device", label="Devices",
+        primary=("host.name",),
+        identity={
+            "host.name": "name", "host.ip": "ip", "ips": "ip",
+            "host.mac": "mac", "macs": "mac", "host.serial": "serial",
+            "serial.number": "serial", "host.id": "uid", "cloud.instance.id": "uid",
+        },
+    ),
+    "user": AssetType(
+        type="user", label="Users",
+        primary=("user.name", "user.email"),
+        identity={
+            "user.name": "name", "user.email": "email", "email": "email",
+            "user.id": "uid", "user.sid": "sid", "sid": "sid",
+            "user.principal_name": "upn", "upn": "upn",
+        },
+    ),
+    "application": AssetType(
+        type="application", label="Applications",
+        primary=("application.name", "package.name", "service.name",
+                 "software.name", "process.name"),
+        identity={
+            "application.name": "name", "package.name": "name",
+            "service.name": "name", "software.name": "name", "process.name": "name",
+        },
+    ),
 }
+DEFAULT_TYPE = "device"
 
-# Human labels for the "correlated by" explanation, per identifier kind.
+
+def _type_spec(asset_type: str) -> AssetType:
+    if asset_type not in ASSET_TYPES:
+        raise KeyError(f"unknown asset type {asset_type!r}")
+    return ASSET_TYPES[asset_type]
+
+
+# Human labels for the "correlated by" / identifiers text, per identifier kind.
 _IDENT_LABELS = {
-    "name": "host.name", "ip": "host.ip", "mac": "host.mac",
-    "serial": "serial", "uid": "id",
+    "name": "name", "ip": "host.ip", "mac": "host.mac", "serial": "serial",
+    "uid": "id", "email": "email", "sid": "SID", "upn": "UPN",
 }
+# Order identifiers are listed in for display.
+_IDENT_ORDER = ["ip", "mac", "email", "upn", "sid", "serial", "uid"]
+
+# Back-compat alias: the device identity map (some callers/tests reference it).
+IDENTITY_FIELDS: Dict[str, str] = ASSET_TYPES["device"].identity
 
 # Values that are never a real, unique identifier — ignored for correlation so
 # placeholders (empty, loopback, all-zero MAC, "unknown") don't merge everything.
@@ -82,11 +127,12 @@ def _norm_ident(kind: str, value) -> Optional[str]:
     return s
 
 
-def _row_identities(columns: List[dict], row: list) -> set:
-    """Return the set of ``(kind, normalized_value)`` identity tokens in a row."""
+def _row_identities(columns: List[dict], row: list, identity: Dict[str, str]) -> set:
+    """Return the ``(kind, normalized_value)`` identity tokens in a row, for the
+    given type's identity map."""
     out = set()
     for i, c in enumerate(columns):
-        kind = IDENTITY_FIELDS.get(str(c.get("name", "")).lower())
+        kind = identity.get(str(c.get("name", "")).lower())
         if not kind or i >= len(row):
             continue
         cell = row[i]
@@ -95,6 +141,17 @@ def _row_identities(columns: List[dict], row: list) -> set:
             if nv:
                 out.add((kind, nv))
     return out
+
+
+def _primary_value(columns: List[dict], row: list, primary: Tuple[str, ...]) -> Optional[str]:
+    """The asset's display value for a row: the first present primary column."""
+    lower = [str(c.get("name", "")).lower() for c in columns]
+    for col in primary:
+        if col in lower:
+            i = lower.index(col)
+            if i < len(row) and row[i] not in (None, ""):
+                return str(row[i])
+    return None
 
 
 class _UnionFind:
@@ -123,24 +180,25 @@ def _pick_primary(name_counts: Counter) -> str:
     return sorted(name_counts, key=lambda n: (-name_counts[n], len(n), n))[0]
 
 
-def correlate(blocks: List[Tuple[dict, List[dict]]]) -> dict:
-    """Resolve host-keyed rows across all adapters into correlated assets.
+def correlate(blocks: List[Tuple[dict, List[dict]]], asset_type: str = DEFAULT_TYPE) -> dict:
+    """Resolve rows across all adapters into correlated assets of one *type*.
 
-    Every row with a ``host.name`` becomes an *observation*; observations that
-    share any identity token (hostname, IP, MAC, serial, cloud id) are merged
-    into one **asset** via union-find. So a machine reported as ``WIN-DC01`` by
-    one adapter and ``dc01.corp.local`` by another collapses into a single asset
-    when they share, e.g., an IP or MAC.
+    A row contributes an asset of ``asset_type`` when it carries that type's
+    primary column (e.g. ``host.name`` for devices, ``user.name`` for users);
+    rows sharing any identity token *of that type* (hostname/IP/MAC for devices,
+    email/SID/… for users, name for applications) are merged via union-find. A
+    single row can feed several types in separate calls — a "user on host" row is
+    a device here and a user under ``asset_type="user"`` — but types never merge
+    into each other.
 
-    ``blocks`` is ``[(adapter_info, records), ...]``. Returns
-    ``{assets, adapter_order}`` where each asset carries its names/aliases,
-    identifiers, contributing adapters, the tokens that correlated it, and the
-    per-query rows that belong to it (for building fields and detail tables).
+    Returns ``{assets, adapter_order, type}`` where each asset carries its
+    names/aliases, identifiers, contributing adapters, the tokens that correlated
+    it, and the per-query rows that belong to it (for fields and detail tables).
     """
+    spec = _type_spec(asset_type)
     uf = _UnionFind()
     adapter_order: List[Tuple[str, str]] = []
     seen_ids: set = set()
-    # (adapter_id, adapter_name, record, [(row, tokens)]) for rows with a host.
     obs: List[Tuple[str, str, dict, list]] = []
 
     for info, records in blocks:
@@ -148,20 +206,18 @@ def correlate(blocks: List[Tuple[dict, List[dict]]]) -> dict:
         aname = info.get("name", aid)
         for rec in records:
             cols = rec.get("columns", [])
-            hn = _col_index(cols, HOST_KEY)
-            if hn is None:
-                continue
             rowtoks = []
             for row in rec.get("rows", []):
-                if hn >= len(row) or row[hn] in (None, ""):
+                disp = _primary_value(cols, row, spec.primary)
+                if disp is None:
                     continue
-                toks = _row_identities(cols, row)
+                toks = _row_identities(cols, row, spec.identity)
                 keys = [f"{k}:{v}" for k, v in toks]
                 for kk in keys[1:]:
                     uf.union(keys[0], kk)
                 if keys:
                     uf.find(keys[0])
-                rowtoks.append((row, toks, keys, str(row[hn])))
+                rowtoks.append((row, toks, keys, disp))
             if rowtoks:
                 obs.append((aid, aname, rec, rowtoks))
                 if aid not in seen_ids:
@@ -172,7 +228,7 @@ def correlate(blocks: List[Tuple[dict, List[dict]]]) -> dict:
     acc: Dict[str, dict] = {}
     for aid, aname, rec, rowtoks in obs:
         for row, toks, keys, disp in rowtoks:
-            root = uf.find(keys[0]) if keys else f"name:{disp.lower()}"
+            root = uf.find(keys[0]) if keys else f"disp:{disp.lower()}"
             a = acc.setdefault(root, {
                 "adapters": [], "adapter_ids": set(),
                 "name_counts": Counter(), "identities": {},
@@ -210,16 +266,25 @@ def correlate(blocks: List[Tuple[dict, List[dict]]]) -> dict:
             "match_by": {k: sorted(v) for k, v in match_by.items()},
             "obs": a["obs"],
         })
-    return {"assets": assets, "adapter_order": adapter_order}
+    return {"assets": assets, "adapter_order": adapter_order, "type": asset_type}
 
 
 def _correlated_by_text(match_by: Dict[str, list]) -> str:
     """Render an asset's correlation reasons, e.g. ``host.ip 10.0.0.5``."""
-    parts = []
-    for kind in ("mac", "serial", "uid", "ip"):
-        if kind in match_by:
-            parts.append(f"{_IDENT_LABELS[kind]} " + ", ".join(match_by[kind]))
-    return "; ".join(parts)
+    kinds = [k for k in _IDENT_ORDER if k in match_by]
+    kinds += [k for k in match_by if k not in _IDENT_ORDER and k != "name"]
+    return "; ".join(
+        f"{_IDENT_LABELS.get(k, k)} " + ", ".join(match_by[k]) for k in kinds
+    )
+
+
+def _identifiers_text(identities: Dict[str, list]) -> str:
+    """Render an asset's non-name identifiers, e.g. ``host.ip: 10.0.0.5``."""
+    kinds = [k for k in _IDENT_ORDER if identities.get(k)]
+    kinds += [k for k in identities if k not in _IDENT_ORDER and k != "name" and identities.get(k)]
+    return "; ".join(
+        f"{_IDENT_LABELS.get(k, k)}: " + ", ".join(identities[k]) for k in kinds
+    )
 
 
 def _col_index(columns: List[dict], name: str) -> Optional[int]:
@@ -315,32 +380,39 @@ def build_host_view(records: List[dict]) -> dict:
     }
 
 
-def build_unified_inventory(blocks: List[Tuple[dict, List[dict]]]) -> dict:
-    """Correlate host-keyed results across **all** adapters into one inventory.
+def inventory_types(blocks: List[Tuple[dict, List[dict]]]) -> List[dict]:
+    """List the asset types with how many assets of each the data yields."""
+    out = []
+    for t in ASSET_TYPES.values():
+        n = len(correlate(blocks, t.type)["assets"])
+        out.append({"type": t.type, "label": t.label, "count": n})
+    return out
 
-    This is layer 3 — cross-adapter reconciliation. Where ``build_host_view``
-    merges a single adapter's queries into a golden record per host, this folds
-    every adapter's host-keyed results into one **asset** and records *which
-    adapters* saw it. Assets are correlated on shared identifiers (hostname, IP,
-    MAC, serial, cloud id — see ``correlate``), so a machine reported under two
-    different names by two adapters becomes one row. Assets seen by more than one
-    adapter are surfaced first, so overlap between sources is immediately visible.
 
-    ``blocks`` is ``[(adapter_info, records), ...]`` where ``adapter_info`` is
-    ``{"id", "name", ...}`` and ``records`` are db fetch records (with
-    ``columns`` and ``rows``) — the same shape the exporters consume.
+def build_unified_inventory(
+    blocks: List[Tuple[dict, List[dict]]], asset_type: str = DEFAULT_TYPE
+) -> dict:
+    """Correlate results across **all** adapters into one inventory of assets of
+    the given type (``device``, ``user``, or ``application``).
 
-    Returns ``{columns, rows, asset_count, multi_adapter_count,
-    correlated_count, adapters}``. The columns are ``host.name`` (the primary
-    name), ``aliases`` (other names merged into the asset), ``host.ip``,
-    ``seen_by``, ``adapter_count``, ``correlated_by`` (the identifiers that
-    merged it), then one column per contributing adapter.
+    This is layer 3 — cross-adapter reconciliation. It folds every adapter's rows
+    into one **asset** per correlated entity and records *which adapters* saw it.
+    Assets are correlated on shared identifiers of their type (see ``correlate``),
+    so an entity reported under two different names by two adapters becomes one
+    row. Assets seen by more than one adapter are surfaced first.
+
+    ``blocks`` is ``[(adapter_info, records), ...]``. Returns ``{type, columns,
+    rows, asset_count, multi_adapter_count, correlated_count, adapters}``. The
+    columns are the type's primary name, ``aliases``, ``identifiers``,
+    ``seen_by``, ``adapter_count``, ``correlated_by``, then one per adapter.
     """
-    res = correlate(blocks)
+    spec = _type_spec(asset_type)
+    res = correlate(blocks, asset_type)
     adapter_order = res["adapter_order"]
+    primary_cols = set(spec.primary)
 
     columns = (
-        [{"name": HOST_KEY}, {"name": "aliases"}, {"name": HOST_IP},
+        [{"name": spec.primary[0]}, {"name": "aliases"}, {"name": "identifiers"},
          {"name": "seen_by"}, {"name": "adapter_count"}, {"name": "correlated_by"}]
         + [{"name": aname} for _, aname in adapter_order]
     )
@@ -355,7 +427,8 @@ def build_unified_inventory(blocks: List[Tuple[dict, List[dict]]]) -> dict:
             n_queries += 1
             cols = o["record"].get("columns", [])
             value_idxs = [
-                i for i, c in enumerate(cols) if c.get("name") not in (HOST_KEY, HOST_IP)
+                i for i, c in enumerate(cols)
+                if str(c.get("name", "")).lower() not in primary_cols
             ]
             salient = _salient_index(cols, value_idxs)
             if salient is not None:
@@ -384,7 +457,7 @@ def build_unified_inventory(blocks: List[Tuple[dict, List[dict]]]) -> dict:
         row = [
             asset["primary_name"],
             ", ".join(asset["aliases"]),
-            ", ".join(asset["identities"].get("ip", [])),
+            _identifiers_text(asset["identities"]),
             ", ".join(seen_names),
             len(by),
             _correlated_by_text(asset["match_by"]),
@@ -394,6 +467,7 @@ def build_unified_inventory(blocks: List[Tuple[dict, List[dict]]]) -> dict:
         rows.append(row)
 
     return {
+        "type": asset_type,
         "columns": columns,
         "rows": rows,
         "asset_count": len(rows),
@@ -403,8 +477,11 @@ def build_unified_inventory(blocks: List[Tuple[dict, List[dict]]]) -> dict:
     }
 
 
-def _asset_fields(asset: dict) -> List[dict]:
-    """Flatten one asset's per-query rows into aggregated, tagged fields."""
+def _asset_fields(asset: dict, primary_cols: set) -> List[dict]:
+    """Flatten one asset's per-query rows into aggregated, tagged fields.
+
+    The type's primary columns (the asset's own name) are excluded — everything
+    else the queries carried becomes a field."""
     adapters_seen = asset["adapters"]  # ordered (id, name)
     adapter_names = {aid: aname for aid, aname in adapters_seen}
     field_vals: dict = {}   # field name -> {adapter_id: set(values)}
@@ -412,12 +489,9 @@ def _asset_fields(asset: dict) -> List[dict]:
 
     for (aid, _qid), o in asset["obs"].items():
         cols = o["record"].get("columns", [])
-        hn = _col_index(cols, HOST_KEY)
         for i, c in enumerate(cols):
-            if i == hn:
-                continue
             name = str(c.get("name", ""))
-            if name == HOST_KEY:
+            if name.lower() in primary_cols:
                 continue
             if name not in field_vals:
                 field_vals[name] = {}
@@ -465,28 +539,31 @@ def _asset_fields(asset: dict) -> List[dict]:
     return fields
 
 
-def build_asset_detail(blocks: List[Tuple[dict, List[dict]]], host: str) -> dict:
-    """Full cross-adapter detail for a single correlated asset.
+def build_asset_detail(
+    blocks: List[Tuple[dict, List[dict]]], host: str, asset_type: str = DEFAULT_TYPE
+) -> dict:
+    """Full cross-adapter detail for a single correlated asset of ``asset_type``.
 
     Resolves assets with ``correlate`` (so ``host`` may match the primary name
     or any merged alias), then returns three views of the matched asset:
 
     - ``adapters`` — the adapters that saw it, plus ``names``/``aliases``,
-      ``identities`` (all IPs/MACs/…), and ``correlated_by`` (the identifiers
-      that merged records into this one asset).
+      ``identities``, and ``correlated_by`` (the identifiers that merged records
+      into this one asset).
     - ``fields`` — every attribute flattened to distinct values, each tagged
       ``common`` (reported by more than one adapter) or ``specific`` (only one),
       with a ``preferred`` best-guess value, per-adapter values, and whether the
-      adapters ``agree``. The **preferred** value is the one the most adapters
-      report, ties broken by adapter order.
-    - ``tables`` — the raw per-host rows of each contributing query, kept as
-      mini tables (users, revisions, applications, …) to expand under the asset.
+      adapters ``agree``.
+    - ``tables`` — the raw per-asset rows of each contributing query, kept as
+      mini tables to expand under the asset.
 
-    Returns ``{host, found, ...}``; ``found`` is False when no asset matches.
+    Returns ``{host, type, found, ...}``; ``found`` is False when no asset matches.
     """
+    spec = _type_spec(asset_type)
+    primary_cols = set(spec.primary)
     host = str(host)
     needle = host.rstrip(".").lower()
-    res = correlate(blocks)
+    res = correlate(blocks, asset_type)
     asset = None
     for a in res["assets"]:
         if needle == a["primary_name"].rstrip(".").lower() or any(
@@ -496,14 +573,17 @@ def build_asset_detail(blocks: List[Tuple[dict, List[dict]]], host: str) -> dict
             break
 
     if asset is None:
-        return {"host": host, "found": False, "adapters": [], "names": [],
-                "aliases": [], "identities": {}, "correlated_by": {},
+        return {"host": host, "type": asset_type, "found": False, "adapters": [],
+                "names": [], "aliases": [], "identities": {}, "correlated_by": {},
                 "fields": [], "tables": []}
 
     tables = []
     for (aid, qid), o in asset["obs"].items():
         cols = o["record"].get("columns", [])
-        other = [i for i, c in enumerate(cols) if c.get("name") != HOST_KEY]
+        other = [
+            i for i, c in enumerate(cols)
+            if str(c.get("name", "")).lower() not in primary_cols
+        ]
         tables.append({
             "adapter": o["adapter"],
             "adapter_id": aid,
@@ -516,12 +596,13 @@ def build_asset_detail(blocks: List[Tuple[dict, List[dict]]], host: str) -> dict
 
     return {
         "host": asset["primary_name"],
+        "type": asset_type,
         "found": True,
         "adapters": [{"id": aid, "name": aname} for aid, aname in asset["adapters"]],
         "names": asset["names"],
         "aliases": asset["aliases"],
         "identities": asset["identities"],
         "correlated_by": asset["match_by"],
-        "fields": _asset_fields(asset),
+        "fields": _asset_fields(asset, primary_cols),
         "tables": tables,
     }

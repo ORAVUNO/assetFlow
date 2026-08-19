@@ -142,9 +142,17 @@ This is the intra-adapter merge.
 ### Unified inventory (across all adapters)
 
 The **★ Unified inventory** button on the adapter gallery is the cross-adapter
-view: it folds every adapter's host-keyed results into **one asset per machine**
-and shows *which adapters saw it*. This is where the same host reported by more
-than one source is reconciled.
+view: it folds every adapter's results into **one asset per entity** and shows
+*which adapters saw it*. This is where the same entity reported by more than one
+source is reconciled.
+
+- **Asset types.** The inventory has a type switch — **Devices**, **Users**, and
+  **Applications** — and each type is correlated **separately** in its own
+  namespace (a user is never merged into a device). Devices key on
+  hostname/IP/MAC/serial, users on name/email/SID/UPN, applications on their
+  name. A single query row can feed more than one type: a "user on host" row
+  contributes a Device *and* a User (so opening the `admin` user shows every host
+  it appears on).
 
 - **Correlated on shared identifiers, not just the hostname.** Assets are merged
   by matching any shared identifier — `host.name`, `host.ip`, `host.mac`,

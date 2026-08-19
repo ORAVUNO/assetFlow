@@ -128,7 +128,7 @@ def test_unified_inventory(client):
     d = client.get("/api/inventory").json()
     cols = [c["name"] for c in d["columns"]]
     assert cols[:6] == [
-        "host.name", "aliases", "host.ip", "seen_by", "adapter_count", "correlated_by",
+        "host.name", "aliases", "identifiers", "seen_by", "adapter_count", "correlated_by",
     ]
     assert "Elasticsearch" in cols
     assert d["asset_count"] >= 1
@@ -158,6 +158,36 @@ def test_inventory_asset_detail(client):
     assert any(t["query_id"] == "AI001" for t in d["tables"])
     # unknown host -> 404
     assert client.get("/api/inventory/asset?host=nope").status_code == 404
+
+
+def test_inventory_types_and_switch(client):
+    # AI001 returns host.name + user.name -> feeds both device and user types
+    fake = QueryResult(
+        columns=[{"name": "host.name"}, {"name": "user.name"}],
+        rows=[["host-a", "admin"], ["host-b", "admin"]],
+    )
+    import assetflow.runner as rm
+    orig = rm.run_query
+    rm.run_query = lambda c, q, limit=None, time_range=None: fake
+    try:
+        client.post(f"/api/adapters/{A}/run/AI001?limit=5")
+    finally:
+        rm.run_query = orig
+
+    types = {t["type"]: t["count"] for t in client.get("/api/inventory/types").json()["types"]}
+    assert types["device"] == 2 and types["user"] == 1 and "application" in types
+
+    users = client.get("/api/inventory?type=user").json()
+    assert users["type"] == "user"
+    assert [c["name"] for c in users["columns"]][0] == "user.name"
+    assert {r[0] for r in users["rows"]} == {"admin"}
+
+    # asset detail for a user
+    d = client.get("/api/inventory/asset?host=admin&type=user").json()
+    assert d["found"] is True and d["type"] == "user"
+
+    # unknown type rejected
+    assert client.get("/api/inventory?type=vmware").status_code == 404
 
 
 def test_kinds_listing(client):

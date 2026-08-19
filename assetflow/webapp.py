@@ -437,37 +437,54 @@ def create_app(
             )
         raise HTTPException(status_code=400, detail="format must be json or zip")
 
+    def _check_type(asset_type: str) -> str:
+        if asset_type not in merge_mod.ASSET_TYPES:
+            raise HTTPException(status_code=404, detail=f"unknown asset type {asset_type}")
+        return asset_type
+
+    @app.get("/api/inventory/types")
+    def api_inventory_types() -> dict:
+        """Asset types and how many correlated assets of each the data yields."""
+        return {"types": merge_mod.inventory_types(_blocks(None))}
+
     @app.get("/api/inventory")
-    def api_inventory() -> dict:
-        """Cross-adapter unified inventory: one asset per host, with the adapters
-        that saw it. Assets seen by multiple adapters surface first."""
-        return merge_mod.build_unified_inventory(_blocks(None))
+    def api_inventory(type: str = QueryParam(default=merge_mod.DEFAULT_TYPE)) -> dict:
+        """Cross-adapter unified inventory for one asset type (device / user /
+        application): one asset per correlated entity, with the adapters that saw
+        it. Assets seen by multiple adapters surface first."""
+        return merge_mod.build_unified_inventory(_blocks(None), _check_type(type))
 
     @app.get("/api/inventory.{fmt}")
-    def api_inventory_export(fmt: str) -> Response:
-        inv = merge_mod.build_unified_inventory(_blocks(None))
+    def api_inventory_export(
+        fmt: str, type: str = QueryParam(default=merge_mod.DEFAULT_TYPE)
+    ) -> Response:
+        inv = merge_mod.build_unified_inventory(_blocks(None), _check_type(type))
         result = QueryResult(columns=inv["columns"], rows=inv["rows"])
+        stem = f"assetflow-inventory-{type}"
         if fmt == "csv":
             return Response(
                 content=result.to_csv(),
                 media_type="text/csv",
-                headers={"Content-Disposition": 'attachment; filename="assetflow-unified-inventory.csv"'},
+                headers={"Content-Disposition": f'attachment; filename="{stem}.csv"'},
             )
         if fmt == "json":
             return Response(
                 content=result.to_json(),
                 media_type="application/json",
-                headers={"Content-Disposition": 'attachment; filename="assetflow-unified-inventory.json"'},
+                headers={"Content-Disposition": f'attachment; filename="{stem}.json"'},
             )
         raise HTTPException(status_code=400, detail="format must be csv or json")
 
     @app.get("/api/inventory/asset")
-    def api_inventory_asset(host: str = QueryParam(..., min_length=1)) -> dict:
+    def api_inventory_asset(
+        host: str = QueryParam(..., min_length=1),
+        type: str = QueryParam(default=merge_mod.DEFAULT_TYPE),
+    ) -> dict:
         """Full cross-adapter detail for one asset: aggregated/preferred fields
         (tagged common vs adapter-specific) and per-query mini tables."""
-        detail = merge_mod.build_asset_detail(_blocks(None), host)
+        detail = merge_mod.build_asset_detail(_blocks(None), host, _check_type(type))
         if not detail["found"]:
-            raise HTTPException(status_code=404, detail=f"no saved data for host {host!r}")
+            raise HTTPException(status_code=404, detail=f"no saved {type} data for {host!r}")
         return detail
 
     @app.get("/api/export-all.{fmt}")
@@ -613,6 +630,12 @@ INDEX_HTML = r"""<!doctype html>
   .invbtn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
           padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
   .backlink{color:var(--accent);cursor:pointer;font-weight:600}
+  .typeswitch{display:flex;gap:8px;margin:12px 0 4px;flex-wrap:wrap}
+  .typepill{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:20px;
+            padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .typepill.active{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+  .typepill .pilln{opacity:.7;font-weight:500;margin-left:4px}
+  .typepill.active .pilln{opacity:.85}
   .scopetag{font-size:10px;padding:1px 7px;border-radius:20px;font-weight:600;white-space:nowrap}
   .scopetag.common{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
   .scopetag.specific{background:color-mix(in srgb,var(--info) 20%,transparent);color:var(--info)}
@@ -771,23 +794,31 @@ function showGallery(){
 }
 
 /* ---------- unified inventory (cross-adapter, layer 3) ---------- */
-async function openInventory(){
+let INV_TYPE='device', INV_TYPES=[];
+async function openInventory(type){
+  if(type) INV_TYPE=type;
   const g=document.getElementById('gallery');
   g.innerHTML='<p class="hint">Correlating assets across adapters…</p>';
-  let d; try{ d=await j('/api/inventory'); }
+  try{ INV_TYPES=(await j('/api/inventory/types')).types; }catch(e){ INV_TYPES=[]; }
+  if(!INV_TYPES.some(t=>t.type===INV_TYPE) && INV_TYPES[0]) INV_TYPE=INV_TYPES[0].type;
+  let d; try{ d=await j('/api/inventory?type='+encodeURIComponent(INV_TYPE)); }
   catch(e){ g.innerHTML='<div class="err">'+esc(e.message)+'</div>'+
     '<p><span class="backlink" onclick="showGallery()">← Back to adapters</span></p>'; return; }
   const names=d.adapters.map(a=>a.name);
+  const pills=INV_TYPES.map(t=>'<button class="typepill'+(t.type===INV_TYPE?' active':'')+'" '+
+    'onclick="openInventory(\''+esc(t.type)+'\')">'+esc(t.label)+' <span class="pilln">'+t.count+'</span></button>').join('');
   let h='<div class="gbar"><span class="backlink" onclick="showGallery()">← Back to adapters</span></div>'+
     '<h2 style="margin:6px 0 2px">Unified Inventory</h2>'+
     '<div class="sub">One row per asset, correlated across every adapter by shared '+
-    'identifiers (hostname, IP, MAC, serial). Rows highlighted in blue are seen by '+
-    'more than one adapter. <b>Click a row</b> to open the asset.</div>'+
+    'identifiers of its type. Each type (devices, users, applications) is correlated '+
+    'separately. Rows highlighted in blue are seen by more than one adapter. '+
+    '<b>Click a row</b> to open the asset.</div>'+
+    '<div class="typeswitch">'+pills+'</div>'+
     '<div class="meta">'+d.asset_count+' asset(s) · '+d.multi_adapter_count+
     ' seen by multiple adapters · '+(d.correlated_count||0)+' merged via shared identifiers'+
     ' · adapters: '+esc(names.join(', ')||'none')+
-    ' · <a class="dl" href="/api/inventory.csv">Download CSV</a>'+
-    ' · <a class="dl" href="/api/inventory.json">Download JSON</a></div>'+
+    ' · <a class="dl" href="/api/inventory.csv?type='+esc(INV_TYPE)+'">Download CSV</a>'+
+    ' · <a class="dl" href="/api/inventory.json?type='+esc(INV_TYPE)+'">Download JSON</a></div>'+
     '<div id="invtable"></div>';
   g.innerHTML=h;
   const t=document.getElementById('invtable');
@@ -796,20 +827,21 @@ async function openInventory(){
     const ci=cols.indexOf('adapter_count');
     mountTable(t, cols, d.rows, {
       rowClass:r=>((ci>=0 && (+r[ci])>1)?'multi':''),
-      onRow:r=>openAsset(r[0]),
+      onRow:r=>openAsset(r[0], INV_TYPE),
     });
   }else{
-    t.innerHTML='<p class="hint">No host-keyed results saved yet. Open an adapter, connect, '+
-      'and fetch a host query (e.g. AI001) — assets appear here as adapters report them.</p>';
+    t.innerHTML='<p class="hint">No '+esc(INV_TYPE)+' assets saved yet. Open a connection, connect, '+
+      'and fetch a query that returns this asset type — assets appear here as adapters report them.</p>';
   }
 }
 
 /* ---------- asset drill-down (open one host) ---------- */
 let ASSET=null, ASSET_VIEW='__all__';
-async function openAsset(host){
+async function openAsset(host, type){
   const g=document.getElementById('gallery');
   g.innerHTML='<p class="hint">Loading asset '+esc(host)+'…</p>';
-  try{ ASSET=await j('/api/inventory/asset?host='+encodeURIComponent(host)); }
+  const q='host='+encodeURIComponent(host)+'&type='+encodeURIComponent(type||INV_TYPE);
+  try{ ASSET=await j('/api/inventory/asset?'+q); }
   catch(e){ g.innerHTML='<div class="err">'+esc(e.message)+'</div>'+
     '<p><span class="backlink" onclick="openInventory()">← Back to inventory</span></p>'; return; }
   ASSET_VIEW='__all__';

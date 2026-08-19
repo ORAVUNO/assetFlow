@@ -78,7 +78,7 @@ def test_unified_inventory_flags_multi_adapter_assets():
 
     names = [c["name"] for c in inv["columns"]]
     assert names[:6] == [
-        "host.name", "aliases", "host.ip", "seen_by", "adapter_count", "correlated_by",
+        "host.name", "aliases", "identifiers", "seen_by", "adapter_count", "correlated_by",
     ]
     # one column per contributing adapter, in input order
     assert names[6:] == ["Elasticsearch", "Tufin SecureTrack"]
@@ -159,7 +159,7 @@ def test_unified_inventory_skips_non_host_keyed():
     assert inv["asset_count"] == 0
     # no adapter contributed a host, so no per-adapter columns
     assert [c["name"] for c in inv["columns"]] == [
-        "host.name", "aliases", "host.ip", "seen_by", "adapter_count", "correlated_by",
+        "host.name", "aliases", "identifiers", "seen_by", "adapter_count", "correlated_by",
     ]
     assert inv["adapters"] == []
 
@@ -239,6 +239,56 @@ def test_asset_detail_lookup_by_alias():
         assert "10.0.0.5" in d["correlated_by"].get("ip", [])
         # both adapters' fields present
         assert {"vendor", "user.name"} <= {f["name"] for f in d["fields"]}
+
+
+def test_asset_types_are_correlated_separately():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping", ["host.name", "host.ip", "user.name"],
+            [["WIN-DC01", "10.0.0.5", "admin"], ["WIN-APP07", "10.0.2.9", "admin"]]),
+    ])
+    # devices: two hosts
+    dev = merge.build_unified_inventory([es], "device")
+    assert dev["type"] == "device"
+    assert {r[0] for r in dev["rows"]} == {"WIN-DC01", "WIN-APP07"}
+    # users: one user (admin), seen on both hosts — NOT merged into a device
+    usr = merge.build_unified_inventory([es], "user")
+    assert usr["type"] == "user"
+    assert [c["name"] for c in usr["columns"]][0] == "user.name"
+    assert {r[0] for r in usr["rows"]} == {"admin"}
+    # inventory_types reports counts per type
+    counts = {t["type"]: t["count"] for t in merge.inventory_types([es])}
+    assert counts["device"] == 2 and counts["user"] == 1
+
+
+def test_user_asset_detail_shows_hosts_as_fields():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI001", "User Device Mapping", ["host.name", "user.name"],
+            [["WIN-DC01", "admin"], ["WIN-APP07", "admin"]]),
+    ])
+    d = merge.build_asset_detail([es], "admin", "user")
+    assert d["found"] is True and d["type"] == "user" and d["host"] == "admin"
+    # user.name is the asset identity (dropped); host.name becomes a field
+    fnames = {f["name"] for f in d["fields"]}
+    assert "host.name" in fnames and "user.name" not in fnames
+    host_field = next(f for f in d["fields"] if f["name"] == "host.name")
+    assert set(host_field["values_by_adapter"]["Elasticsearch"]) == {"WIN-DC01", "WIN-APP07"}
+
+
+def test_application_assets_from_service_name():
+    es = _block("elasticsearch", "Elasticsearch", [
+        rec("AI010", "App by Service", ["service.name", "Hosts"],
+            [["Elastic Agent", 12], ["nginx", 3]]),
+    ])
+    inv = merge.build_unified_inventory([es], "application")
+    assert inv["type"] == "application"
+    assert [c["name"] for c in inv["columns"]][0] == "application.name"
+    assert {r[0] for r in inv["rows"]} == {"Elastic Agent", "nginx"}
+
+
+def test_unknown_asset_type_raises():
+    import pytest
+    with pytest.raises(KeyError):
+        merge.correlate([], "vmware")
 
 
 def test_asset_detail_missing_host():
