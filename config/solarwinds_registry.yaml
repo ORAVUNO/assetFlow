@@ -1,0 +1,304 @@
+# =============================================================================
+# SolarWinds Orion / NCM Asset Intelligence Registry
+# =============================================================================
+# Resource registry for the SolarWinds adapter. Where the Elasticsearch registry
+# carries ES|QL query bodies, each entry here names a `resource` that the
+# SolarWinds runner maps to one or more SWQL statements (run through the SWIS
+# query endpoint) and normalizes into the same column/row shape
+# (see assetflow/solarwinds_runner.py).
+#
+# One interface is used (see assetflow/solarwinds_client.py):
+#   - SolarWinds Information Service (SWIS), the single SWQL query endpoint:
+#       POST https://<host>:17774/SolarWinds/InformationService/v3/Json/Query
+#     Everything — nodes, interfaces, NCM config archive, NCM compliance — is a
+#     SWQL SELECT against an Orion/NCM entity.
+#
+# Two capabilities are covered:
+#   1. Full, typed inventory (NPM): every monitored device, tagged with a derived
+#      asset.type (Router / Switch / Firewall / Server / …), with every
+#      SolarWinds custom property merged onto the row under columns prefixed
+#      `custom.` so system fields and site-defined custom fields are never
+#      confused.
+#   2. Configuration posture and change (NCM): the current config each device
+#      runs (config_inventory), what changed in a device's config over time
+#      (change_detail — diffs archived configs, feeds the change log), and which
+#      devices violate which compliance policies (policy_violations). The NCM
+#      resources return no rows unless NCM is licensed and archiving configs.
+#
+# Status meanings match the other registries:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Entity/field names confirmed from the SWIS schema
+#                              docs; mapping is best-effort and needs confirming
+#                              against a live SolarWinds release.
+#   - investigation_required : Entity exists but response shape / availability
+#                              varies by SolarWinds/NCM version or licensing.
+#   - not_validated          : Not yet exercised against live data.
+# =============================================================================
+
+metadata:
+  version: 1
+  description: >-
+    SolarWinds Orion inventory and NCM configuration-posture resources — every
+    monitored device typed as Router / Switch / Firewall / Server / … with
+    custom properties (prefixed `custom.`), plus the current config posture,
+    per-device config change history, and NCM compliance violations. Entity/field
+    names follow the SolarWinds Information Service (SWIS) schema; queries are
+    SWQL.
+  query_language: SWQL (SolarWinds Information Service)
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Device Inventory
+    - Interfaces
+    - Storage
+    - Custom Properties
+    - Config Posture
+    - Config Changes
+    - Compliance
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+feeds:
+  - id: FEED-SW-NODES
+    name: Device Inventory
+    category: Device Inventory
+    description: Every monitored device — routers, switches, firewalls, servers, … — typed and enriched with custom properties.
+    query_ids: [SW001]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-SW-INTERFACES
+    name: Interfaces
+    category: Interfaces
+    description: Monitored interfaces per device, with type, speed, MAC, and admin/oper status.
+    query_ids: [SW002]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-SW-STORAGE
+    name: Storage
+    category: Storage
+    description: Volumes / disks per device, with type, size, and utilization.
+    query_ids: [SW003]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-SW-CUSTOM
+    name: Custom Properties
+    category: Custom Properties
+    description: The catalog of node custom-property definitions available on this SolarWinds server (what custom fields exist).
+    query_ids: [SW004]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-SW-CONFIG
+    name: Config Posture
+    category: Config Posture
+    description: The current running / startup config version per device (NCM), when captured, and whether it is the approved baseline.
+    query_ids: [SW005]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-SW-CHANGES
+    name: Config Changes
+    category: Config Changes
+    description: What changed in each device's configuration over time (NCM), diffed line by line. Feeds the deduplicated change log; supports "since last check".
+    query_ids: [SW006]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-SW-COMPLIANCE
+    name: Compliance
+    category: Compliance
+    description: NCM policy-compliance posture — which devices violate which policy rules.
+    query_ids: [SW007]
+    recommended_refresh_frequency: Daily
+
+# =============================================================================
+# QUERIES (resources)
+# =============================================================================
+queries:
+  - id: SW001
+    category: Device Inventory
+    name: Devices (Full Inventory)
+    status: partially_validated
+    validated: false
+    resource: nodes
+    purpose: >-
+      Inventory every device SolarWinds monitors, tagged with a derived
+      asset.type (Router / Switch / Firewall / Load Balancer / Wireless / Server
+      / …), with IP, vendor, machine type, OS/IOS version, DNS, location, status,
+      MAC, and every SolarWinds node custom property merged in under custom.*
+      columns.
+    expected_output_fields:
+      - host.name       # Caption (folds into the unified host view)
+      - node.id         # Orion NodeID
+      - asset.type      # derived role: Router / Switch / Firewall / Server / …
+      - host.ip         # IP_Address
+      - device.vendor   # Vendor
+      - device.model    # MachineType
+      - os.version      # IOSVersion
+      - host.dns        # DNS
+      - sys.name        # SysName
+      - location        # Location
+      - status          # StatusDescription (Up / Down / …)
+      - host.mac        # first real MAC (Orion.NodeMACAddresses)
+      - "custom.*"      # each SolarWinds node custom property, prefixed custom.
+    notes: >-
+      SELECT the standard Orion.Nodes fields and LEFT JOIN
+      Orion.NodesCustomProperties so every site-defined custom property rides
+      along; the custom columns are discovered dynamically (SELECT TOP 1 * on the
+      custom-properties entity) and emitted prefixed `custom.` so they are never
+      confused with system fields. MAC comes from Orion.NodeMACAddresses. Node
+      role is derived from Vendor + MachineType + NodeDescription + poll method
+      (ObjectSubType), since SolarWinds has no single device-role field. Paged
+      with WITH ROWS … WITH TOTALROWS.
+    recommended_refresh_frequency: Daily
+
+  - id: SW002
+    category: Interfaces
+    name: Interfaces
+    status: partially_validated
+    validated: false
+    resource: interfaces
+    purpose: Inventory monitored interfaces per device with type, speed, MAC, and admin/oper status.
+    expected_output_fields:
+      - host.name        # owning node Caption
+      - interface.id     # InterfaceID
+      - interface.name   # InterfaceName
+      - interface.type   # InterfaceTypeDescription
+      - speed.bps        # InterfaceSpeed
+      - mac              # PhysicalAddress
+      - admin.status     # AdminStatus
+      - oper.status      # OperStatus
+    notes: >-
+      SELECT from Orion.NPM.Interfaces INNER JOIN Orion.Nodes for the owning node
+      caption. Requires NPM; returns no rows for ICMP-only nodes.
+    recommended_refresh_frequency: Daily
+
+  - id: SW003
+    category: Storage
+    name: Volumes
+    status: partially_validated
+    validated: false
+    resource: volumes
+    purpose: Inventory volumes / disks per device with type, size, and utilization.
+    expected_output_fields:
+      - host.name       # owning node Caption
+      - volume.id       # VolumeID
+      - volume.name     # volume Caption
+      - volume.type     # VolumeType (Fixed Disk / RAM / …)
+      - size.bytes      # VolumeSize
+      - percent.used    # VolumePercentUsed
+    notes: SELECT from Orion.Volumes INNER JOIN Orion.Nodes for the owning node caption.
+    recommended_refresh_frequency: Daily
+
+  - id: SW004
+    category: Custom Properties
+    name: Custom Property Definitions
+    status: partially_validated
+    validated: false
+    resource: custom_properties
+    purpose: >-
+      List the node custom-property definitions defined on this SolarWinds server
+      — the catalog of custom fields that get merged onto device rows as custom.*
+      in SW001.
+    expected_output_fields:
+      - custom_field.name         # property name (appears as custom.<name> on nodes)
+      - custom_field.description  # description
+      - data_type                 # declared data type
+      - target                    # target entity (Orion.NodesCustomProperties)
+    notes: >-
+      Reads Orion.CustomProperty (filtered to node custom properties) for the rich
+      definition; falls back to the names discovered by probing
+      Orion.NodesCustomProperties. Use this to see which custom fields exist before
+      relying on specific custom.* columns in SW001.
+    recommended_refresh_frequency: Weekly
+
+  - id: SW005
+    category: Config Posture
+    name: Config Posture (Latest Config per Device)
+    status: partially_validated
+    validated: false
+    resource: config_inventory
+    purpose: >-
+      Show the current configuration posture: the latest running and startup
+      config version NCM holds for each device, when it was captured, and whether
+      it is the approved baseline. This is the "what config is this device
+      running" view, beyond plain inventory.
+    expected_output_fields:
+      - host.name      # NCM node caption
+      - asset.type     # "Config Snapshot"
+      - config.type    # Running / Startup
+      - config.title   # archived config title
+      - config.id      # ConfigID (globally unique config version id)
+      - captured_at    # DownloadTime
+      - baseline       # whether this version is the NCM baseline
+    notes: >-
+      SELECT from NCM.ConfigArchive INNER JOIN NCM.Nodes (legacy Cirrus.* names
+      tried as a fallback), ordered by DownloadTime DESC, keeping the newest
+      version per (device, config type). The config text itself is not selected
+      here (it is large); SW006 fetches text to diff. Requires NCM licensed and
+      archiving configs.
+    recommended_refresh_frequency: Daily
+
+  - id: SW006
+    category: Config Changes
+    name: Config Change Detail
+    status: partially_validated
+    validated: false
+    resource: change_detail
+    purpose: >-
+      Track configuration change: diff each device's two most recent archived
+      running configs line by line to show exactly what was added and removed,
+      and when. Rows accumulate into the deduplicated Change Log. Pick the "Since
+      last check" range to report only configs that changed since the previous
+      fetch (per-device watermark).
+    expected_output_fields:
+      - host.name      # NCM node caption
+      - revision.id    # ConfigID of the newer config version (globally unique)
+      - "@timestamp"   # DownloadTime of the newer config
+      - changed_by     # blank — NCM config archive does not record the author
+      - change_type    # added / removed (per config line)
+      - rule.uid       # stable per-line key (content hash) for dedup
+      - before         # the removed config line (for a removal)
+      - after          # the added config line (for an addition)
+      - authorized     # blank — not applicable to config archive
+      - requester      # blank — not applicable to config archive
+    notes: >-
+      For each NCM node, SELECT TOP 2 ... Config FROM NCM.ConfigArchive WHERE
+      ConfigType = 'Running' ORDER BY DownloadTime DESC, then difflib the two
+      config texts (volatile lines like "Last configuration change at" are
+      dropped). Default mode diffs the latest two configs; the incremental
+      (since/new) mode diffs a device only when its newest ConfigID differs from
+      the last one seen and advances a per-node watermark, so each change is
+      reported exactly once. Author attribution needs NCM real-time change
+      detection (AAA/syslog), which is not exposed to SWQL, so changed_by is
+      blank. The result shape matches the change log; rows dedupe by ConfigID +
+      per-line key + change type.
+    recommended_refresh_frequency: Daily
+
+  - id: SW007
+    category: Compliance
+    name: Policy Compliance Violations
+    status: investigation_required
+    validated: false
+    resource: policy_violations
+    purpose: >-
+      Report the compliance posture: which devices violate which NCM policy
+      rules (e.g. telnet enabled, weak SNMP community, missing ACL), with the
+      rule, severity, and remediation where available.
+    expected_output_fields:
+      - host.name          # device caption
+      - policy.report      # policy report name
+      - policy.name        # policy name
+      - policy.rule        # violated rule name
+      - severity           # rule severity / level
+      - remediation        # remediation script / guidance, when present
+      - violation.detail   # the offending config / violation string
+    notes: >-
+      NCM's compliance results live under a few entity names across releases
+      (NCM.PolicyReportResults / NCM.PolicyViolations / Cirrus.PolicyReportViolations
+      / *CacheResults); the runner SELECTs TOP N * from each in turn and reads
+      whichever columns are present, so field names are best-effort. Marked
+      investigation_required because the exact violation entity/columns vary by
+      NCM version — confirm against SWQL Studio for your release.
+    recommended_refresh_frequency: Daily
