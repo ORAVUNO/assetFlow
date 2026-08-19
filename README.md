@@ -3,19 +3,22 @@
 Asset-intelligence tool that fetches assets from pluggable **adapters** (data
 sources), shows them in a local web UI, and persists every fetch to a local
 database. Elasticsearch is the first adapter, Tufin SecureTrack is the second,
-and VMware vCenter is the third; more sources plug in beside them, grouped by
-category, so results from many sources can later be merged.
+VMware vCenter is the third, and SolarWinds Orion is the fourth; more sources
+plug in beside them, grouped by category, so results from many sources can later
+be merged.
 
 - **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, VMware,
-  …) is a template with its own metadata and query registry. You can create
-  **multiple connections** of the same kind — e.g. two Tufin servers or three
-  Elasticsearch clusters — each with a **label** of its own, its own live
+  SolarWinds, …) is a template with its own metadata and query registry. You can
+  create **multiple connections** of the same kind — e.g. two Tufin servers or
+  three Elasticsearch clusters — each with a **label** of its own, its own live
   connection, and its own saved data. The gallery lists connections by category;
   **＋ Add connection** creates another instance, and each card can be renamed or
   removed. Today's kinds: **Elasticsearch** (category *SIEM / Log Analytics*),
   **Tufin SecureTrack** (category *Network Security Policy* — see
-  [Tufin adapter](#tufin-securetrack-adapter)), and **VMware vCenter** (category
-  *Virtualization / Infrastructure* — see [VMware adapter](#vmware-vcenter-adapter)).
+  [Tufin adapter](#tufin-securetrack-adapter)), **VMware vCenter** (category
+  *Virtualization / Infrastructure* — see [VMware adapter](#vmware-vcenter-adapter)),
+  and **SolarWinds Orion** (category *Network Monitoring / NCM* — see
+  [SolarWinds adapter](#solarwinds-orion-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity,
@@ -26,6 +29,9 @@ category, so results from many sources can later be merged.
   `config/vmware_registry.yaml` — the VMware adapter's 6 vCenter resources in 6
   feeds (Virtual Servers, Physical Hosts, Compute Clusters, Storage,
   Datacenters, Custom Attributes).
+  `config/solarwinds_registry.yaml` — the SolarWinds adapter's 7 SWQL resources
+  in 7 feeds (Device Inventory, Interfaces, Storage, Custom Properties, Config
+  Posture, Config Changes, Compliance).
 - **Database:** fetched results are saved to a local SQLite file
   (`assetflow.db`, gitignored). The newest run per query is the panel's saved
   view; older runs form the history. Real telemetry never leaves your machine.
@@ -39,7 +45,8 @@ correlation design, decisions & flow ·
 [`docs/elasticsearch_integration.md`](docs/elasticsearch_integration.md) ·
 [`docs/tufin_integration.md`](docs/tufin_integration.md) ·
 [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md) ·
-[`docs/vmware_integration.md`](docs/vmware_integration.md).
+[`docs/vmware_integration.md`](docs/vmware_integration.md) ·
+[`docs/solarwinds_integration.md`](docs/solarwinds_integration.md).
 
 ## Requirements
 
@@ -52,6 +59,13 @@ correlation design, decisions & flow ·
   user (host + username + password). vCenter Custom Attributes (columns prefixed
   `custom.`) additionally need pyVmomi (`pip install pyvmomi`, or from an offline
   wheel); standard inventory works without it.
+- For the SolarWinds adapter: network access to your SolarWinds Orion/SWIS host
+  (query port 17774, or 17778 on older deployments) and an Orion account with
+  read access (host + username + password). Typed device inventory and custom
+  properties (columns prefixed `custom.`) need only NPM; the config-posture,
+  config-change, and compliance resources need **NCM** licensed and archiving
+  configs. No extra Python package is required — SWQL runs over the standard
+  library.
 
 ## Setup
 
@@ -430,6 +444,83 @@ you tick **Remember**.
 > API** and the pyVmomi custom-fields pattern; resources stay marked
 > `partially_validated` until run against a live vCenter (the same honest
 > labeling the other registries use).
+
+## SolarWinds Orion adapter
+
+The **SolarWinds Orion** adapter (category *Network Monitoring / NCM*) fetches a
+full, typed device inventory from SolarWinds and — the reason it exists — goes
+**beyond inventory to track configuration posture and change** on network
+devices, via SolarWinds **NCM** (Network Configuration Manager). Everything runs
+over one interface: **SWIS** (the SolarWinds Information Service), queried with
+**SWQL**.
+
+### What it fetches
+
+Seven resources (`SW001`–`SW007`). Node rows are tagged with a derived
+`asset.type` (Router / Switch / Firewall / Load Balancer / Wireless / Server / …)
+so the estate is legible at a glance:
+
+| Resource | SWIS entity | Highlights |
+|---|---|---|
+| **Devices** (`nodes`) | `Orion.Nodes` + custom props + MAC | typed inventory: IP, vendor, machine type, OS/IOS version, DNS, location, status, MAC, + `custom.*` |
+| **Interfaces** (`interfaces`) | `Orion.NPM.Interfaces` | type, speed, MAC, admin/oper status (needs NPM) |
+| **Volumes** (`volumes`) | `Orion.Volumes` | type, size, utilization |
+| **Custom Property Definitions** (`custom_properties`) | `Orion.CustomProperty` | the catalog of custom fields defined on the server |
+| **Config Posture** (`config_inventory`) | `NCM.ConfigArchive` | latest running/startup config per device, when captured, baseline flag |
+| **Config Change Detail** (`change_detail`) | `NCM.ConfigArchive` | line-level config diffs (added/removed) → **Change Log**; "since last check" mode |
+| **Policy Compliance** (`policy_violations`) | `NCM.PolicyReportResults` (+ variants) | which devices violate which policy rules, with severity/remediation |
+
+### Configuration posture and change (beyond inventory)
+
+The last three resources answer *"can we track configurational posture and change
+of network devices?"* — **yes**, through NCM:
+
+- **Current posture** — `config_inventory` shows the latest running & startup
+  config version NCM holds for each device, when it was captured, and whether it
+  is the approved **baseline**. That's "what config is this device running."
+- **Change history** — `change_detail` diffs each device's two most recent
+  archived running configs **line by line** (added/removed lines), with the
+  change time. Rows accumulate into the deduplicated **Change Log** (the same
+  sink Tufin's rule changes use), keyed by the globally-unique `ConfigID`. Pick
+  the **"Since last check"** range for the incremental mode: a per-device
+  watermark reports each config change exactly once. (NCM's archive doesn't
+  record the acting user, so `changed_by` is blank — config author attribution
+  needs NCM real-time change detection, which SWQL doesn't expose.)
+- **Compliance posture** — `policy_violations` reports which devices violate
+  which NCM policy rules (telnet enabled, weak SNMP, missing ACL, …).
+
+These NCM resources return no rows unless NCM is licensed and archiving configs;
+the connection banner notes *"NCM not detected"* when it isn't.
+
+### System fields vs. custom fields
+
+Standard `Orion.Nodes` columns are the **system fields**. SolarWinds node
+**custom properties** are discovered dynamically (`SELECT TOP 1 * FROM
+Orion.NodesCustomProperties`, minus the base columns), LEFT JOINed onto the node
+query, and emitted as their **own columns prefixed `custom.`** — e.g.
+`custom.Department`, `custom.Owner` — so a system field is never confused with a
+site-defined one. When `SELECT *` is unsupported or no custom properties exist,
+the standard inventory is unaffected.
+
+### Connecting
+
+In the web UI, open the **SolarWinds Orion** card and click **Connection**: enter
+the **host** (or IP), **username** (an Orion account with read access),
+**password**, optional **port** (defaults to 17774; older deployments use
+17778 — the client auto-probes both), and toggle **Verify TLS certificate**
+(disable only for a lab/self-signed environment). Or set `SWIS_HOSTNAME` /
+`SWIS_USERNAME` / `SWIS_PASSWORD` in `.env` (see `.env.example`) to auto-connect
+on startup. Credentials entered in the form are held in the local server's memory
+only unless you tick **Remember**.
+
+> **Developer guide.** For a full walkthrough — architecture, module map, data
+> flow, the SWQL entity choices, and how config change feeds the Change Log — see
+> [`docs/solarwinds_integration.md`](docs/solarwinds_integration.md).
+
+> **Validation status.** Entity and field names follow the **SWIS schema docs**
+> (the modern `NCM.*` namespace with legacy `Cirrus.*` fallbacks); resources stay
+> marked `partially_validated` / `investigation_required` until run against a live
+> SolarWinds/NCM box (the same honest labeling the other registries use).
 
 ## CLI reference
 

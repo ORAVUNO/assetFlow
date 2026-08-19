@@ -18,6 +18,8 @@ from typing import Dict, List, Optional
 from . import client as client_mod
 from . import db as db_mod
 from . import runner as runner_mod
+from . import solarwinds_client as solarwinds_client_mod
+from . import solarwinds_runner as solarwinds_runner_mod
 from . import tufin_client as tufin_client_mod
 from . import tufin_runner as tufin_runner_mod
 from . import vmware_client as vmware_client_mod
@@ -341,6 +343,90 @@ class VMwareAdapter(Adapter):
         )
 
 
+class SolarWindsAdapter(Adapter):
+    """SolarWinds Orion source: fetches full, typed device inventory (routers,
+    switches, firewalls, servers, …) with custom properties (prefixed
+    ``custom.``) over the SWIS query API, plus NCM configuration posture — the
+    current config per device, per-device config change history, and policy
+    compliance — via SWQL."""
+
+    def connect(
+        self,
+        *,
+        host: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        port: int = solarwinds_client_mod.DEFAULT_PORT,
+        verify_certs: bool = True,
+        request_timeout: int = 120,
+    ) -> dict:
+        candidate = solarwinds_client_mod.build_client(
+            host=host or "",
+            username=username or "",
+            password=password or "",
+            port=port or solarwinds_client_mod.DEFAULT_PORT,
+            verify_certs=verify_certs,
+            request_timeout=request_timeout,
+        )
+        info = solarwinds_client_mod.ping(candidate)  # raises on failure
+        self._client = candidate
+        self._conn_info = info
+        return info
+
+    def connect_form(self, form: dict) -> dict:
+        return self.connect(
+            host=(form.get("host") or form.get("url") or None),
+            username=(form.get("username") or None),
+            password=(form.get("password") or None),
+            port=int(form.get("port") or solarwinds_client_mod.DEFAULT_PORT),
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 120)),
+        )
+
+    def try_auto_connect(self) -> bool:
+        try:
+            candidate = solarwinds_client_mod.build_client_from_env()
+            info = solarwinds_client_mod.ping(candidate)
+        except Exception:
+            return False
+        self._client = candidate
+        self._conn_info = info
+        return True
+
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "SWIS_HOSTNAME", "SWIS_USERNAME", "SWIS_PASSWORD",
+            "SWIS_PORT", "SWIS_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        host = (form.get("host") or form.get("url") or "").strip()
+        return {
+            "SWIS_HOSTNAME": solarwinds_client_mod.clean_host(host),
+            "SWIS_USERNAME": str(form.get("username") or ""),
+            "SWIS_PASSWORD": str(form.get("password") or ""),
+            "SWIS_PORT": str(form.get("port") or solarwinds_client_mod.DEFAULT_PORT),
+            "SWIS_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
+        }
+
+    def ping(self) -> dict:
+        if self._client is None:
+            raise solarwinds_client_mod.SolarWindsConfigError("adapter is not connected")
+        info = solarwinds_client_mod.ping(self._client)
+        self._conn_info = info
+        return info
+
+    def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
+        if self._client is None:
+            raise solarwinds_client_mod.SolarWindsConfigError("adapter is not connected")
+        # The config change-detail "since last check" mode reads/advances a
+        # per-node watermark stored in the database (scoped to this adapter).
+        store = db_mod.watermark_store(self.info.id)
+        return solarwinds_runner_mod.run_query(
+            self._client, query, limit=limit, time_range=time_range, watermark_store=store
+        )
+
+
 @dataclass
 class AdapterKind:
     """A *type* of data source (Elasticsearch, Tufin, …) — the template from
@@ -500,6 +586,25 @@ def available_kinds(registry_path: Optional[str] = None) -> Dict[str, AdapterKin
             ),
             registry=load_registry(vmware_path),
             adapter_cls=VMwareAdapter,
+        )
+
+    solarwinds_path = _find_registry(
+        "config/solarwinds_registry.yaml", "solarwinds_registry.yaml"
+    )
+    if solarwinds_path:
+        kinds["solarwinds"] = AdapterKind(
+            kind="solarwinds",
+            name="SolarWinds Orion",
+            category="Network Monitoring / NCM",
+            description=(
+                "SolarWinds Orion — full, typed device inventory (routers, "
+                "switches, firewalls, servers, …) with custom properties "
+                "(prefixed 'custom.') via the SWIS query API, plus NCM "
+                "configuration posture: the current config per device, per-device "
+                "config change history, and policy compliance."
+            ),
+            registry=load_registry(solarwinds_path),
+            adapter_cls=SolarWindsAdapter,
         )
     return kinds
 

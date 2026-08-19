@@ -994,10 +994,23 @@ async function forgetConn(){
 function applyKind(kind){
   const tufin = (kind==='tufin');
   const vmware = (kind==='vmware');
-  // Tufin uses an API base path; Elasticsearch and VMware use a port.
+  const solarwinds = (kind==='solarwinds');
+  // Tufin uses an API base path; Elasticsearch, VMware, and SolarWinds use a port.
   document.getElementById('f_port').classList.toggle('hidden', tufin);
   document.getElementById('f_basepath').classList.toggle('hidden', !tufin);
   const remember='Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). ';
+  if(solarwinds){
+    document.getElementById('c_host').placeholder = 'solarwinds.example.com  ·  10.0.0.20';
+    document.getElementById('c_user').placeholder = 'orion-read-user';
+    document.getElementById('c_port').placeholder = '17774';
+    document.getElementById('c_timeout').value = '120';
+    document.getElementById('c_hint').innerHTML = remember+
+      'Connects to the SolarWinds Information Service (SWIS) at '+
+      '<code>https://host:17774/SolarWinds/InformationService/v3/Json/Query</code> and runs SWQL. '+
+      'Fetches typed device inventory with custom properties (columns prefixed <code>custom.</code>); '+
+      'NCM config posture, config-change, and compliance resources need NCM licensed.';
+    return;
+  }
   if(vmware){
     document.getElementById('c_host').placeholder = 'vcenter.example.com  ·  10.0.0.10';
     document.getElementById('c_user').placeholder = 'administrator@vsphere.local';
@@ -1101,7 +1114,7 @@ async function openChangeLog(){
   m.innerHTML=h;
   const t=document.getElementById('cltable');
   if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {});
-  else t.innerHTML='<p class="hint">No changes recorded yet. Run TUF008 (Change Detail) — its rows accumulate here.</p>';
+  else t.innerHTML='<p class="hint">No changes recorded yet. Run a Change Detail query (Tufin TUF008, SolarWinds SW006) — its rows accumulate here.</p>';
 }
 
 async function openDrift(){
@@ -1142,7 +1155,9 @@ function renderSidebar(){
   const all=document.createElement('div'); all.className='q ov'; all.id='ovAll';
   all.innerHTML='<span class="qid">★ All Fetched Results</span>';
   all.onclick=openMerged; side.appendChild(all);
-  if(DETAIL.kind==='tufin'){
+  // Any adapter with a change_detail resource (Tufin revisions, SolarWinds NCM
+  // config changes) accumulates a deduplicated Change Log.
+  if((DETAIL.queries||[]).some(q=>q.resource==='change_detail')){
     const cl=document.createElement('div'); cl.className='q ov'; cl.id='ovChangeLog';
     cl.innerHTML='<span class="qid">⟳ Change Log</span>';
     cl.onclick=openChangeLog; side.appendChild(cl);
@@ -1171,7 +1186,7 @@ function select(id){
     '<h2>'+esc(q.id)+' — '+esc(q.name)+' <span class="badge b-'+q.status+'">'+q.status.replace(/_/g,' ')+'</span></h2>'+
     '<div class="sub">'+esc(q.purpose)+'</div>'+
     (q.expected_output_fields.length?'<div class="fields">Fields: '+q.expected_output_fields.map(esc).join(', ')+'</div>':'')+
-    '<pre>'+esc(q.esql_query.trim()||(q.resource?('SecureTrack resource: '+q.resource):'(no query — placeholder)'))+'</pre>'+
+    '<pre>'+esc(q.esql_query.trim()||(q.resource?(DETAIL.name+' resource: '+q.resource):'(no query — placeholder)'))+'</pre>'+
     '<div class="controls">'+
       (q.is_runnable
         ? '<button id="runbtn">Run</button>'+
