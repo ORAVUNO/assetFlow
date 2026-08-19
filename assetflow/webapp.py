@@ -993,18 +993,31 @@ async function forgetConn(){
 /* show the connection fields that fit the adapter kind */
 function applyKind(kind){
   const tufin = (kind==='tufin');
+  const vmware = (kind==='vmware');
+  // Tufin uses an API base path; Elasticsearch and VMware use a port.
   document.getElementById('f_port').classList.toggle('hidden', tufin);
   document.getElementById('f_basepath').classList.toggle('hidden', !tufin);
+  const remember='Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). ';
+  if(vmware){
+    document.getElementById('c_host').placeholder = 'vcenter.example.com  ·  10.0.0.10';
+    document.getElementById('c_user').placeholder = 'administrator@vsphere.local';
+    document.getElementById('c_port').placeholder = '443';
+    document.getElementById('c_timeout').value = '60';
+    document.getElementById('c_hint').innerHTML = remember+
+      'Connects to the vCenter REST API at <code>https://host/api</code> for the VM / host / '+
+      'cluster inventory. vCenter Custom Attributes (columns prefixed <code>custom.</code>) are '+
+      'read via pyVmomi when it is installed; without it, standard inventory still works.';
+    return;
+  }
   document.getElementById('c_host').placeholder = tufin
     ? 'securetrack.example.com  ·  10.0.0.5'
     : '10.0.0.5  ·  host:9200  ·  https://host:9200';
   document.getElementById('c_user').placeholder = tufin ? 'securetrack-api-user' : 'elastic';
+  document.getElementById('c_port').placeholder = '9200';
   document.getElementById('c_timeout').value = tufin ? '30' : '60';
   document.getElementById('c_hint').innerHTML = tufin
-    ? 'Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). '+
-      'Connects to the SecureTrack REST API at <code>https://host/securetrack/api</code>.'
-    : 'Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). '+
-      'Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.';
+    ? remember+'Connects to the SecureTrack REST API at <code>https://host/securetrack/api</code>.'
+    : remember+'Fetched results are saved to a local SQLite database. Bare hostnames default to <code>https://host:9200</code>.';
 }
 
 /* generic sortable/filterable table mounted into any container */

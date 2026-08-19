@@ -181,7 +181,7 @@ def show(ctx: click.Context, query_id: str) -> None:
         console.print("\n[bold]ES|QL[/bold]:")
         console.print(q.esql_query.strip())
     elif q.resource:
-        console.print(f"\n[bold]resource[/bold]: {q.resource}  [dim](fetched via the Tufin adapter)[/dim]")
+        console.print(f"\n[bold]resource[/bold]: {q.resource}  [dim](fetched via a resource adapter, e.g. Tufin or VMware)[/dim]")
     else:
         console.print("\n[dim](no query — placeholder)[/dim]")
 

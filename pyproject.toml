@@ -23,6 +23,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "httpx>=0.27"]
+# Optional: the VMware adapter only needs pyVmomi for vCenter Custom Attributes
+# (columns prefixed `custom.`). Standard inventory works without it.
+vmware = ["pyvmomi>=8.0"]
 
 [project.scripts]
 assetflow = "assetflow.cli:main"
