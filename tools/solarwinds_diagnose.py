@@ -158,13 +158,10 @@ def main():
 
     # 3) NCM presence + data
     print(_c("\n-- NCM (config posture: SW005/SW006) --", "cyan"))
-    ent, _ = swis.query("SELECT TOP 1 FullName FROM Metadata.Entity WHERE FullName='NCM.Nodes'")
-    ncm_present = bool(ent)
-    if not ncm_present:
-        ent, _ = swis.query("SELECT TOP 1 FullName FROM Metadata.Entity WHERE FullName='Cirrus.Nodes'")
-        ncm_present = bool(ent)
-    print(f"  {'%s  NCM entities registered' % OK if ncm_present else '%s  NCM entities NOT registered (module not installed/licensed)' % FAIL}")
-
+    # Whether NCM is installed is decided by whether its entities actually resolve
+    # (a COUNT that returns even 0 means the entity exists), NOT by a Metadata.Entity
+    # probe — that probe is unreadable for some scoped accounts and gives a false
+    # "not installed".
     ncm_nodes = count(swis, [
         "SELECT COUNT(NodeID) AS n FROM NCM.Nodes",
         "SELECT COUNT(NodeID) AS n FROM Cirrus.Nodes",
@@ -174,6 +171,9 @@ def main():
         "SELECT COUNT(ConfigID) AS n FROM NCM.ConfigArchive",
         "SELECT COUNT(ConfigID) AS n FROM Cirrus.ConfigArchive",
     ], "Archived configs (NCM.ConfigArchive)")
+
+    # NCM entity resolves (returned an int, even 0) => module is installed.
+    ncm_present = (ncm_nodes is not None) or (configs is not None)
 
     # sample archive row + config types (only meaningful if configs exist)
     if configs:
@@ -204,14 +204,22 @@ def main():
     # 5) verdict
     print(_c("\n== Verdict ==", "cyan"))
     if not ncm_present:
-        print(_c("NCM is not installed/licensed on this box. SW005–SW007 will always be "
-                 "empty. Inventory (SW001–SW004) is unaffected.", "yellow"))
+        print(_c("NCM entities do not resolve — the NCM module is not installed on this box. "
+                 "SW005–SW007 will always be empty. Inventory (SW001–SW004) is unaffected.", "yellow"))
+    elif configs == 0 and (ncm_nodes or 0) == 0:
+        print(_c("NCM IS installed (its entities resolve), but it reports 0 managed nodes and "
+                 "0 archived configs. So SW005/SW006 are empty for a real reason, not an adapter "
+                 "bug. Two possible causes:\n"
+                 "  1) NCM isn't managing any devices / not archiving — add nodes to NCM and run "
+                 "a 'Download Configs' job (My Dashboards > NCM > Configuration Management).\n"
+                 "  2) This account lacks NCM rights — SWIS hides NCM rows per-account. Re-run "
+                 "this script with an NCM-admin account, or compare against the NCM node count in "
+                 "the web console. If an admin account sees configs, grant this account NCM access.",
+                 "yellow"))
     elif configs == 0:
-        print(_c("NCM is present but has NO archived configs. SW005/SW006 are empty for a "
-                 "real reason, not a bug.\nFix on the SolarWinds side: assign nodes to NCM "
-                 "and run a 'Download Configs' job (My Dashboards > NCM > Config Management), "
-                 "then re-run this script.", "yellow"))
-    elif configs:
+        print(_c(f"NCM manages {ncm_nodes} nodes but has 0 archived configs. Schedule/run a "
+                 "'Download Configs' job in NCM, then re-run this script.", "yellow"))
+    else:
         print(_c(f"NCM has {configs} archived configs across {ncm_nodes} nodes — data EXISTS. "
                  "If SW005/SW006 still show nothing in the app, that's a mapping bug: send the "
                  "'newest config' line above (its columns) so the query can be matched to your "
