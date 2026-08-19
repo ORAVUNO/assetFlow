@@ -2,19 +2,20 @@
 
 Asset-intelligence tool that fetches assets from pluggable **adapters** (data
 sources), shows them in a local web UI, and persists every fetch to a local
-database. Elasticsearch is the first adapter and Tufin SecureTrack is the
-second; more sources plug in beside them, grouped by category, so results from
-many sources can later be merged.
+database. Elasticsearch is the first adapter, Tufin SecureTrack is the second,
+and VMware vCenter is the third; more sources plug in beside them, grouped by
+category, so results from many sources can later be merged.
 
-- **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, …) is a
-  template with its own metadata and query registry. You can create **multiple
-  connections** of the same kind — e.g. two Tufin servers or three Elasticsearch
-  clusters — each with a **label** of its own, its own live connection, and its
-  own saved data. The gallery lists connections by category; **＋ Add
-  connection** creates another instance, and each card can be renamed or removed.
-  Today's kinds: **Elasticsearch** (category *SIEM / Log Analytics*) and **Tufin
-  SecureTrack** (category *Network Security Policy* — see
-  [Tufin adapter](#tufin-securetrack-adapter)).
+- **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, VMware,
+  …) is a template with its own metadata and query registry. You can create
+  **multiple connections** of the same kind — e.g. two Tufin servers or three
+  Elasticsearch clusters — each with a **label** of its own, its own live
+  connection, and its own saved data. The gallery lists connections by category;
+  **＋ Add connection** creates another instance, and each card can be renamed or
+  removed. Today's kinds: **Elasticsearch** (category *SIEM / Log Analytics*),
+  **Tufin SecureTrack** (category *Network Security Policy* — see
+  [Tufin adapter](#tufin-securetrack-adapter)), and **VMware vCenter** (category
+  *Virtualization / Infrastructure* — see [VMware adapter](#vmware-vcenter-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity,
@@ -22,6 +23,9 @@ many sources can later be merged.
   `config/tufin_registry.yaml` — the Tufin adapter's 8 SecureTrack resources in
   7 feeds (Device Inventory, Change History, Policy Rules, Network Objects &
   Services, Segmentation, Policy Hygiene, Audit Events).
+  `config/vmware_registry.yaml` — the VMware adapter's 6 vCenter resources in 6
+  feeds (Virtual Servers, Physical Hosts, Compute Clusters, Storage,
+  Datacenters, Custom Attributes).
 - **Database:** fetched results are saved to a local SQLite file
   (`assetflow.db`, gitignored). The newest run per query is the panel's saved
   view; older runs form the history. Real telemetry never leaves your machine.
@@ -34,7 +38,8 @@ many sources can later be merged.
 correlation design, decisions & flow ·
 [`docs/elasticsearch_integration.md`](docs/elasticsearch_integration.md) ·
 [`docs/tufin_integration.md`](docs/tufin_integration.md) ·
-[`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md).
+[`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md) ·
+[`docs/vmware_integration.md`](docs/vmware_integration.md).
 
 ## Requirements
 
@@ -43,6 +48,10 @@ correlation design, decisions & flow ·
   for ES|QL) and credentials (an API key, or a username/password).
 - For the Tufin adapter: network access to your Tufin SecureTrack host and a
   SecureTrack API user (host + username + password).
+- For the VMware adapter: network access to your vCenter and a read-only vCenter
+  user (host + username + password). vCenter Custom Attributes (columns prefixed
+  `custom.`) additionally need pyVmomi (`pip install pyvmomi`, or from an offline
+  wheel); standard inventory works without it.
 
 ## Setup
 
@@ -363,6 +372,64 @@ form are held in the local server's memory only and never written to disk.
 > honest labeling the Elasticsearch registry uses); the schema is now accurate,
 > the live run is the remaining step. Point the adapter at a different release
 > and re-check the fields against that box's `/securetrack/apidoc/`.
+
+## VMware vCenter adapter
+
+The **VMware vCenter** adapter (category *Virtualization / Infrastructure*)
+fetches the full virtualization inventory from an on-prem vCenter and folds it
+into the same host-keyed views as the other adapters.
+
+### What it fetches
+
+Six resources (`VMW001`–`VMW006`), each tagging every row with an `asset.type`
+so the estate is legible at a glance — the *virtual servers* vs *physical
+servers* distinction is explicit:
+
+| Resource | `asset.type` | Highlights |
+|---|---|---|
+| **Virtual Machines** (`virtual_machines`) | `Virtual Machine` | power state, vCPU/memory, guest OS, guest hostname/IP (VMware Tools), + `custom.*` |
+| **ESXi Hosts** (`hosts`) | `Physical Host (ESXi)` | connection/power state, hardware vendor/model, CPU, memory, ESXi version/build, cluster, + `custom.*` |
+| **Compute Clusters** (`clusters`) | `Compute Cluster` | HA / DRS posture |
+| **Datastores** (`datastores`) | `Datastore` | type, capacity, free space (GiB) |
+| **Datacenters** (`datacenters`) | `Datacenter` | top-level containers |
+| **Custom Attribute Definitions** (`custom_attributes`) | — | the catalog of custom fields defined on the vCenter |
+
+### System fields vs. custom fields
+
+Standard vCenter inventory comes over the **vSphere Automation REST API**
+(`https://<host>/api`) with no third-party dependency. vCenter **Custom
+Attributes** are not returned by those REST calls, so they are read separately
+via **pyVmomi** (the SOAP SDK) and merged onto each VM / host row by managed
+object id (`vm-123`, `host-45`). Every custom field is emitted as its **own
+column prefixed `custom.`** — e.g. `custom.System Owner`, `custom.Department` —
+so a system-provided field is never confused with a site-defined one. The custom
+columns are discovered dynamically (the union of attributes present on the
+objects in scope) and appended after the standard columns.
+
+pyVmomi is **optional**: install it with `pip install pyvmomi` (or, on an offline
+server, `pip install --no-index --find-links=. pyvmomi`). Without it the standard
+inventory still fetches — the `custom.*` columns are simply absent, and the
+connection banner notes *"custom fields off (pyVmomi not installed)"*.
+
+### Connecting
+
+In the web UI, open the **VMware vCenter** card and click **Connection**: enter
+the **host** (or IP), **username** (e.g. `administrator@vsphere.local`),
+**password**, optional **port** (defaults to 443), and toggle **Verify TLS
+certificate** (keep it on for production certs; disable only for a
+lab/self-signed environment). Or set `VC_HOSTNAME` / `VC_USERNAME` /
+`VC_PASSWORD` in `.env` (see `.env.example`) to auto-connect on startup.
+Credentials entered in the form are held in the local server's memory only unless
+you tick **Remember**.
+
+> **Developer guide.** For a full walkthrough of how the VMware integration
+> works — architecture, module map, data flow, and the REST + pyVmomi split —
+> see [`docs/vmware_integration.md`](docs/vmware_integration.md).
+
+> **Validation status.** Endpoint paths follow the **vSphere 8 Automation REST
+> API** and the pyVmomi custom-fields pattern; resources stay marked
+> `partially_validated` until run against a live vCenter (the same honest
+> labeling the other registries use).
 
 ## CLI reference
 

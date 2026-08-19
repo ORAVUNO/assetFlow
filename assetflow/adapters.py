@@ -20,6 +20,8 @@ from . import db as db_mod
 from . import runner as runner_mod
 from . import tufin_client as tufin_client_mod
 from . import tufin_runner as tufin_runner_mod
+from . import vmware_client as vmware_client_mod
+from . import vmware_runner as vmware_runner_mod
 from .models import Query, Registry
 from .registry import load_registry
 from .runner import QueryResult
@@ -259,6 +261,86 @@ class TufinAdapter(Adapter):
         )
 
 
+class VMwareAdapter(Adapter):
+    """VMware vCenter source: fetches full inventory — virtual machines
+    (virtual servers), ESXi hosts (physical servers), clusters, datastores, and
+    datacenters — over the vCenter REST API, enriched with vCenter Custom
+    Attributes (prefixed ``custom.``) read via pyVmomi."""
+
+    def connect(
+        self,
+        *,
+        host: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        port: int = 443,
+        verify_certs: bool = True,
+        request_timeout: int = 60,
+    ) -> dict:
+        candidate = vmware_client_mod.build_client(
+            host=host or "",
+            username=username or "",
+            password=password or "",
+            port=port or 443,
+            verify_certs=verify_certs,
+            request_timeout=request_timeout,
+        )
+        info = vmware_client_mod.ping(candidate)  # raises on failure
+        self._client = candidate
+        self._conn_info = info
+        return info
+
+    def connect_form(self, form: dict) -> dict:
+        return self.connect(
+            host=(form.get("host") or form.get("url") or None),
+            username=(form.get("username") or None),
+            password=(form.get("password") or None),
+            port=int(form.get("port") or 443),
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 60)),
+        )
+
+    def try_auto_connect(self) -> bool:
+        try:
+            candidate = vmware_client_mod.build_client_from_env()
+            info = vmware_client_mod.ping(candidate)
+        except Exception:
+            return False
+        self._client = candidate
+        self._conn_info = info
+        return True
+
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "VC_HOSTNAME", "VC_USERNAME", "VC_PASSWORD",
+            "VCENTER_PORT", "VCENTER_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        host = (form.get("host") or form.get("url") or "").strip()
+        return {
+            "VC_HOSTNAME": vmware_client_mod.clean_host(host),
+            "VC_USERNAME": str(form.get("username") or ""),
+            "VC_PASSWORD": str(form.get("password") or ""),
+            "VCENTER_PORT": str(form.get("port") or 443),
+            "VCENTER_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
+        }
+
+    def ping(self) -> dict:
+        if self._client is None:
+            raise vmware_client_mod.VMwareConfigError("adapter is not connected")
+        info = vmware_client_mod.ping(self._client)
+        self._conn_info = info
+        return info
+
+    def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
+        if self._client is None:
+            raise vmware_client_mod.VMwareConfigError("adapter is not connected")
+        return vmware_runner_mod.run_query(
+            self._client, query, limit=limit, time_range=time_range
+        )
+
+
 @dataclass
 class AdapterKind:
     """A *type* of data source (Elasticsearch, Tufin, …) — the template from
@@ -402,6 +484,22 @@ def available_kinds(registry_path: Optional[str] = None) -> Dict[str, AdapterKin
             ),
             registry=load_registry(tufin_path),
             adapter_cls=TufinAdapter,
+        )
+
+    vmware_path = _find_registry("config/vmware_registry.yaml", "vmware_registry.yaml")
+    if vmware_path:
+        kinds["vmware"] = AdapterKind(
+            kind="vmware",
+            name="VMware vCenter",
+            category="Virtualization / Infrastructure",
+            description=(
+                "VMware vCenter — full inventory of virtual machines (virtual "
+                "servers), ESXi hosts (physical servers), clusters, datastores, "
+                "and datacenters via the vSphere REST API, enriched with vCenter "
+                "Custom Attributes (prefixed 'custom.') via pyVmomi."
+            ),
+            registry=load_registry(vmware_path),
+            adapter_cls=VMwareAdapter,
         )
     return kinds
 

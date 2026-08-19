@@ -1,0 +1,242 @@
+# =============================================================================
+# VMware vCenter Asset Intelligence Registry
+# =============================================================================
+# Resource registry for the VMware adapter. Where the Elasticsearch registry
+# carries ES|QL query bodies, each entry here names a `resource` that the VMware
+# runner maps to one or more vCenter endpoints and normalizes into the same
+# column/row shape (see assetflow/vmware_runner.py).
+#
+# Two interfaces are used (see assetflow/vmware_client.py):
+#   - vCenter REST API (vSphere Automation API) for standard inventory:
+#       GET /api/vcenter/vm                     <- virtual servers
+#       GET /api/vcenter/vm/{id}                <- VM detail (guest OS, hardware)
+#       GET /api/vcenter/vm/{id}/guest/identity <- guest hostname / IP (VM Tools)
+#       GET /api/vcenter/host                   <- physical ESXi hosts
+#       GET /api/vcenter/cluster
+#       GET /api/vcenter/datastore
+#       GET /api/vcenter/datacenter
+#   - vCenter SOAP SDK via pyVmomi for vCenter Custom Attributes (custom fields),
+#     which the REST inventory calls do not return. Custom fields are merged onto
+#     each VM / host row under columns prefixed `custom.` so system fields and
+#     site-defined custom fields are never confused. pyVmomi is OPTIONAL: without
+#     it the standard inventory still works and the `custom.` columns are absent.
+#
+# Status meanings match the other registries:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Endpoint path confirmed from VMware's API docs;
+#                              field mapping is best-effort and needs confirming
+#                              against a live vCenter release.
+#   - investigation_required : Endpoint exists but response shape / availability
+#                              varies by vCenter version or licensing.
+#   - not_validated          : Not yet exercised against live data.
+# =============================================================================
+
+metadata:
+  version: 1
+  description: >-
+    VMware vCenter inventory and asset-intelligence resources — virtual servers
+    (VMs), physical ESXi hosts, clusters, datastores, and datacenters — enriched
+    with vCenter Custom Attributes (prefixed `custom.`). Endpoint paths follow
+    the vSphere Automation REST API (vSphere 8); custom fields use pyVmomi.
+  query_language: vCenter REST + pyVmomi
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Virtual Servers
+    - Physical Hosts
+    - Compute Clusters
+    - Storage
+    - Datacenters
+    - Custom Attributes
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+feeds:
+  - id: FEED-VMW-VMS
+    name: Virtual Servers
+    category: Virtual Servers
+    description: Every virtual machine with power state, CPU/memory, guest OS, hostname/IP, and custom fields.
+    query_ids: [VMW001]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-VMW-HOSTS
+    name: Physical Hosts
+    category: Physical Hosts
+    description: ESXi hypervisor hosts with vendor, model, CPU, memory, ESXi build, cluster, and custom fields.
+    query_ids: [VMW002]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-VMW-CLUSTERS
+    name: Compute Clusters
+    category: Compute Clusters
+    description: vSphere clusters with HA / DRS posture.
+    query_ids: [VMW003]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-VMW-STORAGE
+    name: Storage
+    category: Storage
+    description: Datastores with type, capacity, and free space.
+    query_ids: [VMW004]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-VMW-DATACENTERS
+    name: Datacenters
+    category: Datacenters
+    description: vCenter datacenter objects.
+    query_ids: [VMW005]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-VMW-CUSTOM
+    name: Custom Attributes
+    category: Custom Attributes
+    description: The vCenter Custom Attribute definitions available on this vCenter (what custom fields exist).
+    query_ids: [VMW006]
+    recommended_refresh_frequency: Weekly
+
+# =============================================================================
+# QUERIES (resources)
+# =============================================================================
+queries:
+  - id: VMW001
+    category: Virtual Servers
+    name: Virtual Machines (Virtual Servers)
+    status: partially_validated
+    validated: false
+    resource: virtual_machines
+    purpose: >-
+      Inventory every virtual machine vCenter manages, tagged asset.type
+      "Virtual Machine", with power state, vCPU/memory, guest OS, guest
+      hostname/IP (from VMware Tools), and every vCenter Custom Attribute merged
+      in under custom.* columns.
+    expected_output_fields:
+      - host.name        # VM name (folds into the unified host view)
+      - vm.id            # managed object id, e.g. vm-123 (joins custom fields)
+      - asset.type       # "Virtual Machine"
+      - power_state      # POWERED_ON / POWERED_OFF / SUSPENDED
+      - cpu.count        # vCPU count
+      - memory.mib       # configured memory (MiB)
+      - guest.os         # guest OS id / full name
+      - guest.hostname   # guest hostname (VMware Tools)
+      - host.ip          # guest primary IP (VMware Tools)
+      - guest.family     # WINDOWS / LINUX / ...
+      - "custom.*"       # each vCenter Custom Attribute (pyVmomi), prefixed custom.
+    notes: >-
+      GET /api/vcenter/vm lists all VMs with summary fields (vm, name,
+      power_state, cpu_count, memory_size_MiB) in one call. The first N VMs
+      (vm_detail_scan) are further enriched with GET /api/vcenter/vm/{id}
+      (guest_OS) and GET /api/vcenter/vm/{id}/guest/identity (host_name,
+      ip_address, family) — the latter is populated only when VMware Tools is
+      running. Custom Attributes come from pyVmomi (customFieldsManager +
+      per-object customValue) joined by moid; every custom field is emitted as
+      its own column prefixed `custom.` so it is never confused with a system
+      field. When pyVmomi is not installed the custom.* columns are absent.
+    recommended_refresh_frequency: Daily
+
+  - id: VMW002
+    category: Physical Hosts
+    name: ESXi Hosts (Physical Servers)
+    status: partially_validated
+    validated: false
+    resource: hosts
+    purpose: >-
+      Inventory the physical ESXi hypervisor hosts, tagged asset.type "Physical
+      Host (ESXi)", with connection/power state, hardware vendor/model, CPU,
+      memory, ESXi version/build, parent cluster, and custom fields.
+    expected_output_fields:
+      - host.name          # ESXi host name
+      - host.id            # managed object id, e.g. host-45
+      - asset.type         # "Physical Host (ESXi)"
+      - connection_state   # CONNECTED / DISCONNECTED / NOT_RESPONDING
+      - power_state        # POWERED_ON / POWERED_OFF / STANDBY
+      - hardware.vendor    # server vendor (pyVmomi HostSystem.summary.hardware)
+      - hardware.model     # server model
+      - cpu.model          # physical CPU model
+      - cpu.cores          # physical CPU cores
+      - memory.gib         # physical RAM (GiB)
+      - esxi.version       # ESXi version
+      - esxi.build         # ESXi build
+      - cluster            # parent compute cluster
+      - "custom.*"         # each vCenter Custom Attribute (pyVmomi), prefixed custom.
+    notes: >-
+      GET /api/vcenter/host lists hosts with host, name, connection_state,
+      power_state. The vSphere Automation REST API is thin on physical hardware,
+      so vendor/model/CPU/memory/ESXi build/cluster come from pyVmomi's
+      HostSystem.summary (hardware + config.product + parent) when pyVmomi is
+      available; without it those columns are blank but the host is still listed.
+      Custom Attributes are merged by moid under custom.* as for VMs.
+    recommended_refresh_frequency: Daily
+
+  - id: VMW003
+    category: Compute Clusters
+    name: Compute Clusters
+    status: partially_validated
+    validated: false
+    resource: clusters
+    purpose: Inventory vSphere compute clusters with their HA and DRS posture.
+    expected_output_fields:
+      - host.name       # cluster name
+      - cluster.id      # managed object id, e.g. domain-c7
+      - asset.type      # "Compute Cluster"
+      - ha_enabled      # vSphere HA enabled
+      - drs_enabled     # DRS enabled
+    notes: >-
+      GET /api/vcenter/cluster. Provides the HA/DRS posture used to reason about
+      availability domains for the VMs and hosts above.
+    recommended_refresh_frequency: Daily
+
+  - id: VMW004
+    category: Storage
+    name: Datastores
+    status: partially_validated
+    validated: false
+    resource: datastores
+    purpose: Inventory datastores with type, capacity, and free space.
+    expected_output_fields:
+      - host.name       # datastore name
+      - datastore.id    # managed object id, e.g. datastore-1
+      - asset.type      # "Datastore"
+      - datastore.type  # VMFS / NFS / vSAN / ...
+      - capacity.gib    # total capacity (GiB)
+      - free.gib        # free space (GiB)
+    notes: >-
+      GET /api/vcenter/datastore. capacity/free_space are returned in bytes and
+      normalized to GiB. Capacity trends feed storage-utilization reporting.
+    recommended_refresh_frequency: Daily
+
+  - id: VMW005
+    category: Datacenters
+    name: Datacenters
+    status: partially_validated
+    validated: false
+    resource: datacenters
+    purpose: Inventory the vCenter datacenter objects.
+    expected_output_fields:
+      - host.name         # datacenter name
+      - datacenter.id     # managed object id, e.g. datacenter-2
+      - asset.type        # "Datacenter"
+    notes: GET /api/vcenter/datacenter. The top-level organizing container for hosts, clusters, and VMs.
+    recommended_refresh_frequency: Weekly
+
+  - id: VMW006
+    category: Custom Attributes
+    name: Custom Attribute Definitions
+    status: partially_validated
+    validated: false
+    resource: custom_attributes
+    purpose: >-
+      List the vCenter Custom Attribute definitions defined on this vCenter — the
+      catalog of custom fields that get merged onto VM / host rows as custom.*.
+    expected_output_fields:
+      - custom_field.key   # numeric field key
+      - custom_field.name  # attribute name (appears as custom.<name> on objects)
+      - applies_to         # VirtualMachine / HostSystem / Global
+    notes: >-
+      Read via pyVmomi (content.customFieldsManager.field). Requires pyVmomi to
+      be installed; returns no rows when it is not. Use this to see which custom
+      fields exist before relying on specific custom.* columns in VMW001/VMW002.
+    recommended_refresh_frequency: Weekly

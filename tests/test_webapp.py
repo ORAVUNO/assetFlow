@@ -224,7 +224,7 @@ def test_multiple_connections_lifecycle(client):
     assert new_id not in ids
 
     # unknown kind rejected
-    assert client.post("/api/connections", json={"kind": "vmware", "label": "x"}).status_code == 404
+    assert client.post("/api/connections", json={"kind": "nonexistent-kind", "label": "x"}).status_code == 404
 
 
 def test_inventory_spans_multiple_instances(client):

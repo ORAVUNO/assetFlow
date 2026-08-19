@@ -89,4 +89,13 @@ def test_rename_and_remove_instance(manager):
 
 def test_add_instance_unknown_kind(manager):
     with pytest.raises(KeyError):
-        manager.add_instance("vmware", "vCenter")
+        manager.add_instance("nonexistent-kind", "Nope")
+
+
+def test_default_manager_has_vmware(manager):
+    ids = [a.info.id for a in manager.list()]
+    assert "vmware" in ids
+    v = manager.get("vmware")
+    assert v.info.category == "Virtualization / Infrastructure"
+    assert v.info.kind == "vmware"
+    assert len(v.registry.queries) == 6
