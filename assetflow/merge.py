@@ -637,6 +637,7 @@ def build_asset_detail(
     primary_cols = set(spec.primary)
     host = str(host)
     needle = host.rstrip(".").lower()
+    kind_by_id = {info.get("id"): info.get("kind", "") for info, _ in blocks}
     res = correlate(blocks, asset_type)
     asset = None
     for a in res["assets"]:
@@ -672,7 +673,10 @@ def build_asset_detail(
         "host": asset["primary_name"],
         "type": asset_type,
         "found": True,
-        "adapters": [{"id": aid, "name": aname} for aid, aname in asset["adapters"]],
+        "adapters": [
+            {"id": aid, "name": aname, "kind": kind_by_id.get(aid, "")}
+            for aid, aname in asset["adapters"]
+        ],
         "names": asset["names"],
         "aliases": asset["aliases"],
         "identities": asset["identities"],
