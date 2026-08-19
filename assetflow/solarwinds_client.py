@@ -206,11 +206,26 @@ class SolarWindsClient:
                 errors.append(f":{port} {getattr(exc, 'reason', exc)}")
                 continue
             except Exception as exc:  # pragma: no cover - network dependent
-                status = getattr(getattr(exc, "response", None), "status_code", None)
+                # The ``requests`` path raises HTTPError subclasses carrying a
+                # ``response``; mirror the urllib branch above off its status.
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
                 if status in (401, 403):
                     raise SolarWindsConfigError(
                         f"authentication/permission failed (HTTP {status}) — "
                         "check the SolarWinds username, password, and access"
+                    )
+                if status == 400:
+                    # A malformed/unsupported SWQL — the port is a live SWIS
+                    # endpoint, so surface the query error rather than probing on.
+                    detail = ""
+                    try:
+                        detail = (getattr(response, "text", "") or "")[:500]
+                    except Exception:
+                        pass
+                    self._active_port = port
+                    raise RuntimeError(
+                        f"HTTP 400 from SWIS: {detail or 'invalid SWQL query'}"
                     )
                 errors.append(f":{port} {exc}")
                 continue
@@ -275,15 +290,17 @@ def build_client_from_env() -> SolarWindsClient:
 def ping(client: SolarWindsClient) -> dict:
     """Verify connectivity and return a short connection summary.
 
-    Runs a trivial SWQL statement (which also selects the SWIS version), so a
-    401/403 surfaces as an authentication error and an unreachable host as a
-    connectivity error. Also reports whether the NCM module appears licensed, so
-    the UI can hint when config-posture resources will be empty.
+    Runs a trivial, universally-valid SWQL statement against the SWIS metadata,
+    so a 401/403 surfaces as an authentication error and an unreachable host as a
+    connectivity error. Reports the Orion version (best effort) and whether the
+    NCM module appears present, so the UI can hint when config-posture resources
+    will be empty.
     """
     try:
-        rows = client.query_rows(
-            "SELECT TOP 1 Version FROM Metadata.Entity WHERE EntityName = 'Orion.Nodes'"
-        )
+        # Metadata.Entity is present on every SWIS instance; FullName is the
+        # entity's name (e.g. "Orion.Nodes"). This is the minimal valid probe —
+        # it needs no module and no special read grant.
+        client.query_rows("SELECT TOP 1 FullName FROM Metadata.Entity")
     except SolarWindsConfigError:
         raise
     except Exception as exc:  # pragma: no cover - network dependent
@@ -291,10 +308,7 @@ def ping(client: SolarWindsClient) -> dict:
             f"could not query SWIS at {client.host} — {exc}"
         )
 
-    version = ""
-    if rows:
-        version = str(rows[0].get("Version", "") or "")
-
+    version = _orion_version(client)
     ncm = _ncm_available(client)
     summary = f"SolarWinds SWIS @ {client.host}:{client._active_port or client.port}"
     if not ncm:
@@ -309,19 +323,29 @@ def ping(client: SolarWindsClient) -> dict:
     }
 
 
+def _orion_version(client: SolarWindsClient) -> str:
+    """Best-effort Orion Platform version (Orion.Info.Version); '' if unavailable."""
+    try:
+        rows = client.query_rows("SELECT TOP 1 Version FROM Orion.Info")
+    except Exception:  # pragma: no cover - permission/module dependent
+        return ""
+    return str(rows[0].get("Version", "") or "") if rows else ""
+
+
 def _ncm_available(client: SolarWindsClient) -> bool:
-    """Best-effort check that the NCM (config) entities are present/licensed."""
+    """Best-effort check that the NCM (config) entities are present/licensed.
+
+    Queries the SWIS metadata by ``FullName`` (the entity's name) — a row means
+    the NCM node entity is registered in this SWIS instance.
+    """
     for entity in ("NCM.Nodes", "Cirrus.Nodes"):
         try:
             rows = client.query_rows(
-                f"SELECT TOP 1 EntityName FROM Metadata.Entity "
-                f"WHERE EntityName = '{entity}'"
+                f"SELECT TOP 1 FullName FROM Metadata.Entity "
+                f"WHERE FullName = '{entity}'"
             )
         except Exception:  # pragma: no cover - network dependent
             continue
-        # A row means the NCM entity is registered in this SWIS instance. A
-        # stricter probe (selecting from the entity itself) is avoided to keep
-        # ping cheap and tolerant of read permissions.
         if rows:
             return True
     return False
