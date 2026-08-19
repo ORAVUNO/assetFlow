@@ -24,7 +24,14 @@ Tufin adapter's endpoint paths and field mappings (`config/tufin_registry.yaml`,
 ### DetailedDeviceDTO (`/devices`)
 `name`, `id`, `vendor`, `model`, `ip`, `OS_Version`, `domain_name`/`domain_id`,
 `status`, `offline`, `latest_revision`, `installed_policy`, `topology`,
-`parent_id`, `module_type`, `licenses.license[]` (`type`, `status`, `expiration`).
+`virtual_type`, `parent_id`, `module_type`, `licenses.license[]` (`type`,
+`status`, `expiration`).
+
+There is **no explicit device-type field**. TUF001 derives `asset.type` from
+`model` + `virtual_type` + the management hierarchy: a device that is the parent
+of others (or whose model names a manager — Panorama/FMC/FortiManager/CMA/MDS) is
+*Firewall Management*; a `virtual_type` means *Virtual Firewall*; router/switch
+and load-balancer models are labelled as such; else *Firewall*.
 
 ### RevisionDTO (`/devices/{id}/revisions`) — the "who / what / when"
 - `id` — globally unique revision id (used by `/revisions/{id}`)

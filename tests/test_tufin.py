@@ -87,6 +87,23 @@ def test_devices_resource_is_host_keyed():
     assert "10.0.0.5" in result.rows[0]
 
 
+def test_devices_derive_asset_type():
+    mapping = {
+        "devices.json?show_os_version=true": {"devices": [
+            {"id": "1", "name": "HQ-FW", "vendor": "Cisco", "model": "asa", "parent_id": "9"},
+            {"id": "9", "name": "FMC-Mgmt", "vendor": "Cisco", "model": "fmc"},
+            {"id": "3", "name": "PA-vsys1", "vendor": "PaloAlto", "model": "PANOSDevice", "virtual_type": "vsys"},
+            {"id": "4", "name": "Core-RTR", "vendor": "Cisco", "model": "router_ios"},
+        ]}
+    }
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("devices"))
+    by_name = {r[0]: dict(zip(result.column_names, r)) for r in result.rows}
+    assert by_name["HQ-FW"]["asset.type"] == "Firewall"
+    assert by_name["FMC-Mgmt"]["asset.type"] == "Firewall Management"   # model hint + is a parent
+    assert by_name["PA-vsys1"]["asset.type"] == "Virtual Firewall (vsys)"
+    assert by_name["Core-RTR"]["asset.type"] == "Router/Switch"
+
+
 def test_revisions_expose_who_what_when():
     # Shape mirrors SecureTrack R25-2 RevisionDTO: id/revisionId, split
     # date+time, admin, guiClient, nested comment, and a tickets wrapper.
