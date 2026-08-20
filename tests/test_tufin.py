@@ -752,3 +752,60 @@ def test_resolve_device_scan_env(monkeypatch):
     assert tufin_runner_mod.resolve_device_scan() is None  # 0 = all
     monkeypatch.setenv("TUFIN_DEVICE_SCAN", "nonsense")
     assert tufin_runner_mod.resolve_device_scan() is None
+
+
+# --------------------------------------------------------------------------- #
+# Pagination: SecureTrack caps list responses (~200) and reports `total`
+# --------------------------------------------------------------------------- #
+
+class PagingClient:
+    """Serves list endpoints in server-capped pages, advertising the full total
+    — mirroring how SecureTrack returns at most ~200 rows per call."""
+
+    def __init__(self, lists, cap=200):
+        # lists: {base_path: (envelope_key, [items])}
+        self.lists = lists
+        self.cap = cap
+        self.host = "tufin.test"
+        self.calls = 0
+
+    def get(self, path):
+        self.calls += 1
+        base, _, query = path.partition("?")
+        params = {}
+        for kv in query.split("&"):
+            if kv.startswith(("start=", "count=")):
+                k, v = kv.split("=")
+                params[k] = int(v)
+        for key, (env_key, items) in self.lists.items():
+            if key.partition("?")[0] == base:
+                start = params.get("start", 0)
+                count = min(params.get("count", self.cap), self.cap)
+                return {"total": len(items), env_key: items[start:start + count]}
+        raise RuntimeError(f"404 {path}")
+
+
+def test_fetch_list_walks_every_page_for_rules():
+    devs = [{"id": "1", "name": "FW-1", "model": "asa"}]
+    rules = [{"uid": f"r{i}", "action": "accept"} for i in range(450)]  # > one 200-page
+    client = PagingClient(
+        {"devices.json": ("devices", devs), "devices/1/rules.json": ("rules", rules)},
+        cap=200,
+    )
+    result = tufin_runner_mod.run_query(client, _q("rules"))
+    assert len(result.rows) == 450  # all three pages (200 + 200 + 50), not just 200
+
+
+def test_fetch_list_paginates_the_device_list():
+    devs = [{"id": str(i), "name": f"FW-{i:03d}", "model": "asa"} for i in range(300)]
+    client = PagingClient({"devices.json": ("devices", devs)}, cap=200)
+    result = tufin_runner_mod.run_query(client, _q("devices"))
+    assert len(result.rows) == 300  # 40 > 25 and 300 > 200 — the whole estate
+
+
+def test_fetch_list_single_page_when_no_total_advertised():
+    # A payload without `total` is treated as non-paginated (one page).
+    mapping = dict(DEVICES)
+    mapping["devices/1/rules.json"] = {"rules": [{"uid": "r1", "action": "accept"}]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("rules"))
+    assert len(result.rows) == 1
