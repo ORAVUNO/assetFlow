@@ -278,6 +278,11 @@ class TufinAdapter(Adapter):
             self._require_client(), device_id, old_rev=old_rev, new_rev=new_rev
         )
 
+    def revision_rulebase(self, device_id: str, revision_id=None) -> dict:
+        return tufin_runner_mod.revision_rulebase(
+            self._require_client(), device_id, revision_id=revision_id
+        )
+
 
 class VMwareAdapter(Adapter):
     """VMware vCenter source: fetches full inventory — virtual machines

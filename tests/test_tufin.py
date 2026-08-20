@@ -628,3 +628,24 @@ def test_list_devices_and_revisions_for_picker():
     # Newest-first for the picker.
     assert [r["id"] for r in revs] == ["101", "100"]
     assert revs[0]["admin"] == "jane"
+
+
+def test_revision_rulebase_views_specific_revision():
+    client = FakeClient(_compare_mapping())
+    # Explicit older revision -> its rulebase (4 rules, r10 with tcp/8443).
+    d = tufin_runner_mod.revision_rulebase(client, "1", revision_id="100")
+    assert d["revision"]["id"] == "100"
+    cols = [c["name"] for c in d["columns"]]
+    assert cols[:4] == ["host.name", "rule.uid", "name", "src_zone"]
+    by_uid = {r[1]: r for r in d["rows"]}
+    assert set(by_uid) == {"r10", "r20", "r40", "r50"}
+    svc_idx = cols.index("service")
+    assert by_uid["r10"][svc_idx] == "tcp/8443"
+    assert by_uid["r10"][0] == "HQ-Perimeter-FW"
+
+
+def test_revision_rulebase_defaults_to_latest():
+    d = tufin_runner_mod.revision_rulebase(FakeClient(_compare_mapping()), "1")
+    assert d["revision"]["id"] == "101"  # newest
+    by_uid = {r[1]: r for r in d["rows"]}
+    assert "r30" in by_uid and "r20" not in by_uid  # latest state
