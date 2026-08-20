@@ -103,3 +103,26 @@ def test_service_skips_drift_for_event_feed(tmp_path):
     rec = service.save_result(a, q, QueryResult(columns=cols, rows=[["h1", "t2"]]))
     assert rec.get("drift") is None  # event feed -> not diffed
     assert db.snapshot_change_log("elasticsearch")["rows"] == []
+
+
+def test_change_dashboard_aggregates(tmp_path):
+    from assetflow import db
+    from assetflow.runner import QueryResult
+    db.init_engine(f"sqlite:///{tmp_path}/dash.db")
+    cols = [{"name": n} for n in [
+        "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
+        "rule.uid", "before", "after", "authorized", "requester",
+    ]]
+    rows = [
+        ["FW-A", "101", "t", "jane", "modified", "r1", "a", "b", "unauthorized", "Alice"],
+        ["FW-A", "101", "t", "jane", "added", "r2", "", "c", "authorized", "Bob"],
+        ["FW-B", "55", "t", "bob", "removed", "r3", "d", "", "", ""],
+    ]
+    db.record_changes("tufin", QueryResult(columns=cols, rows=rows))
+    d = db.change_dashboard("tufin")
+    assert d["total_changes"] == 3
+    assert d["by_type"] == {"added": 1, "modified": 1, "removed": 1}
+    assert d["by_authorization"]["unauthorized"] == 1
+    assert d["top_devices"][0] == {"key": "FW-A", "count": 2}
+    assert d["top_admins"][0]["key"] == "jane"
+    assert len(d["recent"]["rows"]) == 3
