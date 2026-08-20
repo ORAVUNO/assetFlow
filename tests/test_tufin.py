@@ -692,3 +692,63 @@ def test_policy_from_saved_views_specific_and_latest():
     latest = tufin_runner_mod.policy_from_saved(cols, rows, "1")
     assert latest["revision"]["id"] == "101"
     assert "r30" in {r[0] for r in latest["rows"]} and "r20" not in {r[0] for r in latest["rows"]}
+
+
+# --------------------------------------------------------------------------- #
+# Whole-estate coverage: scan, parallelism, device-list caching
+# --------------------------------------------------------------------------- #
+
+_LIST_PATHS = {"devices.json?show_os_version=true", "devices.json", "devices"}
+
+
+class CountingClient(FakeClient):
+    """FakeClient that counts how often the device *list* endpoint is hit."""
+
+    def __init__(self, mapping):
+        super().__init__(mapping)
+        self.device_hits = 0
+
+    def get(self, path):
+        if path in _LIST_PATHS:
+            self.device_hits += 1
+        return super().get(path)
+
+
+def _estate_mapping(n):
+    devs = [{"id": str(i), "name": f"FW-{i:02d}", "model": "asa"} for i in range(n)]
+    mapping = {"devices.json?show_os_version=true": {"devices": devs}}
+    for i in range(n):
+        mapping[f"devices/{i}/rules.json"] = {"rules": [{"uid": f"r{i}", "action": "accept"}]}
+    return mapping
+
+
+def test_scan_covers_whole_estate_by_default():
+    # 30 devices > the old cap of 25 — every one must be scanned now.
+    result = tufin_runner_mod.run_query(FakeClient(_estate_mapping(30)), _q("rules"))
+    names = {r[0] for r in result.rows}
+    assert len(names) == 30
+
+
+def test_explicit_device_scan_still_caps():
+    result = tufin_runner_mod.run_query(
+        FakeClient(_estate_mapping(30)), _q("rules"), device_scan_limit=5
+    )
+    assert len({r[0] for r in result.rows}) == 5
+
+
+def test_device_list_is_cached_across_collectors():
+    c = CountingClient(_estate_mapping(6))
+    tufin_runner_mod.run_query(c, _q("rules"))
+    tufin_runner_mod.run_query(c, _q("services"))  # services.json absent -> skipped, list reused
+    assert c.device_hits == 1  # fetched once, then served from cache
+
+
+def test_resolve_device_scan_env(monkeypatch):
+    monkeypatch.delenv("TUFIN_DEVICE_SCAN", raising=False)
+    assert tufin_runner_mod.resolve_device_scan() is None  # default = whole estate
+    monkeypatch.setenv("TUFIN_DEVICE_SCAN", "50")
+    assert tufin_runner_mod.resolve_device_scan() == 50
+    monkeypatch.setenv("TUFIN_DEVICE_SCAN", "0")
+    assert tufin_runner_mod.resolve_device_scan() is None  # 0 = all
+    monkeypatch.setenv("TUFIN_DEVICE_SCAN", "nonsense")
+    assert tufin_runner_mod.resolve_device_scan() is None

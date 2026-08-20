@@ -259,7 +259,9 @@ class TufinAdapter(Adapter):
         # watermark stored in the database (scoped to this adapter).
         store = db_mod.watermark_store(self.info.id)
         return tufin_runner_mod.run_query(
-            self._client, query, limit=limit, time_range=time_range, watermark_store=store
+            self._client, query, limit=limit, time_range=time_range,
+            device_scan_limit=tufin_runner_mod.resolve_device_scan(),  # None = whole estate
+            watermark_store=store,
         )
 
 
