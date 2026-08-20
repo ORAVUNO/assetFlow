@@ -347,6 +347,24 @@ def create_app(
         _get_adapter(adapter_id)
         return db.change_log(adapter_id)
 
+    @app.get("/api/adapters/{adapter_id}/change-dashboard")
+    def api_change_dashboard(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        dash = db.change_dashboard(adapter_id)
+        # Inventory context from the latest saved fetches (best-effort per id).
+        def _count(*qids):
+            for qid in qids:
+                rec = db.latest_fetch(adapter_id, qid, include_data=False)
+                if rec is not None:
+                    return {"value": rec["row_count"], "query_id": qid, "ran_at": rec["ran_at"]}
+            return None
+        dash["inventory"] = {
+            "devices": _count("TUF001"),
+            "rules": _count("TUF003"),
+            "cleanup": _count("TUF007"),
+        }
+        return dash
+
     @app.get("/api/adapters/{adapter_id}/drift")
     def api_drift(adapter_id: str) -> dict:
         _get_adapter(adapter_id)
@@ -1296,6 +1314,47 @@ async function openChangeLog(){
   else t.innerHTML='<p class="hint">No changes recorded yet. Run a Change Detail query (Tufin TUF008, SolarWinds SW006) — its rows accumulate here.</p>';
 }
 
+async function openChangeDashboard(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovChangeDash'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading changes dashboard…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/change-dashboard'); }
+  catch(e){ m.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  const t=d.by_type||{}, au=d.by_authorization||{}, inv=d.inventory||{};
+  const tile=(label,val,sub)=>'<div style="flex:1;min-width:130px;border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--panel)">'+
+    '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">'+esc(label)+'</div>'+
+    '<div style="font-size:26px;font-weight:700;margin-top:4px">'+esc(val==null?'—':val)+'</div>'+
+    (sub?'<div style="font-size:11px;color:var(--muted)">'+esc(sub)+'</div>':'')+'</div>';
+  let h='<h2>Changes Dashboard — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Aggregated from the deduplicated Change Log. Run Change Detail (TUF008) to populate; TUF001/TUF003/TUF007 add inventory context.</div>'+
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">'+
+      tile('Total changes', d.total_changes)+ tile('Added', t.added||0)+
+      tile('Modified', t.modified||0)+ tile('Removed', t.removed||0)+
+      tile('Unauthorized', au.unauthorized||0)+
+    '</div>'+
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px">'+
+      tile('Devices', inv.devices?inv.devices.value:null,'TUF001')+
+      tile('Rules', inv.rules?inv.rules.value:null,'TUF003')+
+      tile('Cleanup (shadowed)', inv.cleanup?inv.cleanup.value:null,'TUF007')+
+    '</div>'+
+    '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:8px">'+
+      '<div style="flex:1;min-width:280px"><div class="sheethdr">Devices with most changes</div><div id="cdDevices"></div></div>'+
+      '<div style="flex:1;min-width:280px"><div class="sheethdr">Top administrators</div><div id="cdAdmins"></div></div>'+
+    '</div>'+
+    '<div class="sheethdr">Recent changes</div><div id="cdRecent"></div>';
+  m.innerHTML=h;
+  const dev=(d.top_devices||[]).map(r=>[r.key||'(unknown)', r.count]);
+  const adm=(d.top_admins||[]).map(r=>[r.key||'(unknown)', r.count]);
+  if(dev.length) mountTable(document.getElementById('cdDevices'), ['device','changes'], dev, {filter:false});
+  else document.getElementById('cdDevices').innerHTML='<p class="hint">—</p>';
+  if(adm.length) mountTable(document.getElementById('cdAdmins'), ['administrator','changes'], adm, {filter:false});
+  else document.getElementById('cdAdmins').innerHTML='<p class="hint">—</p>';
+  const rec=d.recent||{columns:[],rows:[]};
+  if(rec.rows.length) mountTable(document.getElementById('cdRecent'), rec.columns.map(c=>c.name), rec.rows, {pin:srcPin()});
+  else document.getElementById('cdRecent').innerHTML='<p class="hint">No changes recorded yet. Run TUF008 (Change Detail).</p>';
+}
+
 async function openDrift(){
   CURRENT=null;
   document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
@@ -1340,6 +1399,9 @@ function renderSidebar(){
     const cl=document.createElement('div'); cl.className='q ov'; cl.id='ovChangeLog';
     cl.innerHTML='<span class="qid">⟳ Change Log</span>';
     cl.onclick=openChangeLog; side.appendChild(cl);
+    const cd=document.createElement('div'); cd.className='q ov'; cd.id='ovChangeDash';
+    cd.innerHTML='<span class="qid">📊 Changes Dashboard</span>';
+    cd.onclick=openChangeDashboard; side.appendChild(cd);
   }
   const dl=document.createElement('div'); dl.className='q ov'; dl.id='ovDrift';
   dl.innerHTML='<span class="qid">⇄ Drift Log</span>';

@@ -642,6 +642,53 @@ def change_log(adapter: str, limit: int = 1000) -> dict:
     }
 
 
+def change_dashboard(adapter: str, recent: int = 25, top: int = 10) -> dict:
+    """Aggregate the change log for an adapter into dashboard figures.
+
+    Returns totals, counts by change type / authorization / device / admin, and
+    the most recent changes — all from the deduplicated ``tufin_changes`` sink.
+    """
+    with _session() as s:
+        base = select(TufinChange).where(TufinChange.adapter == adapter)
+        total = s.scalar(select(func.count()).select_from(base.subquery())) or 0
+
+        def grouped(col, limit=None):
+            stmt = (
+                select(col, func.count().label("n"))
+                .where(TufinChange.adapter == adapter)
+                .group_by(col)
+                .order_by(desc("n"))
+            )
+            if limit:
+                stmt = stmt.limit(limit)
+            return [{"key": (k or ""), "count": n} for k, n in s.execute(stmt).all()]
+
+        by_type = {row["key"]: row["count"] for row in grouped(TufinChange.change_type)}
+        by_auth = {row["key"]: row["count"] for row in grouped(TufinChange.authorized)}
+        by_device = grouped(TufinChange.device_name, top)
+        by_admin = grouped(TufinChange.changed_by, top)
+
+        recent_stmt = (
+            select(TufinChange)
+            .where(TufinChange.adapter == adapter)
+            .order_by(desc(TufinChange.id))
+            .limit(recent)
+        )
+        recent_rows = [c.to_record() for c in s.scalars(recent_stmt)]
+
+    return {
+        "total_changes": total,
+        "by_type": by_type,
+        "by_authorization": by_auth,
+        "top_devices": by_device,
+        "top_admins": by_admin,
+        "recent": {
+            "columns": [{"name": c} for c in _CHANGE_COLUMNS],
+            "rows": [[rec[c] for c in _CHANGE_COLUMNS] for rec in recent_rows],
+        },
+    }
+
+
 def get_change_watermark(adapter: str, device_id: str) -> Optional[str]:
     """Return the last processed revision id for a device, or None."""
     with _session() as s:
