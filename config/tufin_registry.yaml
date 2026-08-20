@@ -165,8 +165,9 @@ queries:
       - authorization_status   # RevisionDTO.authorizationStatus
       - comment                # RevisionDTO.comment.comment
     notes: >-
-      GET /securetrack/api/devices/{id}/revisions.json for each device (scan
-      capped to bound REST calls; rows capped by limit). Field mapping confirmed
+      GET /securetrack/api/devices/{id}/revisions.json for each device (whole
+      estate by default, fetched in bounded parallel; rows capped by limit).
+      Field mapping confirmed
       against RevisionDTO (R25-2): id + revisionId, split date/time, admin,
       guiClient, action, nested comment, and a tickets wrapper (ticket[].id).
       The DTO also carries auditLog and manualAuthorization (status/user/dateTime
@@ -326,8 +327,10 @@ queries:
       come from GET /change_authorization?old_version=&new_version=,
       which requires "Authorize Revisions with Tickets" enabled in SecureTrack;
       when it is off those columns are blank. Heavier than the other resources
-      (several REST calls per device), so the device scan is capped. This is the
-      change-intelligence headline — pair it with TUF002 (raw revision history).
+      (several REST calls per device); it covers the whole estate by default,
+      fetched in bounded parallel. Set TUFIN_DEVICE_SCAN to cap the device count
+      and TUFIN_CONCURRENCY to tune parallelism. This is the change-intelligence
+      headline — pair it with TUF002 (raw revision history).
     recommended_refresh_frequency: Every 5-15 minutes
 
   - id: TUF009
@@ -359,7 +362,8 @@ queries:
       - disabled
       - comment
     notes: >-
-      For each device (scan capped), the recent revisions are selected — the
+      For each device (whole estate by default, fetched in bounded parallel;
+      set TUFIN_DEVICE_SCAN / TUFIN_CONCURRENCY to tune), the recent revisions are selected — the
       latest 5 by default, or every revision within the time-range window
       (24h/7d/30d/90d), capped at 30 — and each revision's rulebase is pulled
       (GET /securetrack/api/revisions/{id}/rules.json) and flattened to one row

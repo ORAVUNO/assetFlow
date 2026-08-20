@@ -20,18 +20,69 @@ path/key variants and normalizes defensively.
 
 from __future__ import annotations
 
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .models import Query
 from .runner import QueryResult
 
-# How many devices a per-device resource will scan before stopping, to bound
-# the number of REST calls on large estates. Rows are still capped by ``limit``.
+# ``device_scan_limit`` defaults to ``None`` = scan the WHOLE estate. This
+# legacy constant is only a fallback ceiling if a caller explicitly asks for a
+# bounded scan; Discover/run-all pass ``None`` to cover every device.
 DEFAULT_DEVICE_SCAN = 25
+
+# How many per-device REST calls to run in parallel. The client is stateless
+# per request (a fresh HTTP call each time), so a bounded thread pool safely
+# turns an N-device sweep into ~N/workers wall-time without flooding the API.
+_DEFAULT_CONCURRENCY = 8
+_MAX_CONCURRENCY = 32
+
+# The device list is re-read by every collector; within one Discover pass that
+# would be ~10 identical calls. Cache it briefly per client so it is fetched
+# once. Short TTL bounds staleness across separate passes.
+_DEVICE_CACHE_TTL = 60.0
 
 # Time-range tokens (shared with the ES adapter's UI) → day counts, used to
 # filter timestamped resources (revisions, audit events) client-side.
 _RANGE_DAYS = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}
+
+
+def resolve_device_scan() -> Optional[int]:
+    """Estate coverage for a fetch: ``TUFIN_DEVICE_SCAN`` (a positive int), else
+    ``None`` = all devices. ``0``/blank/invalid also mean all."""
+    raw = os.getenv("TUFIN_DEVICE_SCAN")
+    if raw:
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    return None
+
+
+def _concurrency() -> int:
+    try:
+        n = int(os.getenv("TUFIN_CONCURRENCY", str(_DEFAULT_CONCURRENCY)))
+    except ValueError:
+        n = _DEFAULT_CONCURRENCY
+    return max(1, min(n, _MAX_CONCURRENCY))
+
+
+def _scan(devices: List[dict], scan: Optional[int]) -> List[dict]:
+    """Apply the device-scan ceiling; ``None``/``0`` = the whole estate."""
+    return devices if not scan else devices[: int(scan)]
+
+
+def _map_devices(devices: List[dict], fn: Callable[[dict], Any]) -> List[Any]:
+    """Run ``fn`` over each device, in bounded parallel, preserving order."""
+    workers = _concurrency()
+    if workers <= 1 or len(devices) <= 1:
+        return [fn(d) for d in devices]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(fn, devices))
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +229,11 @@ def _first_payload(client, paths: Tuple[str, ...]) -> Any:
 
 
 def _fetch_devices(client) -> List[dict]:
+    # Serve a recent device list from a per-client cache so one Discover pass
+    # (many collectors) hits /devices once, not once per collector.
+    cached = getattr(client, "_af_devices_cache", None)
+    if cached and (time.monotonic() - cached[0]) < _DEVICE_CACHE_TTL:
+        return cached[1]
     payload = _first_payload(
         client,
         (
@@ -186,7 +242,12 @@ def _fetch_devices(client) -> List[dict]:
             "devices",
         ),
     )
-    return unwrap_items(payload, ("devices", "device"))
+    devices = unwrap_items(payload, ("devices", "device"))
+    try:
+        client._af_devices_cache = (time.monotonic(), devices)
+    except Exception:  # pragma: no cover - exotic client without __dict__
+        pass
+    return devices
 
 
 def _device_key(device: dict) -> Tuple[str, str]:
@@ -265,20 +326,22 @@ def _collect_devices(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
 
 def _collect_per_device(
     client,
-    scan: int,
+    scan: Optional[int],
     paths_for: Callable[[str, str, dict], Tuple[str, ...]],
     keys: Tuple[str, ...],
     columns: List[str],
     row_for: Callable[[dict, str, str], List[Any]],
 ) -> Tuple[List[str], List[List[Any]]]:
-    rows: List[List[Any]] = []
-    for device in _fetch_devices(client)[:scan]:
+    def rows_for(device: dict) -> List[List[Any]]:
         device_id, name = _device_key(device)
         payload = _first_payload(client, paths_for(device_id, name, device))
         if payload is None:
-            continue
-        for item in unwrap_items(payload, keys):
-            rows.append(row_for(item, device_id, name))
+            return []
+        return [row_for(item, device_id, name) for item in unwrap_items(payload, keys)]
+
+    rows: List[List[Any]] = []
+    for chunk in _map_devices(_scan(_fetch_devices(client), scan), rows_for):
+        rows.extend(chunk)
     return columns, rows
 
 
@@ -670,17 +733,29 @@ def _collect_change_detail(
         "rule.uid", "before", "after", "authorized", "requester",
     ]
     incremental = (time_range or "").lower() in INCREMENTAL_TOKENS and watermark_store is not None
-    rows: List[List[Any]] = []
-    for device in _fetch_devices(client)[:scan]:
+    devices = _scan(_fetch_devices(client), scan)
+
+    # Read every device's watermark up front on the main thread; the store is a
+    # DB handle, so its reads/writes stay off the worker threads.
+    watermarks: Dict[str, Any] = {}
+    if incremental:
+        for device in devices:
+            device_id, _name = _device_key(device)
+            watermarks[device_id] = watermark_store.get(device_id)
+
+    def work(device: dict) -> Tuple[List[List[Any]], Optional[Tuple[str, str]]]:
         device_id, name = _device_key(device)
         revisions = _revisions_sorted(client, device_id)
+        wm_update: Optional[Tuple[str, str]] = None
         if incremental:
-            watermark = watermark_store.get(device_id)
+            watermark = watermarks.get(device_id)
             pairs, new_watermark = _incremental_pairs(revisions, watermark, MAX_CHANGE_PAIRS)
             if new_watermark and new_watermark != watermark:
-                watermark_store.set(device_id, new_watermark)
+                wm_update = (device_id, new_watermark)
         else:
             pairs = _select_change_pairs(revisions, time_range, MAX_CHANGE_PAIRS)
+
+        dev_rows: List[List[Any]] = []
         rules_cache: Dict[str, Dict[str, dict]] = {}
 
         def rules_for(rev_id: str) -> Dict[str, dict]:
@@ -700,7 +775,7 @@ def _collect_change_detail(
             status, requester = _authorization(client, old_id, new_id)
 
             def emit(change_type: str, uid: str, before: dict, after: dict) -> None:
-                rows.append([
+                dev_rows.append([
                     name, new_id, when, admin, change_type, uid,
                     _rule_compact(before) if before else "",
                     _rule_compact(after) if after else "",
@@ -716,6 +791,13 @@ def _collect_change_detail(
             for uid, before in before_rules.items():
                 if uid not in after_rules:
                     emit("removed", uid, before, {})
+        return dev_rows, wm_update
+
+    rows: List[List[Any]] = []
+    for dev_rows, wm_update in _map_devices(devices, work):
+        rows.extend(dev_rows)
+        if wm_update is not None:
+            watermark_store.set(*wm_update)  # main thread — serialized DB write
     return columns, rows
 
 
@@ -830,15 +912,15 @@ def _select_recent_revisions(
 
 
 def _collect_revision_rules(
-    client, scan: int, time_range: Optional[str] = None
+    client, scan: Optional[int], time_range: Optional[str] = None
 ) -> Tuple[List[str], List[List[Any]]]:
     """Snapshot the rulebases of each device's recent revisions into flat rows."""
-    rows: List[List[Any]] = []
-    for device in _fetch_devices(client)[:scan]:
+    def rows_for(device: dict) -> List[List[Any]]:
         device_id, name = _device_key(device)
-        revisions = _revisions_sorted(client, device_id)
+        out: List[List[Any]] = []
         for rev in _select_recent_revisions(
-            revisions, time_range, DEFAULT_REVISION_HISTORY, MAX_REVISION_HISTORY
+            _revisions_sorted(client, device_id), time_range,
+            DEFAULT_REVISION_HISTORY, MAX_REVISION_HISTORY
         ):
             rid = _rev_id(rev)
             number = str(_first(rev, "revisionId"))
@@ -846,11 +928,16 @@ def _collect_revision_rules(
             admin = textish(_first(rev, "admin", "admin_name", "changed_by", "user"))
             for uid, rule in _revision_rules(client, rid).items():
                 f = _rule_fields(rule)
-                rows.append([
+                out.append([
                     name, device_id, rid, number, when, admin, uid,
                     f["name"], f["src_zone"], f["source"], f["dst_zone"], f["destination"],
                     f["service"], f["action"], f["track"], f["disabled"], f["comment"],
                 ])
+        return out
+
+    rows: List[List[Any]] = []
+    for chunk in _map_devices(_scan(_fetch_devices(client), scan), rows_for):
+        rows.extend(chunk)
     return REVISION_RULE_COLUMNS, rows
 
 
@@ -880,15 +967,15 @@ def _object_value(obj: dict) -> str:
 
 
 def _collect_revision_objects(
-    client, scan: int, time_range: Optional[str] = None
+    client, scan: Optional[int], time_range: Optional[str] = None
 ) -> Tuple[List[str], List[List[Any]]]:
     """Snapshot each device's recent revisions' network objects into flat rows."""
-    rows: List[List[Any]] = []
-    for device in _fetch_devices(client)[:scan]:
+    def rows_for(device: dict) -> List[List[Any]]:
         device_id, name = _device_key(device)
-        revisions = _revisions_sorted(client, device_id)
+        out: List[List[Any]] = []
         for rev in _select_recent_revisions(
-            revisions, time_range, DEFAULT_REVISION_HISTORY, MAX_REVISION_HISTORY
+            _revisions_sorted(client, device_id), time_range,
+            DEFAULT_REVISION_HISTORY, MAX_REVISION_HISTORY
         ):
             rid = _rev_id(rev)
             number = str(_first(rev, "revisionId"))
@@ -900,13 +987,18 @@ def _collect_revision_objects(
             )
             for obj in unwrap_items(payload, ("network_objects", "network_object")):
                 uid = str(_first(obj, "uid", "id", "display_name", "name"))
-                rows.append([
+                out.append([
                     name, device_id, rid, number, when, admin, uid,
                     textish(_first(obj, "display_name", "name")),
                     textish(_first(obj, "@xsi.type", "type", "class_name")),
                     _object_value(obj),
                     textish(_first(obj, "comment")),
                 ])
+        return out
+
+    rows: List[List[Any]] = []
+    for chunk in _map_devices(_scan(_fetch_devices(client), scan), rows_for):
+        rows.extend(chunk)
     return REVISION_OBJECT_COLUMNS, rows
 
 
@@ -1181,10 +1273,14 @@ def run_query(
     query: Query,
     limit: Optional[int] = None,
     time_range: Optional[str] = None,
-    device_scan_limit: int = DEFAULT_DEVICE_SCAN,
+    device_scan_limit: Optional[int] = None,
     watermark_store=None,
 ) -> QueryResult:
-    """Fetch a Tufin registry query's resource and normalize the response."""
+    """Fetch a Tufin registry query's resource and normalize the response.
+
+    ``device_scan_limit`` bounds how many devices per-device resources scan;
+    ``None`` (the default) covers the whole estate.
+    """
     resource = (query.resource or "").strip()
     if not resource:
         raise ValueError(
