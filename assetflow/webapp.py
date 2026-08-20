@@ -406,6 +406,22 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"compare failed: {exc}")
 
+    @app.get("/api/adapters/{adapter_id}/tufin/revision-policy")
+    def api_tufin_revision_policy(
+        adapter_id: str,
+        device_id: str = QueryParam(...),
+        revision_id: Optional[str] = QueryParam(default=None),
+    ) -> dict:
+        a = _get_adapter(adapter_id)
+        if not hasattr(a, "revision_rulebase"):
+            raise HTTPException(status_code=400, detail="not a Tufin adapter")
+        if not a.connected:
+            raise HTTPException(status_code=400, detail="adapter is not connected")
+        try:
+            return a.revision_rulebase(device_id, revision_id=revision_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"policy fetch failed: {exc}")
+
     @app.get("/api/adapters/{adapter_id}/drift")
     def api_drift(adapter_id: str) -> dict:
         _get_adapter(adapter_id)
@@ -1524,6 +1540,73 @@ function renderRevCompare(d){
   return h;
 }
 
+// ----- Tufin revision policy viewer (full rulebase of any one revision) -----
+async function openRevisionPolicy(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovRevPolicy'); if(el) el.classList.add('active');
+  const m=document.getElementById('main');
+  if(!DETAIL.connected){
+    m.innerHTML='<h2>Revision Policy</h2><div class="err">Connect the Tufin adapter first '+
+      '(Connection panel) — the policy viewer reads the live per-revision rulebase.</div>'; return;
+  }
+  m.innerHTML='<h2>Revision Policy — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">View the full firewall rulebase exactly as it stood at any one revision — '+
+    'pick a device and a point in its history. Defaults to the latest revision.</div>'+
+    '<div class="rcbar">'+
+      '<label>Device<select id="rpDev"><option value="">Loading…</option></select></label>'+
+      '<label>Revision<select id="rpRev"></select></label>'+
+      '<button id="rpGo" disabled>View</button>'+
+    '</div><div id="rpmeta" class="meta"></div><div id="rpout"></div>';
+  document.getElementById('rpGo').onclick=rpRun;
+  const dsel=document.getElementById('rpDev'); dsel.onchange=rpLoadRevisions;
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices'); }
+  catch(e){ dsel.innerHTML='<option value="">(failed)</option>';
+    document.getElementById('rpout').innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  const devs=d.devices||[];
+  if(!devs.length){ dsel.innerHTML='<option value="">(no devices)</option>';
+    document.getElementById('rpout').innerHTML='<p class="hint">No devices returned by SecureTrack.</p>'; return; }
+  dsel.innerHTML='<option value="">Select a device…</option>'+
+    devs.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+(x.model?(' ('+esc(x.model)+')'):'')+'</option>').join('');
+}
+
+async function rpLoadRevisions(){
+  const dev=document.getElementById('rpDev').value;
+  const rs=document.getElementById('rpRev'), go=document.getElementById('rpGo');
+  const out=document.getElementById('rpout'); out.innerHTML=''; document.getElementById('rpmeta').innerHTML='';
+  rs.innerHTML=''; go.disabled=true;
+  if(!dev) return;
+  rs.innerHTML='<option>Loading…</option>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices/'+encodeURIComponent(dev)+'/revisions'); }
+  catch(e){ out.innerHTML='<div class="err">'+esc(e.message)+'</div>'; rs.innerHTML=''; return; }
+  const revs=d.revisions||[];
+  if(!revs.length){ rs.innerHTML='<option value="">(none)</option>';
+    out.innerHTML='<p class="hint">This device has no revisions.</p>'; return; }
+  rs.innerHTML=revs.map(r=>'<option value="'+esc(r.id)+'">#'+esc(r.number||r.id)+' · '+esc(r.date||'')+
+    (r.admin?(' · '+esc(r.admin)):'')+'</option>').join('');
+  rs.selectedIndex=0;   // newest-first
+  go.disabled=false; rpRun();
+}
+
+async function rpRun(){
+  const dev=document.getElementById('rpDev').value, rev=document.getElementById('rpRev').value;
+  const out=document.getElementById('rpout'), meta=document.getElementById('rpmeta');
+  if(!dev){ out.innerHTML='<p class="hint">Pick a device.</p>'; return; }
+  out.innerHTML='<p class="hint">Loading rulebase…</p>'; meta.innerHTML='';
+  const p=new URLSearchParams({device_id:dev}); if(rev) p.set('revision_id',rev);
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/revision-policy?'+p.toString()); }
+  catch(e){ out.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  if(d.error){ out.innerHTML='<div class="err">'+esc(d.error)+'</div>'; return; }
+  const r=d.revision||{};
+  meta.innerHTML=esc((d.device&&d.device.name)||'')+' · revision <b>#'+esc(r.number||r.id||'?')+'</b>'+
+    (r.date?(' · '+esc(r.date)):'')+(r.admin?(' · by '+esc(r.admin)):'')+
+    (r.action?(' · '+esc(r.action)):'')+
+    (r.authorization_status?(' · '+esc(r.authorization_status)):'')+
+    ' · '+(d.rows||[]).length+' rules';
+  if((d.rows||[]).length) mountTable(out, d.columns.map(c=>c.name), d.rows, {});
+  else out.innerHTML='<p class="hint">This revision has no rules.</p>';
+}
+
 async function openDrift(){
   CURRENT=null;
   document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
@@ -1577,6 +1660,9 @@ function renderSidebar(){
     const rc=document.createElement('div'); rc.className='q ov'; rc.id='ovRevCompare';
     rc.innerHTML='<span class="qid">🔀 Compare Revisions</span>';
     rc.onclick=openRevisionCompare; side.appendChild(rc);
+    const rp=document.createElement('div'); rp.className='q ov'; rp.id='ovRevPolicy';
+    rp.innerHTML='<span class="qid">📜 Revision Policy</span>';
+    rp.onclick=openRevisionPolicy; side.appendChild(rp);
   }
   const dl=document.createElement('div'); dl.className='q ov'; dl.id='ovDrift';
   dl.innerHTML='<span class="qid">⇄ Drift Log</span>';

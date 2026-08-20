@@ -951,6 +951,50 @@ def compare_revisions(
     }
 
 
+def revision_rulebase(
+    client, device_id: str, revision_id: Optional[str] = None
+) -> dict:
+    """Return the full rulebase of one revision as a column/row table.
+
+    Unlike the ``rules`` collector (which only ever shows each device's latest
+    rulebase), this views an *arbitrary* revision — pick a device and a point in
+    its history and read the policy exactly as it stood then. With
+    ``revision_id`` omitted the latest revision is used.
+    """
+    revisions = _revisions_sorted(client, device_id)
+    by_id = {_rev_id(r): r for r in revisions}
+    name = ""
+    for device in _fetch_devices(client):
+        did, dname = _device_key(device)
+        if did == str(device_id):
+            name = dname
+            break
+
+    if revision_id not in (None, ""):
+        rev = by_id.get(str(revision_id), {"id": str(revision_id)})
+        rev_id = str(revision_id)
+    elif revisions:
+        rev = revisions[-1]
+        rev_id = _rev_id(rev)
+    else:
+        return {"device": {"id": str(device_id), "name": name},
+                "error": "device has no revisions", "columns": [], "rows": []}
+
+    rules = _revision_rules(client, rev_id)
+    labels = [label for label, _ in _RULE_FIELD_ORDER]
+    columns = ["host.name", "rule.uid"] + labels
+    rows: List[List[Any]] = []
+    for uid, rule in rules.items():
+        fields = _rule_fields(rule)
+        rows.append([name, uid] + [fields[label] for label in labels])
+    return {
+        "device": {"id": str(device_id), "name": name},
+        "revision": _rev_meta(rev) if rev else {"id": rev_id},
+        "columns": [{"name": c} for c in columns],
+        "rows": rows,
+    }
+
+
 def list_devices(client) -> List[Dict[str, str]]:
     """Lightweight {id, name, model} list for a revision-comparison device picker."""
     out: List[Dict[str, str]] = []
