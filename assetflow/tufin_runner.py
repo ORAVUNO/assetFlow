@@ -316,10 +316,40 @@ def _collect_revisions(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
     return _collect_per_device(client, scan, paths_for, ("revisions", "revision"), columns, row_for)
 
 
+# R25-2 rule source/destination/service live under src_network/dst_network/
+# dst_service (arrays of objects), with zones under src_zone/dst_zone — NOT the
+# generic "source"/"destination" keys.
+def _rule_src(rule: dict) -> Any:
+    return _first(rule, "src_network", "src_networks", "source", "src", "sources")
+
+
+def _rule_dst(rule: dict) -> Any:
+    return _first(rule, "dst_network", "dst_networks", "destination", "dst", "destinations")
+
+
+def _rule_svc(rule: dict) -> Any:
+    return _first(rule, "dst_service", "dst_services", "service", "services", "src_service", "protocol")
+
+
+def _rule_src_zone(rule: dict) -> Any:
+    return _first(rule, "src_zone", "from_zone")
+
+
+def _rule_dst_zone(rule: dict) -> Any:
+    return _first(rule, "dst_zone", "to_zone")
+
+
+def _rule_any(value: Any) -> str:
+    """Render a rule field, showing 'Any' when the object list is empty (as a
+    firewall rule with no explicit source/destination means any)."""
+    text = textish(value)
+    return text if text else "Any"
+
+
 def _collect_rules(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
     columns = [
-        "host.name", "rule.uid", "rule.name", "source", "destination",
-        "service", "action", "track", "disabled", "comment",
+        "host.name", "rule.uid", "rule.name", "src_zone", "source",
+        "dst_zone", "destination", "service", "action", "track", "disabled", "comment",
     ]
 
     def paths_for(device_id: str, name: str, device: dict) -> Tuple[str, ...]:
@@ -340,9 +370,11 @@ def _collect_rules(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
             name,
             str(_first(rule, "uid", "id", "rule_id", "order", "number")),
             textish(_first(rule, "name", "comment")),
-            textish(_first(rule, "source", "src", "sources")),
-            textish(_first(rule, "destination", "dst", "destinations")),
-            textish(_first(rule, "service", "services", "protocol")),
+            textish(_rule_src_zone(rule)),
+            _rule_any(_rule_src(rule)),
+            textish(_rule_dst_zone(rule)),
+            _rule_any(_rule_dst(rule)),
+            _rule_any(_rule_svc(rule)),
             textish(_first(rule, "action")),
             textish(_first(rule, "track")),
             textish(_first(rule, "disabled")),
@@ -476,9 +508,9 @@ def _rule_fingerprint(rule: dict) -> str:
     read as a traffic change (mirrors the original Tufin change detector).
     """
     parts = [
-        textish(_first(rule, "source", "src", "sources")),
-        textish(_first(rule, "destination", "dst", "destinations")),
-        textish(_first(rule, "service", "services", "protocol")),
+        textish(_rule_src(rule)),
+        textish(_rule_dst(rule)),
+        textish(_rule_svc(rule)),
         textish(_first(rule, "action")),
         textish(_first(rule, "disabled")),
     ]
@@ -487,9 +519,9 @@ def _rule_fingerprint(rule: dict) -> str:
 
 def _rule_compact(rule: dict) -> str:
     """A short human-readable rule summary for before/after cells."""
-    src = textish(_first(rule, "source", "src", "sources")) or "any"
-    dst = textish(_first(rule, "destination", "dst", "destinations")) or "any"
-    svc = textish(_first(rule, "service", "services", "protocol")) or "any"
+    src = textish(_rule_src(rule)) or "any"
+    dst = textish(_rule_dst(rule)) or "any"
+    svc = textish(_rule_svc(rule)) or "any"
     act = textish(_first(rule, "action")) or "?"
     return f"{src} → {dst} : {svc} ({act})"
 

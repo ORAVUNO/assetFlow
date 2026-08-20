@@ -179,17 +179,24 @@ queries:
       - host.name
       - rule.uid
       - rule.name
-      - source
-      - destination
-      - service
+      - src_zone           # RuleDTO.src_zone (from_zone)
+      - source             # RuleDTO.src_network[]
+      - dst_zone           # RuleDTO.dst_zone (to_zone)
+      - destination        # RuleDTO.dst_network[]
+      - service            # RuleDTO.dst_service[]
       - action
       - track
       - disabled
       - comment
     notes: >-
       GET /securetrack/api/revisions/{latest}/rules.json, falling back to
-      /securetrack/api/devices/{id}/rules.json. Source/destination/service can be
-      object references or lists; they are flattened to readable text.
+      /securetrack/api/devices/{id}/rules.json. R25-2 RuleDTO exposes the rule's
+      source/destination/service under src_network / dst_network / dst_service
+      (arrays of network/service objects) and zones under src_zone / dst_zone —
+      NOT generic "source"/"destination" keys. Each is flattened to readable text
+      (object display name, or IP for hosts/subnets); an empty list renders as
+      "Any". Source/destination were previously blank because the wrong field
+      names were read.
     recommended_refresh_frequency: Daily
 
   - id: TUF004

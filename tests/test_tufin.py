@@ -138,26 +138,35 @@ def test_revisions_expose_who_what_when():
     assert row["comment"] == "added vendor VPN rule"
 
 
-def test_rules_flatten_nested_fields():
+def test_rules_flatten_real_r25_2_fields():
+    # R25-2 rules put source/dest/service under src_network/dst_network/
+    # dst_service, with zones under src_zone/dst_zone.
     mapping = dict(DEVICES)
     mapping["devices/1/rules.json"] = {
         "rules": [
             {
                 "uid": "{abc}",
                 "name": "Allow web",
-                "source": [{"name": "net-a"}, {"name": "net-b"}],
-                "destination": {"ip": "10.10.10.10"},
-                "service": "tcp/443",
+                "src_zone": [{"name": "DMZ"}],
+                "src_network": [{"display_name": "net-a"}, {"display_name": "net-b"}],
+                "dst_zone": [{"name": "INSIDE"}],
+                "dst_network": [{"ip": "10.10.10.10"}],
+                "dst_service": [{"display_name": "https"}],
                 "action": "accept",
-            }
+            },
+            {"uid": "{any}", "name": "Any-any", "action": "drop"},  # no networks -> Any
         ]
     }
     result = tufin_runner_mod.run_query(FakeClient(mapping), _q("rules"))
-    row = dict(zip(result.column_names, result.rows[0]))
-    assert row["host.name"] == "HQ-Perimeter-FW"
-    assert row["source"] == "net-a, net-b"
-    assert row["destination"] == "10.10.10.10"
-    assert row["action"] == "accept"
+    rows = [dict(zip(result.column_names, r)) for r in result.rows]
+    r0 = rows[0]
+    assert r0["source"] == "net-a, net-b"
+    assert r0["destination"] == "10.10.10.10"
+    assert r0["service"] == "https"
+    assert r0["src_zone"] == "DMZ" and r0["dst_zone"] == "INSIDE"
+    assert r0["action"] == "accept"
+    # a rule with no source/dest objects renders as Any
+    assert rows[1]["source"] == "Any" and rows[1]["destination"] == "Any"
 
 
 def test_cleanups_require_code_and_unwrap_shadowed_rule():
