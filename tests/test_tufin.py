@@ -534,3 +534,97 @@ def test_build_client_requires_host_and_creds():
         tufin_client_mod.build_client(host="", username="u", password="p")
     with pytest.raises(tufin_client_mod.TufinConfigError):
         tufin_client_mod.build_client(host="h", username="", password="")
+
+
+# --------------------------------------------------------------------------- #
+# Revision comparison (SecureTrack-style compare report)
+# --------------------------------------------------------------------------- #
+
+def _compare_mapping():
+    """Device 1 with revisions 100 -> 101: r10 modified (service), r20 removed,
+    r30 added, r40 reordered (moved), plus one network-object add + modify."""
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {
+        "revisions": [
+            {"id": "100", "revisionId": "100", "date": "2026-08-01", "time": "09:00:00", "admin": "bob"},
+            {"id": "101", "revisionId": "101", "date": "2026-08-05", "time": "17:30:00", "admin": "jane",
+             "action": "Install Policy"},
+        ]
+    }
+    mapping["revisions/100/rules.json"] = {"rules": [
+        {"uid": "r10", "src_network": "10.0.0.0/24", "dst_network": "db", "dst_service": "tcp/8443",
+         "src_zone": "inside", "dst_zone": "dmz", "action": "accept"},
+        {"uid": "r20", "src_network": "any", "dst_network": "net", "dst_service": "tcp/22", "action": "drop"},
+        {"uid": "r40", "src_network": "1.1.1.1", "dst_network": "web", "dst_service": "tcp/80", "action": "accept"},
+        {"uid": "r50", "src_network": "2.2.2.2", "dst_network": "dns", "dst_service": "udp/53", "action": "accept"},
+    ]}
+    # r10 modified (service); r20 removed; r30 added; r50 jumps to the top with
+    # identical content -> a clean "moved" while r10/r40 stay put.
+    mapping["revisions/101/rules.json"] = {"rules": [
+        {"uid": "r50", "src_network": "2.2.2.2", "dst_network": "dns", "dst_service": "udp/53", "action": "accept"},
+        {"uid": "r10", "src_network": "10.0.0.0/24", "dst_network": "db", "dst_service": "tcp/443",
+         "src_zone": "inside", "dst_zone": "dmz", "action": "accept"},
+        {"uid": "r40", "src_network": "1.1.1.1", "dst_network": "web", "dst_service": "tcp/80", "action": "accept"},
+        {"uid": "r30", "src_network": "196.10.15.20", "dst_network": "vpn", "dst_service": "tcp/3389",
+         "action": "accept"},
+    ]}
+    mapping["revisions/100/network_objects.json"] = {"network_objects": [
+        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.9"},
+    ]}
+    mapping["revisions/101/network_objects.json"] = {"network_objects": [
+        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.10"},  # ip modified
+        {"uid": "o2", "display_name": "srv-b", "type": "host", "ip": "10.0.0.20"},  # added
+    ]}
+    return mapping
+
+
+def test_compare_revisions_summary_and_detail():
+    d = tufin_runner_mod.compare_revisions(FakeClient(_compare_mapping()), "1")
+    # Defaulted to the latest two revisions, oldest -> newest.
+    assert d["from"]["id"] == "100" and d["to"]["id"] == "101"
+    assert d["device"]["name"] == "HQ-Perimeter-FW"
+    assert d["to"]["admin"] == "jane"
+
+    summ = {s["category"]: s for s in d["summary"]}
+    rules = summ["Security Rules"]
+    assert rules["added"] == 1 and rules["deleted"] == 1 and rules["modified"] == 1
+    assert rules["moved"] == 1
+    objs = summ["Network Objects"]
+    assert objs["added"] == 1 and objs["modified"] == 1 and objs["deleted"] == 0
+
+    by = {(r["change_type"], r["rule_uid"]): r for r in d["rules"]}
+    assert ("added", "r30") in by
+    assert ("removed", "r20") in by
+    assert ("moved", "r50") in by
+    mod = by[("modified", "r10")]
+    assert "service" in mod["changed_fields"]
+    assert mod["before"]["service"] == "tcp/8443" and mod["after"]["service"] == "tcp/443"
+    # A moved rule's content is unchanged, so nothing is flagged as a field diff.
+    assert by[("moved", "r50")]["changed_fields"] == []
+
+    obj_by = {(o["change_type"], o["name"]): o for o in d["objects"]}
+    assert ("modified", "o1") in obj_by and ("added", "o2") in obj_by
+    assert "10.0.0.10" in obj_by[("modified", "o1")]["after"]
+
+
+def test_compare_revisions_explicit_ids_are_ordered_oldest_first():
+    # Pass the ids reversed; the report must still read 100 -> 101.
+    d = tufin_runner_mod.compare_revisions(
+        FakeClient(_compare_mapping()), "1", old_rev="101", new_rev="100"
+    )
+    assert d["from"]["id"] == "100" and d["to"]["id"] == "101"
+
+
+def test_compare_revisions_no_revisions_errors():
+    d = tufin_runner_mod.compare_revisions(FakeClient(dict(DEVICES)), "1")
+    assert "error" in d and d["rules"] == []
+
+
+def test_list_devices_and_revisions_for_picker():
+    client = FakeClient(_compare_mapping())
+    devs = tufin_runner_mod.list_devices(client)
+    assert devs[0]["id"] == "1" and devs[0]["name"] == "HQ-Perimeter-FW"
+    revs = tufin_runner_mod.list_revisions(client, "1")
+    # Newest-first for the picker.
+    assert [r["id"] for r in revs] == ["101", "100"]
+    assert revs[0]["admin"] == "jane"

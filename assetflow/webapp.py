@@ -365,6 +365,47 @@ def create_app(
         }
         return dash
 
+    @app.get("/api/adapters/{adapter_id}/tufin/devices")
+    def api_tufin_devices(adapter_id: str) -> dict:
+        a = _get_adapter(adapter_id)
+        if not hasattr(a, "list_devices"):
+            raise HTTPException(status_code=400, detail="not a Tufin adapter")
+        if not a.connected:
+            raise HTTPException(status_code=400, detail="adapter is not connected")
+        try:
+            return {"devices": a.list_devices()}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"failed to list devices: {exc}")
+
+    @app.get("/api/adapters/{adapter_id}/tufin/devices/{device_id}/revisions")
+    def api_tufin_device_revisions(adapter_id: str, device_id: str) -> dict:
+        a = _get_adapter(adapter_id)
+        if not hasattr(a, "list_revisions"):
+            raise HTTPException(status_code=400, detail="not a Tufin adapter")
+        if not a.connected:
+            raise HTTPException(status_code=400, detail="adapter is not connected")
+        try:
+            return {"revisions": a.list_revisions(device_id)}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"failed to list revisions: {exc}")
+
+    @app.get("/api/adapters/{adapter_id}/tufin/revision-compare")
+    def api_tufin_revision_compare(
+        adapter_id: str,
+        device_id: str = QueryParam(...),
+        old_rev: Optional[str] = QueryParam(default=None),
+        new_rev: Optional[str] = QueryParam(default=None),
+    ) -> dict:
+        a = _get_adapter(adapter_id)
+        if not hasattr(a, "compare_revisions"):
+            raise HTTPException(status_code=400, detail="not a Tufin adapter")
+        if not a.connected:
+            raise HTTPException(status_code=400, detail="adapter is not connected")
+        try:
+            return a.compare_revisions(device_id, old_rev=old_rev, new_rev=new_rev)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"compare failed: {exc}")
+
     @app.get("/api/adapters/{adapter_id}/drift")
     def api_drift(adapter_id: str) -> dict:
         _get_adapter(adapter_id)
@@ -644,6 +685,25 @@ INDEX_HTML = r"""<!doctype html>
   .minihdr.dim{color:var(--muted);font-weight:500}
   .sheethdr{margin:18px 0 2px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
   .mini table{font-size:12px}
+  /* revision comparison */
+  .rcbar{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:8px 0 4px}
+  .rcbar label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted)}
+  .rcbar select{min-width:150px}
+  .rctag{display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;
+         padding:1px 7px;border-radius:5px;white-space:nowrap}
+  .rc-added{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .rc-removed{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+  .rc-modified{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}
+  .rc-moved{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+  tr.row-added td{background:color-mix(in srgb,var(--ok) 7%,transparent)}
+  tr.row-removed td{background:color-mix(in srgb,var(--bad) 7%,transparent)}
+  tr.row-modified td{background:color-mix(in srgb,var(--warn) 8%,transparent)}
+  tr.row-moved td{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+  .rcfld{white-space:normal;max-width:340px}
+  .rcfld .chg{background:color-mix(in srgb,var(--warn) 22%,transparent);border-radius:3px;padding:0 2px}
+  .rcfld .b4{color:var(--muted);text-decoration:line-through}
+  .rcfld .af{color:var(--text);font-weight:600}
+  .rcfld .arw{color:var(--muted);padding:0 4px}
   /* unified inventory */
   tr.multi td{background:color-mix(in srgb,var(--accent) 12%,transparent) !important;font-weight:600}
   .invbtn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
@@ -1355,6 +1415,115 @@ async function openChangeDashboard(){
   else document.getElementById('cdRecent').innerHTML='<p class="hint">No changes recorded yet. Run TUF008 (Change Detail).</p>';
 }
 
+// ----- Tufin revision comparison (SecureTrack-style compare report) -----
+async function openRevisionCompare(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovRevCompare'); if(el) el.classList.add('active');
+  const m=document.getElementById('main');
+  if(!DETAIL.connected){
+    m.innerHTML='<h2>Compare Revisions</h2><div class="err">Connect the Tufin adapter first '+
+      '(Connection panel) — revision comparison reads live per-revision rulebases.</div>'; return;
+  }
+  m.innerHTML='<h2>Compare Revisions — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Pick a device and two revisions to see exactly what changed between them — '+
+    'new, deleted, modified and moved security rules and network objects. Defaults to the latest two revisions.</div>'+
+    '<div class="rcbar">'+
+      '<label>Device<select id="rcDev"><option value="">Loading…</option></select></label>'+
+      '<label>From (before)<select id="rcOld"></select></label>'+
+      '<label>To (after)<select id="rcNew"></select></label>'+
+      '<button id="rcGo" disabled>Compare</button>'+
+    '</div><div id="rcout"></div>';
+  document.getElementById('rcGo').onclick=rcRun;
+  const dsel=document.getElementById('rcDev'); dsel.onchange=rcLoadRevisions;
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices'); }
+  catch(e){ dsel.innerHTML='<option value="">(failed)</option>';
+    document.getElementById('rcout').innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  const devs=d.devices||[];
+  if(!devs.length){ dsel.innerHTML='<option value="">(no devices)</option>';
+    document.getElementById('rcout').innerHTML='<p class="hint">No devices returned by SecureTrack.</p>'; return; }
+  dsel.innerHTML='<option value="">Select a device…</option>'+
+    devs.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+(x.model?(' ('+esc(x.model)+')'):'')+'</option>').join('');
+}
+
+async function rcLoadRevisions(){
+  const dev=document.getElementById('rcDev').value;
+  const os=document.getElementById('rcOld'), ns=document.getElementById('rcNew'), go=document.getElementById('rcGo');
+  const out=document.getElementById('rcout'); out.innerHTML=''; go.disabled=true;
+  os.innerHTML=ns.innerHTML='';
+  if(!dev) return;
+  os.innerHTML=ns.innerHTML='<option>Loading…</option>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices/'+encodeURIComponent(dev)+'/revisions'); }
+  catch(e){ out.innerHTML='<div class="err">'+esc(e.message)+'</div>'; os.innerHTML=ns.innerHTML=''; return; }
+  const revs=d.revisions||[];
+  if(revs.length<2){ os.innerHTML=ns.innerHTML='<option value="">(need 2+)</option>';
+    out.innerHTML='<p class="hint">This device has fewer than two revisions to compare.</p>'; return; }
+  const opt=r=>'<option value="'+esc(r.id)+'">#'+esc(r.number||r.id)+' · '+esc(r.date||'')+(r.admin?(' · '+esc(r.admin)):'')+'</option>';
+  os.innerHTML=revs.map(opt).join(''); ns.innerHTML=revs.map(opt).join('');
+  ns.selectedIndex=0; os.selectedIndex=1;   // newest-first list → To=newest, From=second-newest
+  go.disabled=false; rcRun();
+}
+
+async function rcRun(){
+  const dev=document.getElementById('rcDev').value;
+  const oldR=document.getElementById('rcOld').value, newR=document.getElementById('rcNew').value;
+  const out=document.getElementById('rcout');
+  if(!dev){ out.innerHTML='<p class="hint">Pick a device.</p>'; return; }
+  out.innerHTML='<p class="hint">Comparing revisions…</p>';
+  const p=new URLSearchParams({device_id:dev});
+  if(oldR) p.set('old_rev',oldR); if(newR) p.set('new_rev',newR);
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/revision-compare?'+p.toString()); }
+  catch(e){ out.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  out.innerHTML=renderRevCompare(d);
+}
+
+function rcTag(ct){return '<span class="rctag rc-'+ct+'">'+esc(ct)+'</span>';}
+
+function rcCell(entry, label){
+  const b=(entry.before||{})[label]||'', a=(entry.after||{})[label]||'';
+  if(entry.change_type==='removed') return esc(b);
+  if(entry.change_type==='added') return esc(a);
+  if((entry.changed_fields||[]).indexOf(label)>=0)
+    return '<span class="b4">'+esc(b||'∅')+'</span><span class="arw">→</span><span class="af">'+esc(a||'∅')+'</span>';
+  return esc(a);
+}
+
+function renderRevCompare(d){
+  if(d.error) return '<div class="err">'+esc(d.error)+'</div>';
+  const f=d.from||{}, t=d.to||{}, au=d.authorization||{};
+  let h='<div class="meta">'+esc((d.device&&d.device.name)||'')+
+    ' · from <b>#'+esc(f.number||f.id||'?')+'</b> ('+esc(f.date||'')+')'+
+    ' → to <b>#'+esc(t.number||t.id||'?')+'</b> ('+esc(t.date||'')+')'+
+    (t.admin?(' · by '+esc(t.admin)):'')+
+    (au.status?(' · authorization: '+esc(au.status)+(au.requester?(' ('+esc(au.requester)+')'):'')):'')+'</div>';
+  h+='<div class="sheethdr">Summary</div><div class="tablewrap"><table><thead><tr>'+
+    '<th>Category</th><th>New</th><th>Deleted</th><th>Modified</th><th>Moved</th></tr></thead><tbody>';
+  (d.summary||[]).forEach(s=>{ h+='<tr><td>'+esc(s.category)+'</td><td>'+(s.added||0)+'</td><td>'+
+    (s.deleted||0)+'</td><td>'+(s.modified||0)+'</td><td>'+(s.moved||0)+'</td></tr>'; });
+  h+='</tbody></table></div>';
+  const flds=d.rule_fields||['name','src_zone','source','dst_zone','destination','service','action'];
+  const rules=d.rules||[];
+  h+='<div class="sheethdr">Security rule changes ('+rules.length+')</div>';
+  if(!rules.length) h+='<p class="hint">No security-rule changes between these revisions.</p>';
+  else{
+    h+='<div class="tablewrap"><table><thead><tr><th>Change</th><th>rule.uid</th>'+
+      flds.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>';
+    rules.forEach(r=>{ h+='<tr class="row-'+r.change_type+'"><td>'+rcTag(r.change_type)+'</td><td>'+esc(r.rule_uid)+'</td>'+
+      flds.map(lbl=>'<td class="rcfld">'+rcCell(r,lbl)+'</td>').join('')+'</tr>'; });
+    h+='</tbody></table></div>';
+  }
+  const objs=d.objects||[];
+  h+='<div class="sheethdr">Network object changes ('+objs.length+')</div>';
+  if(!objs.length) h+='<p class="hint">No network-object changes between these revisions.</p>';
+  else{
+    h+='<div class="tablewrap"><table><thead><tr><th>Change</th><th>Object</th><th>Before</th><th>After</th></tr></thead><tbody>';
+    objs.forEach(o=>{ h+='<tr class="row-'+o.change_type+'"><td>'+rcTag(o.change_type)+'</td><td>'+esc(o.name)+
+      '</td><td class="rcfld">'+esc(o.before||'')+'</td><td class="rcfld">'+esc(o.after||'')+'</td></tr>'; });
+    h+='</tbody></table></div>';
+  }
+  return h;
+}
+
 async function openDrift(){
   CURRENT=null;
   document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
@@ -1402,6 +1571,12 @@ function renderSidebar(){
     const cd=document.createElement('div'); cd.className='q ov'; cd.id='ovChangeDash';
     cd.innerHTML='<span class="qid">📊 Changes Dashboard</span>';
     cd.onclick=openChangeDashboard; side.appendChild(cd);
+  }
+  // Revision comparison is Tufin-specific (needs live per-revision rulebases).
+  if(DETAIL.kind==='tufin'){
+    const rc=document.createElement('div'); rc.className='q ov'; rc.id='ovRevCompare';
+    rc.innerHTML='<span class="qid">🔀 Compare Revisions</span>';
+    rc.onclick=openRevisionCompare; side.appendChild(rc);
   }
   const dl=document.createElement('div'); dl.className='q ov'; dl.id='ovDrift';
   dl.innerHTML='<span class="qid">⇄ Drift Log</span>';

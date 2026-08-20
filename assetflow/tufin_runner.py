@@ -719,6 +719,253 @@ def _collect_change_detail(
     return columns, rows
 
 
+# --------------------------------------------------------------------------- #
+# Revision comparison (SecureTrack "Compare revisions" report)
+# --------------------------------------------------------------------------- #
+
+# Ordered rule fields shown in the per-rule before/after detail (label ->
+# extractor). Mirrors the columns of a SecureTrack revision-comparison report.
+_RULE_FIELD_ORDER: List[Tuple[str, Callable[[dict], str]]] = [
+    ("name", lambda r: textish(_first(r, "name", "comment"))),
+    ("src_zone", lambda r: textish(_rule_src_zone(r))),
+    ("source", lambda r: _rule_any(_rule_src(r))),
+    ("dst_zone", lambda r: textish(_rule_dst_zone(r))),
+    ("destination", lambda r: _rule_any(_rule_dst(r))),
+    ("service", lambda r: _rule_any(_rule_svc(r))),
+    ("action", lambda r: textish(_first(r, "action"))),
+    ("track", lambda r: textish(_first(r, "track"))),
+    ("disabled", lambda r: textish(_first(r, "disabled"))),
+    ("comment", lambda r: textish(_first(r, "comment", "documentation"))),
+]
+
+
+def _rule_fields(rule: dict) -> Dict[str, str]:
+    return {label: fn(rule) for label, fn in _RULE_FIELD_ORDER}
+
+
+def _lcs_keep(a: List[str], b: List[str]) -> set:
+    """Return the set of items on a longest common subsequence of ``a``/``b``.
+
+    Used to tell a *moved* rule (present in both revisions, same content, but
+    reordered) from one that merely shifted because rules around it were added
+    or removed: only items off the common subsequence count as moved.
+    """
+    n, m = len(a), len(b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for k in range(m - 1, -1, -1):
+            dp[i][k] = dp[i + 1][k + 1] + 1 if a[i] == b[k] else max(dp[i + 1][k], dp[i][k + 1])
+    keep: set = set()
+    i = k = 0
+    while i < n and k < m:
+        if a[i] == b[k]:
+            keep.add(a[i]); i += 1; k += 1
+        elif dp[i + 1][k] >= dp[i][k + 1]:
+            i += 1
+        else:
+            k += 1
+    return keep
+
+
+def _rev_meta(rev: dict) -> Dict[str, str]:
+    return {
+        "id": _rev_id(rev),
+        "number": str(_first(rev, "revisionId")),
+        "date": _join_datetime(rev),
+        "admin": textish(_first(rev, "admin", "admin_name", "changed_by", "user")),
+        "action": textish(_first(rev, "action")),
+        "policy_package": textish(_first(rev, "policyPackage", "policy_package", "policy")),
+        "authorization_status": textish(
+            _first(rev, "authorizationStatus", "automaticAuthorizationStatus", "authorization_status")
+        ),
+        "comment": textish(_nested(rev, "comment", "comment") or _first(rev, "description")),
+    }
+
+
+def _order_key(rev_id: str):
+    try:
+        return (0, int(rev_id))
+    except (TypeError, ValueError):
+        return (1, str(rev_id))
+
+
+def _revision_objects(client, revision_id: str) -> Dict[str, dict]:
+    payload = _first_payload(
+        client,
+        (f"revisions/{revision_id}/network_objects.json", f"revisions/{revision_id}/network_objects"),
+    )
+    out: Dict[str, dict] = {}
+    for obj in unwrap_items(payload, ("network_objects", "network_object")):
+        key = str(_first(obj, "uid", "id", "display_name", "name"))
+        if key:
+            out[key] = obj
+    return out
+
+
+def _object_fingerprint(obj: dict) -> str:
+    return " | ".join([
+        textish(_first(obj, "@xsi.type", "type", "class_name")),
+        textish(_first(obj, "ip", "ip_address", "value")),
+        textish(_first(obj, "netmask")),
+        textish(_first(obj, "members", "member")),
+    ])
+
+
+def _object_display(obj: dict) -> str:
+    typ = textish(_first(obj, "@xsi.type", "type", "class_name")) or "object"
+    ip = textish(_first(obj, "ip", "ip_address", "value"))
+    return f"{typ}: {ip}" if ip else typ
+
+
+def _rule_change_entry(change_type: str, uid: str, before: Optional[dict], after: Optional[dict]) -> dict:
+    bf = _rule_fields(before) if before else {}
+    af = _rule_fields(after) if after else {}
+    changed = [label for label, _ in _RULE_FIELD_ORDER if before and after and bf.get(label) != af.get(label)]
+    return {
+        "change_type": change_type,
+        "rule_uid": uid,
+        "name": (af or bf).get("name", ""),
+        "before": bf,
+        "after": af,
+        "changed_fields": changed,
+    }
+
+
+def compare_revisions(
+    client,
+    device_id: str,
+    *,
+    old_rev: Optional[str] = None,
+    new_rev: Optional[str] = None,
+) -> dict:
+    """Compare two revisions of one device's policy (SecureTrack-style report).
+
+    Produces a *Summary* (New/Deleted/Modified/Moved counts for Security Rules
+    and Network Objects) plus a per-rule and per-object before→after detail.
+    With ``old_rev``/``new_rev`` omitted, compares the device's latest two
+    revisions. Given both, the numerically smaller id is the *before* baseline
+    so the report always reads oldest→newest regardless of pick order.
+    """
+    revisions = _revisions_sorted(client, device_id)
+    by_id = {_rev_id(r): r for r in revisions}
+    name = ""
+    for device in _fetch_devices(client):
+        did, dname = _device_key(device)
+        if did == str(device_id):
+            name = dname
+            break
+
+    if old_rev or new_rev:
+        ids = [str(x) for x in (old_rev, new_rev) if x not in (None, "")]
+        ids = sorted(set(ids), key=_order_key)
+        old_id = ids[0]
+        new_id = ids[-1] if len(ids) > 1 else ids[0]
+        older = by_id.get(old_id, {"id": old_id})
+        newer = by_id.get(new_id, {"id": new_id})
+    elif len(revisions) >= 2:
+        older, newer = revisions[-2], revisions[-1]
+        old_id, new_id = _rev_id(older), _rev_id(newer)
+    elif revisions:
+        older, newer = {}, revisions[-1]
+        old_id, new_id = "", _rev_id(newer)
+    else:
+        return {
+            "device": {"id": str(device_id), "name": name},
+            "error": "device has no revisions",
+            "summary": [], "rules": [], "objects": [],
+        }
+
+    before_rules = _revision_rules(client, old_id) if old_id else {}
+    after_rules = _revision_rules(client, new_id) if new_id else {}
+
+    # Moved detection: rules common to both, in each revision's rulebase order.
+    common_before = [u for u in before_rules if u in after_rules]
+    common_after = [u for u in after_rules if u in before_rules]
+    on_lcs = _lcs_keep(common_before, common_after)
+
+    rule_rows: List[dict] = []
+    counts = {"added": 0, "removed": 0, "modified": 0, "moved": 0}
+    for uid, after in after_rules.items():
+        before = before_rules.get(uid)
+        if before is None:
+            ctype = "added"
+        elif _rule_fingerprint(before) != _rule_fingerprint(after):
+            ctype = "modified"
+        elif uid not in on_lcs:
+            ctype = "moved"
+        else:
+            continue  # unchanged
+        counts[ctype] += 1
+        rule_rows.append(_rule_change_entry(ctype, uid, before, after))
+    for uid, before in before_rules.items():
+        if uid not in after_rules:
+            counts["removed"] += 1
+            rule_rows.append(_rule_change_entry("removed", uid, before, None))
+
+    before_objs = _revision_objects(client, old_id) if old_id else {}
+    after_objs = _revision_objects(client, new_id) if new_id else {}
+    obj_rows: List[dict] = []
+    obj_counts = {"added": 0, "removed": 0, "modified": 0}
+    for key, after in after_objs.items():
+        before = before_objs.get(key)
+        if before is None:
+            ctype = "added"
+        elif _object_fingerprint(before) != _object_fingerprint(after):
+            ctype = "modified"
+        else:
+            continue
+        obj_counts[ctype] += 1
+        obj_rows.append({
+            "change_type": ctype, "name": key,
+            "before": _object_display(before) if before else "",
+            "after": _object_display(after) if after else "",
+        })
+    for key, before in before_objs.items():
+        if key not in after_objs:
+            obj_counts["removed"] += 1
+            obj_rows.append({
+                "change_type": "removed", "name": key,
+                "before": _object_display(before), "after": "",
+            })
+
+    auth_status, requester = _authorization(client, old_id, new_id) if (old_id and new_id) else ("", "")
+
+    _rank = {"added": 0, "removed": 1, "modified": 2, "moved": 3}
+    rule_rows.sort(key=lambda r: (_rank.get(r["change_type"], 9), _order_key(r["rule_uid"])))
+    obj_rows.sort(key=lambda r: (_rank.get(r["change_type"], 9), r["name"]))
+
+    return {
+        "device": {"id": str(device_id), "name": name},
+        "from": _rev_meta(older) if older else {"id": old_id},
+        "to": _rev_meta(newer) if newer else {"id": new_id},
+        "authorization": {"status": auth_status, "requester": requester},
+        "summary": [
+            {"category": "Security Rules", "added": counts["added"], "deleted": counts["removed"],
+             "modified": counts["modified"], "moved": counts["moved"]},
+            {"category": "Network Objects", "added": obj_counts["added"], "deleted": obj_counts["removed"],
+             "modified": obj_counts["modified"], "moved": 0},
+        ],
+        "rule_fields": [label for label, _ in _RULE_FIELD_ORDER],
+        "rules": rule_rows,
+        "objects": obj_rows,
+    }
+
+
+def list_devices(client) -> List[Dict[str, str]]:
+    """Lightweight {id, name, model} list for a revision-comparison device picker."""
+    out: List[Dict[str, str]] = []
+    for device in _fetch_devices(client):
+        did, name = _device_key(device)
+        out.append({"id": did, "name": name, "model": textish(_first(device, "model", "vendor"))})
+    return out
+
+
+def list_revisions(client, device_id: str) -> List[Dict[str, str]]:
+    """Newest-first revision metadata for a device (for the comparison picker)."""
+    revs = _revisions_sorted(client, device_id)
+    return [_rev_meta(r) for r in reversed(revs)]
+
+
 _COLLECTORS: Dict[str, Callable[..., Tuple[List[str], List[List[Any]]]]] = {
     "devices": _collect_devices,
     "revisions": _collect_revisions,
