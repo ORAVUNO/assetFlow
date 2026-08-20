@@ -126,10 +126,16 @@ queries:
       - device.vendor      # DetailedDeviceDTO.vendor
       - device.model       # DetailedDeviceDTO.model
       - virtual_type       # DetailedDeviceDTO.virtual_type (vsys/vdom/context)
+      - context_name       # DetailedDeviceDTO.context_name (virtual context)
       - host.ip            # DetailedDeviceDTO.ip
       - os.version         # DetailedDeviceDTO.OS_Version
       - device.domain      # DetailedDeviceDTO.domain_name
+      - domain.id          # DetailedDeviceDTO.domain_id (multi-domain scoping)
       - device.status      # DetailedDeviceDTO.status / offline
+      - latest_revision    # DetailedDeviceDTO.latest_revision (current revision id)
+      - module_type        # DetailedDeviceDTO.module_type (managed module)
+      - module_uid         # DetailedDeviceDTO.module_uid
+      - topology           # DetailedDeviceDTO.topology (in the topology map)
       - installed_policy   # DetailedDeviceDTO.installed_policy
     notes: >-
       GET /securetrack/api/devices.json?show_os_version=true. Fields confirmed
