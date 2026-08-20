@@ -196,6 +196,30 @@ def test_kinds_listing(client):
     assert "elasticsearch" in kinds and "tufin" in kinds
 
 
+def test_new_kind_seeded_on_existing_db(monkeypatch, tmp_path):
+    # An adapter kind added *after* the database already has connections must
+    # still appear on the gallery — a default connection is seeded for any kind
+    # that has none yet, not only when the whole table is empty.
+    monkeypatch.setattr(client_mod, "build_client", lambda **kw: object())
+    monkeypatch.setattr(client_mod, "build_client_from_env", lambda: object())
+    monkeypatch.setattr(client_mod, "ping", lambda cl: {"cluster_name": "t", "version": "8"})
+    from assetflow import db
+
+    url = f"sqlite:///{tmp_path}/t.db"
+    # Pre-populate as if this db predates the newer kinds: only elasticsearch.
+    db.init_engine(url)
+    db.add_connection("elasticsearch", "elasticsearch", "Elasticsearch")
+
+    app = webapp.create_app(str(REGISTRY_PATH), db_url=url)
+    c = TestClient(app)
+    ids = {a["id"] for cat in c.get("/api/adapters").json()["categories"]
+           for a in cat["adapters"]}
+    available = {k["kind"] for k in c.get("/api/kinds").json()["kinds"]}
+    # every available kind now has a default instance on the gallery
+    assert available <= ids
+    assert "tufin" in ids  # a kind absent from the pre-populated db got seeded
+
+
 def test_multiple_connections_lifecycle(client):
     # default per-kind connections are seeded on a fresh db
     cats = client.get("/api/adapters").json()["categories"]

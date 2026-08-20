@@ -99,14 +99,17 @@ def create_app(
 
     # Adapter kinds are templates; connections (instances) are persisted in the
     # database so multiple instances of a kind — e.g. two Tufin servers — survive
-    # restarts. On a fresh database, seed one default connection per kind.
+    # restarts. Seed a default connection (id == kind) for any kind that has none
+    # yet, so a newly-added adapter kind appears on an *existing* database too —
+    # not only on a fresh one. Kinds with an existing connection are left as-is.
     kinds = adapters_mod.available_kinds(registry_path)
     manager = adapters_mod.AdapterManager(kinds)
     conns = db.list_connections()
-    if not conns:
-        for kind in kinds.values():
+    kinds_with_conn = {c["kind"] for c in conns}
+    for kind in kinds.values():
+        if kind.kind not in kinds_with_conn:
             db.add_connection(kind.kind, kind.kind, kind.name)
-        conns = db.list_connections()
+    conns = db.list_connections()
     for c in conns:
         if c["kind"] in kinds:
             manager.add_instance(c["kind"], c["label"], instance_id=c["id"])
