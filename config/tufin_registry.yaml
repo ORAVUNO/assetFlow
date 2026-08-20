@@ -101,6 +101,13 @@ feeds:
     query_ids: [TUF008]
     recommended_refresh_frequency: Every 5-15 minutes
 
+  - id: FEED-TUF-REV-RULES
+    name: Revision Rulebases
+    category: Policy Rules
+    description: Per-revision rulebase snapshots that power the Compare Revisions and Revision Policy views — fetch once, then compare/view offline.
+    query_ids: [TUF009]
+    recommended_refresh_frequency: Daily
+
 # =============================================================================
 # QUERIES (resources)
 # =============================================================================
@@ -322,3 +329,46 @@ queries:
       (several REST calls per device), so the device scan is capped. This is the
       change-intelligence headline — pair it with TUF002 (raw revision history).
     recommended_refresh_frequency: Every 5-15 minutes
+
+  - id: TUF009
+    category: Policy Rules
+    name: Revision Rulebases (Snapshot)
+    status: validated
+    validated: true
+    resource: revision_rules
+    purpose: >-
+      Snapshot the full rulebase of each device's recent revisions into the
+      database, so the Compare Revisions and Revision Policy views can diff and
+      display them offline — fetch once, then compare the fetched data.
+    expected_output_fields:
+      - host.name          # device
+      - device.id
+      - revision.id        # the snapshotted revision
+      - revision.number
+      - "@timestamp"       # revision date + time
+      - changed_by         # RevisionDTO.admin
+      - rule.uid
+      - rule.name
+      - src_zone
+      - source
+      - dst_zone
+      - destination
+      - service
+      - action
+      - track
+      - disabled
+      - comment
+    notes: >-
+      For each device (scan capped), the recent revisions are selected — the
+      latest 5 by default, or every revision within the time-range window
+      (24h/7d/30d/90d), capped at 30 — and each revision's rulebase is pulled
+      (GET /securetrack/api/revisions/{id}/rules.json) and flattened to one row
+      per rule, tagged with the revision id/number/date/admin. This is the
+      persisted backing store for the "🔀 Compare Revisions" and "📜 Revision
+      Policy" overviews: they read the latest saved snapshot and compute the
+      New/Deleted/Modified/Moved diff (and the full per-revision rulebase) from
+      these rows — no live SecureTrack call at view time. Heavier than the other
+      resources (a rules call per revision per device), so refresh it on a
+      schedule or via Fetch-all rather than constantly. Widen the time range to
+      capture more history for comparison.
+    recommended_refresh_frequency: Daily

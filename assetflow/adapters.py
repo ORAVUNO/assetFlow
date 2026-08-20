@@ -262,27 +262,6 @@ class TufinAdapter(Adapter):
             self._client, query, limit=limit, time_range=time_range, watermark_store=store
         )
 
-    def _require_client(self):
-        if self._client is None:
-            raise tufin_client_mod.TufinConfigError("adapter is not connected")
-        return self._client
-
-    def list_devices(self) -> list:
-        return tufin_runner_mod.list_devices(self._require_client())
-
-    def list_revisions(self, device_id: str) -> list:
-        return tufin_runner_mod.list_revisions(self._require_client(), device_id)
-
-    def compare_revisions(self, device_id: str, old_rev=None, new_rev=None) -> dict:
-        return tufin_runner_mod.compare_revisions(
-            self._require_client(), device_id, old_rev=old_rev, new_rev=new_rev
-        )
-
-    def revision_rulebase(self, device_id: str, revision_id=None) -> dict:
-        return tufin_runner_mod.revision_rulebase(
-            self._require_client(), device_id, revision_id=revision_id
-        )
-
 
 class VMwareAdapter(Adapter):
     """VMware vCenter source: fetches full inventory — virtual machines
