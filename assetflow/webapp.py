@@ -397,10 +397,14 @@ def create_app(
         new_rev: Optional[str] = QueryParam(default=None),
     ) -> dict:
         rec = _saved_revision_rules(adapter_id)
+        obj = db.latest_fetch(adapter_id, "TUF010")  # optional network-object snapshot
         out = tufin_runner_mod.compare_from_saved(
-            rec["columns"], rec["rows"], device_id, old_rev=old_rev, new_rev=new_rev
+            rec["columns"], rec["rows"], device_id, old_rev=old_rev, new_rev=new_rev,
+            object_columns=(obj["columns"] if obj else None),
+            object_rows=(obj["rows"] if obj else None),
         )
         out["ran_at"] = rec.get("ran_at")
+        out["objects_ran_at"] = obj.get("ran_at") if obj else None
         return out
 
     @app.get("/api/adapters/{adapter_id}/tufin/revision-policy")
@@ -1523,6 +1527,25 @@ function renderRevCompare(d){
     rules.forEach(r=>{ h+='<tr class="row-'+r.change_type+'"><td>'+rcTag(r.change_type)+'</td><td>'+esc(r.rule_uid)+'</td>'+
       flds.map(lbl=>'<td class="rcfld">'+rcCell(r,lbl)+'</td>').join('')+'</tr>'; });
     h+='</tbody></table></div>';
+  }
+  // Network objects — only when a TUF010 snapshot was fetched.
+  if(!d.has_objects){
+    h+='<div class="sheethdr">Network object changes</div>'+
+      '<p class="hint">Run <b>TUF010 — Revision Objects</b> (or <b>Fetch all</b>) to also detect '+
+      'network-object edits — changes to a host/subnet/group that alter what a rule permits '+
+      'without the rule text changing.</p>';
+  }else{
+    const ofl=d.object_fields||['name','type','value','comment'];
+    const objs=d.objects||[];
+    h+='<div class="sheethdr">Network object changes ('+objs.length+')</div>';
+    if(!objs.length) h+='<p class="hint">No network-object changes between these revisions.</p>';
+    else{
+      h+='<div class="tablewrap"><table><thead><tr><th>Change</th><th>object.uid</th>'+
+        ofl.map(x=>'<th>'+esc(x)+'</th>').join('')+'</tr></thead><tbody>';
+      objs.forEach(o=>{ h+='<tr class="row-'+o.change_type+'"><td>'+rcTag(o.change_type)+'</td><td>'+esc(o.object_uid)+'</td>'+
+        ofl.map(lbl=>'<td class="rcfld">'+rcCell(o,lbl)+'</td>').join('')+'</tr>'; });
+      h+='</tbody></table></div>';
+    }
   }
   return h;
 }
