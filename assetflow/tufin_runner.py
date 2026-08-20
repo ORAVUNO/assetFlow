@@ -854,9 +854,65 @@ def _collect_revision_rules(
     return REVISION_RULE_COLUMNS, rows
 
 
+# Per-revision network-object snapshot (persisted by TUF010). A rule can point
+# at a named object (a host, subnet, or group); editing that object changes what
+# every rule referencing it permits, while the rule text stays identical — so
+# object-level diffing catches "hidden" scope changes rule diffing cannot see.
+REVISION_OBJECT_COLUMNS = [
+    "host.name", "device.id", "revision.id", "revision.number", "@timestamp", "changed_by",
+    "object.uid", "object.name", "object.type", "object.value", "comment",
+]
+# (label shown in the compare detail  ->  column in REVISION_OBJECT_COLUMNS)
+_OBJECT_FIELDS: List[Tuple[str, str]] = [
+    ("name", "object.name"), ("type", "object.type"),
+    ("value", "object.value"), ("comment", "comment"),
+]
+
+
+def _object_value(obj: dict) -> str:
+    """Render an object's addresses/members — the part that defines its effect."""
+    ip = textish(_first(obj, "ip", "ip_address", "value"))
+    if ip:
+        netmask = textish(_first(obj, "netmask"))
+        return f"{ip}/{netmask}" if netmask and "/" not in ip else ip
+    members = _first(obj, "members", "member")
+    return textish(members) if members else ""
+
+
+def _collect_revision_objects(
+    client, scan: int, time_range: Optional[str] = None
+) -> Tuple[List[str], List[List[Any]]]:
+    """Snapshot each device's recent revisions' network objects into flat rows."""
+    rows: List[List[Any]] = []
+    for device in _fetch_devices(client)[:scan]:
+        device_id, name = _device_key(device)
+        revisions = _revisions_sorted(client, device_id)
+        for rev in _select_recent_revisions(
+            revisions, time_range, DEFAULT_REVISION_HISTORY, MAX_REVISION_HISTORY
+        ):
+            rid = _rev_id(rev)
+            number = str(_first(rev, "revisionId"))
+            when = _join_datetime(rev)
+            admin = textish(_first(rev, "admin", "admin_name", "changed_by", "user"))
+            payload = _first_payload(
+                client,
+                (f"revisions/{rid}/network_objects.json", f"revisions/{rid}/network_objects"),
+            )
+            for obj in unwrap_items(payload, ("network_objects", "network_object")):
+                uid = str(_first(obj, "uid", "id", "display_name", "name"))
+                rows.append([
+                    name, device_id, rid, number, when, admin, uid,
+                    textish(_first(obj, "display_name", "name")),
+                    textish(_first(obj, "@xsi.type", "type", "class_name")),
+                    _object_value(obj),
+                    textish(_first(obj, "comment")),
+                ])
+    return REVISION_OBJECT_COLUMNS, rows
+
+
 # --------------------------------------------------------------------------- #
 # Revision comparison / policy view — computed from the SAVED snapshot rows
-# (no live client), so they read whatever the last TUF009 fetch persisted.
+# (no live client), so they read whatever the last TUF009/TUF010 fetch persisted.
 # --------------------------------------------------------------------------- #
 
 def _colmap(columns: List[Any]) -> Tuple[List[str], Dict[str, int]]:
@@ -904,6 +960,60 @@ def _saved_fingerprint(fields: Dict[str, str]) -> str:
     return " | ".join(fields.get(k, "") for k in ("source", "destination", "service", "action", "disabled"))
 
 
+def _device_revision_objects(
+    columns: List[Any], rows: List[List[Any]], device_id: str
+) -> Dict[str, dict]:
+    """Group saved TUF010 rows for one device into rev_id -> {objects{uid->fields}}."""
+    _names, idx = _colmap(columns)
+
+    def cell(row: List[Any], key: str) -> str:
+        i = idx.get(key)
+        return str(row[i]) if i is not None and i < len(row) and row[i] is not None else ""
+
+    revs: Dict[str, dict] = {}
+    for row in rows:
+        if str(device_id) not in (cell(row, "device.id"), cell(row, "host.name")):
+            continue
+        rid = cell(row, "revision.id")
+        if not rid:
+            continue
+        rev = revs.setdefault(rid, {"objects": {}})
+        rev["objects"][cell(row, "object.uid")] = {label: cell(row, col) for label, col in _OBJECT_FIELDS}
+    return revs
+
+
+def _saved_obj_fingerprint(fields: Dict[str, str]) -> str:
+    return " | ".join(fields.get(k, "") for k in ("type", "value"))
+
+
+def _diff_saved_objects(revs: Dict[str, dict], old_id: str, new_id: str) -> Tuple[dict, List[dict]]:
+    """Added/removed/modified network objects between two revisions (no 'moved')."""
+    before = revs.get(old_id, {}).get("objects", {})
+    after = revs.get(new_id, {}).get("objects", {})
+    counts = {"added": 0, "removed": 0, "modified": 0}
+    obj_rows: List[dict] = []
+    for uid, af in after.items():
+        bf = before.get(uid)
+        if bf is None:
+            ctype = "added"
+        elif _saved_obj_fingerprint(bf) != _saved_obj_fingerprint(af):
+            ctype = "modified"
+        else:
+            continue
+        counts[ctype] += 1
+        changed = [label for label, _ in _OBJECT_FIELDS if bf and bf.get(label) != af.get(label)]
+        obj_rows.append({"change_type": ctype, "object_uid": uid, "name": af.get("name", ""),
+                         "before": bf or {}, "after": af, "changed_fields": changed})
+    for uid, bf in before.items():
+        if uid not in after:
+            counts["removed"] += 1
+            obj_rows.append({"change_type": "removed", "object_uid": uid, "name": bf.get("name", ""),
+                             "before": bf, "after": {}, "changed_fields": []})
+    rank = {"added": 0, "removed": 1, "modified": 2}
+    obj_rows.sort(key=lambda r: (rank.get(r["change_type"], 9), r["object_uid"]))
+    return counts, obj_rows
+
+
 def index_revision_rules(columns: List[Any], rows: List[List[Any]]) -> List[dict]:
     """Devices (with their revisions, newest first) present in the saved snapshot."""
     _names, idx = _colmap(columns)
@@ -935,6 +1045,7 @@ def index_revision_rules(columns: List[Any], rows: List[List[Any]]) -> List[dict
 def compare_from_saved(
     columns: List[Any], rows: List[List[Any]], device_id: str,
     old_rev: Optional[str] = None, new_rev: Optional[str] = None,
+    object_columns: Optional[List[Any]] = None, object_rows: Optional[List[List[Any]]] = None,
 ) -> dict:
     """Compare two saved revisions of one device (SecureTrack-style report).
 
@@ -942,6 +1053,11 @@ def compare_from_saved(
     New/Deleted/Modified/Moved security rules plus per-rule before→after detail.
     Omitting the revisions compares the device's latest two *saved* revisions;
     given both, they are ordered oldest→newest so the report reads forward.
+
+    When a TUF010 network-object snapshot is supplied (``object_columns`` /
+    ``object_rows``), a Network Objects summary and per-object before→after
+    detail for the same two revisions are appended — catching object edits that
+    change what a rule permits without the rule text changing.
     """
     name, revs = _device_revision_rules(columns, rows, device_id)
     base = {"device": {"id": str(device_id), "name": name}, "summary": [], "rules": []}
@@ -993,7 +1109,7 @@ def compare_from_saved(
     rank = {"added": 0, "removed": 1, "modified": 2, "moved": 3}
     rule_rows.sort(key=lambda r: (rank.get(r["change_type"], 9), _order_key(r["rule_uid"])))
 
-    return {
+    out = {
         "device": {"id": str(device_id), "name": name},
         "from": revs.get(old_id, {}).get("meta", {"id": old_id}),
         "to": revs.get(new_id, {}).get("meta", {"id": new_id}),
@@ -1003,7 +1119,20 @@ def compare_from_saved(
         ],
         "rule_fields": [label for label, _ in _COMPARE_FIELDS],
         "rules": rule_rows,
+        "has_objects": object_columns is not None,
     }
+
+    if object_columns is not None:
+        orevs = _device_revision_objects(object_columns, object_rows or [], device_id)
+        if old_id in orevs or new_id in orevs:
+            ocounts, obj_rows = _diff_saved_objects(orevs, old_id, new_id)
+            out["summary"].append(
+                {"category": "Network Objects", "added": ocounts["added"], "deleted": ocounts["removed"],
+                 "modified": ocounts["modified"], "moved": 0}
+            )
+            out["object_fields"] = [label for label, _ in _OBJECT_FIELDS]
+            out["objects"] = obj_rows
+    return out
 
 
 def policy_from_saved(
@@ -1043,6 +1172,7 @@ _COLLECTORS: Dict[str, Callable[..., Tuple[List[str], List[List[Any]]]]] = {
     "zones": _collect_zones,
     "change_detail": _collect_change_detail,
     "revision_rules": _collect_revision_rules,
+    "revision_objects": _collect_revision_objects,
 }
 
 
@@ -1077,6 +1207,8 @@ def run_query(
         # Selects its own revision set from the time range; the @timestamp is a
         # revision date and must not be used to drop baseline revisions.
         columns, rows = _collect_revision_rules(client, device_scan_limit, time_range)
+    elif resource == "revision_objects":
+        columns, rows = _collect_revision_objects(client, device_scan_limit, time_range)
     else:
         columns, rows = collector(client, device_scan_limit)
         rows = _apply_time_range(columns, rows, time_range)

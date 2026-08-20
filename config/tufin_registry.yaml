@@ -102,10 +102,10 @@ feeds:
     recommended_refresh_frequency: Every 5-15 minutes
 
   - id: FEED-TUF-REV-RULES
-    name: Revision Rulebases
+    name: Revision Snapshots
     category: Policy Rules
-    description: Per-revision rulebase snapshots that power the Compare Revisions and Revision Policy views — fetch once, then compare/view offline.
-    query_ids: [TUF009]
+    description: Per-revision rulebase and network-object snapshots that power the Compare Revisions and Revision Policy views — fetch once, then compare/view offline.
+    query_ids: [TUF009, TUF010]
     recommended_refresh_frequency: Daily
 
 # =============================================================================
@@ -371,4 +371,43 @@ queries:
       resources (a rules call per revision per device), so refresh it on a
       schedule or via Fetch-all rather than constantly. Widen the time range to
       capture more history for comparison.
+    recommended_refresh_frequency: Daily
+
+  - id: TUF010
+    category: Network Objects & Services
+    name: Revision Objects (Snapshot)
+    status: validated
+    validated: true
+    resource: revision_objects
+    purpose: >-
+      Snapshot each device's recent revisions' network objects into the
+      database, so Compare Revisions can also detect object-level changes — an
+      edit to a host/subnet/group that alters what a rule permits without the
+      rule text changing.
+    expected_output_fields:
+      - host.name          # device
+      - device.id
+      - revision.id        # the snapshotted revision
+      - revision.number
+      - "@timestamp"       # revision date + time
+      - changed_by         # RevisionDTO.admin
+      - object.uid
+      - object.name
+      - object.type        # host / subnet / range / group …
+      - object.value       # ip[/netmask], or the group's members
+      - comment
+    notes: >-
+      For each device and each selected revision (same selection as TUF009 — the
+      latest 5, or the time-range window, capped at 30) the revision's network
+      objects are pulled (GET /securetrack/api/revisions/{id}/network_objects.json)
+      and flattened to one row per object, tagged with the revision id/number/
+      date/admin. This is the object-level backing store for the "🔀 Compare
+      Revisions" view: when present, it adds a Network Objects summary
+      (New/Deleted/Modified) and per-object before→after detail for the two
+      compared revisions. Because a rule usually references named objects rather
+      than raw addresses, editing an object changes what every rule using it
+      permits while the rule text stays identical — object diffing surfaces those
+      "hidden" scope changes that rule diffing cannot see. Roughly doubles the
+      cost of a snapshot (an extra objects call per revision per device), so pair
+      it with TUF009 on the same refresh schedule.
     recommended_refresh_frequency: Daily

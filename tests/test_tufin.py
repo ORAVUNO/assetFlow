@@ -67,7 +67,7 @@ DEVICES = {
 def test_tufin_registry_loads_and_validates():
     reg = load_registry(str(TUFIN_REGISTRY))
     assert reg.metadata.version == 1
-    assert len(reg.queries) == 9
+    assert len(reg.queries) == 10
     assert len(reg.feeds) == 8
     # every query names a resource the runner knows how to fetch
     for q in reg.queries:
@@ -500,7 +500,7 @@ def test_tufin_adapter_registered():
     a = manager.get("tufin")
     assert a.info.kind == "tufin"
     assert a.info.category == "Network Security Policy"
-    assert len(a.registry.queries) == 9
+    assert len(a.registry.queries) == 10
 
 
 def test_connect_form_and_run(monkeypatch):
@@ -566,6 +566,15 @@ def _compare_mapping():
         {"uid": "r30", "src_network": "196.10.15.20", "dst_network": "vpn", "dst_service": "tcp/3389",
          "action": "accept"},
     ]}
+    # o1 modified (ip .9 -> .10); o2 added; o3 removed.
+    mapping["revisions/100/network_objects.json"] = {"network_objects": [
+        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.9"},
+        {"uid": "o3", "display_name": "old-host", "type": "host", "ip": "10.0.0.3"},
+    ]}
+    mapping["revisions/101/network_objects.json"] = {"network_objects": [
+        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.10"},
+        {"uid": "o2", "display_name": "srv-b", "type": "host", "ip": "10.0.0.20"},
+    ]}
     return mapping
 
 
@@ -573,6 +582,12 @@ def _snapshot():
     """Run the TUF009 collector and return its (columns, rows) — the saved shape
     the compare/policy views read back."""
     result = tufin_runner_mod.run_query(FakeClient(_compare_mapping()), _q("revision_rules"))
+    return result.columns, result.rows
+
+
+def _object_snapshot():
+    """Run the TUF010 collector and return its (columns, rows)."""
+    result = tufin_runner_mod.run_query(FakeClient(_compare_mapping()), _q("revision_objects"))
     return result.columns, result.rows
 
 
@@ -617,6 +632,43 @@ def test_compare_from_saved_explicit_ids_ordered_and_missing_errors():
     # Unknown device -> needs a fetch.
     none = tufin_runner_mod.compare_from_saved(cols, rows, "nope")
     assert "error" in none and none["rules"] == []
+
+
+def test_revision_objects_collector_snapshots_recent_revisions():
+    cols, rows = _object_snapshot()
+    names = [c["name"] for c in cols]
+    assert names[:7] == ["host.name", "device.id", "revision.id", "revision.number",
+                         "@timestamp", "changed_by", "object.uid"]
+    # rev 100 has o1+o3, rev 101 has o1+o2.
+    assert len(rows) == 4
+    val = names.index("object.value")
+    by = {(r[names.index("revision.id")], r[names.index("object.uid")]): r for r in rows}
+    assert by[("100", "o1")][val] == "10.0.0.9" and by[("101", "o1")][val] == "10.0.0.10"
+
+
+def test_compare_from_saved_without_objects_flags_has_objects_false():
+    cols, rows = _snapshot()
+    d = tufin_runner_mod.compare_from_saved(cols, rows, "1")
+    assert d["has_objects"] is False
+    assert all(s["category"] != "Network Objects" for s in d["summary"])
+    assert "objects" not in d
+
+
+def test_compare_from_saved_includes_object_changes():
+    cols, rows = _snapshot()
+    ocols, orows = _object_snapshot()
+    d = tufin_runner_mod.compare_from_saved(
+        cols, rows, "1", object_columns=ocols, object_rows=orows
+    )
+    assert d["has_objects"] is True
+    objsum = {s["category"]: s for s in d["summary"]}["Network Objects"]
+    assert objsum["added"] == 1 and objsum["deleted"] == 1 and objsum["modified"] == 1
+
+    by = {(o["change_type"], o["object_uid"]): o for o in d["objects"]}
+    assert ("added", "o2") in by and ("removed", "o3") in by
+    mod = by[("modified", "o1")]
+    assert "value" in mod["changed_fields"]
+    assert mod["before"]["value"] == "10.0.0.9" and mod["after"]["value"] == "10.0.0.10"
 
 
 def test_index_revision_rules_lists_devices_newest_first():
