@@ -824,9 +824,39 @@ def test_fetch_list_paginates_the_device_list():
     assert len(result.rows) == 300  # 40 > 25 and 300 > 200 — the whole estate
 
 
-def test_fetch_list_single_page_when_no_total_advertised():
-    # A payload without `total` is treated as non-paginated (one page).
+def test_fetch_list_single_page_when_short_page_no_total():
+    # A short page (< requested size) with no `total` ends after one call.
     mapping = dict(DEVICES)
     mapping["devices/1/rules.json"] = {"rules": [{"uid": "r1", "action": "accept"}]}
     result = tufin_runner_mod.run_query(FakeClient(mapping), _q("rules"))
     assert len(result.rows) == 1
+
+
+class NoTotalPagingClient:
+    """Pages by start/count but never advertises `total` — the runner must keep
+    paging while a page comes back full and stop on the first short page."""
+
+    def __init__(self, base_key, env_key, items, page):
+        self.base_key, self.env_key, self.items, self.page = base_key, env_key, items, page
+        self.host = "tufin.test"
+
+    def get(self, path):
+        base, _, query = path.partition("?")
+        params = {}
+        for kv in query.split("&"):
+            if kv.startswith(("start=", "count=")):
+                k, v = kv.split("=")
+                params[k] = int(v)
+        if base == self.base_key:
+            start = params.get("start", 0)
+            count = min(params.get("count", self.page), self.page)
+            return {self.env_key: self.items[start:start + count]}  # no total
+        raise RuntimeError(f"404 {path}")
+
+
+def test_fetch_list_pages_without_total_via_full_page_signal(monkeypatch):
+    monkeypatch.setenv("TUFIN_PAGE_SIZE", "3")  # server caps at 3, exposes no total
+    items = [{"uid": f"r{i}"} for i in range(7)]
+    client = NoTotalPagingClient("x/rules.json", "rules", items, page=3)
+    got = tufin_runner_mod._fetch_list(client, ("x/rules.json",), ("rules", "rule"))
+    assert len(got) == 7  # 3 + 3 + 1, not just the first full page of 3
