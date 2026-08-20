@@ -31,9 +31,12 @@ _SECTIONS = ("rules", "objects", "services", "zones", "revisions", "cleanups")
 # device-inventory column -> top-level device attribute
 _DEVICE_ATTRS = [
     ("device.id", "id"), ("asset.type", "asset_type"), ("device.vendor", "vendor"),
-    ("device.model", "model"), ("virtual_type", "virtual_type"), ("host.ip", "ip"),
-    ("os.version", "os_version"), ("device.domain", "domain"),
-    ("device.status", "status"), ("installed_policy", "installed_policy"),
+    ("device.model", "model"), ("virtual_type", "virtual_type"),
+    ("context_name", "context_name"), ("host.ip", "ip"),
+    ("os.version", "os_version"), ("device.domain", "domain"), ("domain.id", "domain_id"),
+    ("device.status", "status"), ("latest_revision", "latest_revision"),
+    ("module_type", "module_type"), ("topology", "topology"),
+    ("installed_policy", "installed_policy"),
 ]
 
 # change-log columns copied into each device's recent-changes list
@@ -76,8 +79,9 @@ def build_profile(
         if d is None:
             d = devices[name] = {
                 "name": name, "id": "", "asset_type": "", "vendor": "", "model": "",
-                "virtual_type": "", "ip": "", "os_version": "", "domain": "",
-                "status": "", "installed_policy": "",
+                "virtual_type": "", "context_name": "", "ip": "", "os_version": "",
+                "domain": "", "domain_id": "", "status": "", "latest_revision": "",
+                "module_type": "", "topology": "", "installed_policy": "",
                 "revisions": [], "rules": [], "objects": [], "services": [],
                 "zones": [], "cleanups": [],
                 "changes": {"total": 0, "added": 0, "removed": 0, "modified": 0,

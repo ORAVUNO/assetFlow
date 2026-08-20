@@ -361,11 +361,15 @@ def _asset_type(device: dict, parent_ids: set) -> str:
 
 
 def _collect_devices(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
-    # Field names confirmed against DetailedDeviceDTO (SecureTrack R25-2).
+    # Field names confirmed against DetailedDeviceDTO (SecureTrack R25-2) — the
+    # full DTO is surfaced: identity, vendor/model, virtual context, IP/OS, the
+    # domain (name + id, for multi-domain estates), status, the latest revision
+    # id, the managed-module type/uid, and whether it is in the topology map.
     columns = [
         "host.name", "device.id", "asset.type", "device.vendor", "device.model",
-        "virtual_type", "host.ip", "os.version", "device.domain", "device.status",
-        "installed_policy",
+        "virtual_type", "context_name", "host.ip", "os.version",
+        "device.domain", "domain.id", "device.status", "latest_revision",
+        "module_type", "module_uid", "topology", "installed_policy",
     ]
     devices = _fetch_devices(client)
     # A device that manages others (its id is some device's parent_id) is mgmt.
@@ -385,10 +389,16 @@ def _collect_devices(client, scan: int) -> Tuple[List[str], List[List[Any]]]:
             textish(_first(device, "vendor", "vendor_name")),
             textish(_first(device, "model", "type", "device_type")),
             textish(_first(device, "virtual_type")),
+            textish(_first(device, "context_name")),
             textish(_first(device, "ip", "management_ip", "host")),
             textish(_first(device, "OS_Version", "os_version", "version")),
             textish(_first(device, "domain_name", "domain")),
+            textish(_first(device, "domain_id")),
             status,
+            textish(_first(device, "latest_revision", "revision_id", "revision")),
+            textish(_first(device, "module_type")),
+            textish(_first(device, "module_uid")),
+            textish(_first(device, "topology")),
             textish(_first(device, "installed_policy")),
         ])
     return columns, rows

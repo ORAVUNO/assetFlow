@@ -104,6 +104,27 @@ def test_devices_derive_asset_type():
     assert by_name["Core-RTR"]["asset.type"] == "Router/Switch"
 
 
+def test_devices_capture_full_dto():
+    # Exact DetailedDeviceDTO shape from a live SecureTrack (R25-2).
+    mapping = {"devices.json?show_os_version=true": {"devices": [{
+        "context_name": "", "domain_id": "1", "domain_name": "Default", "id": "77",
+        "ip": "192.168.104.91", "latest_revision": "3829", "model": "asa",
+        "module_type": "", "module_uid": "", "name": "KWL-FP4150-ASA-01",
+        "offline": False, "status": "Started", "topology": True, "vendor": "Cisco",
+        "virtual_type": "",
+    }]}}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("devices"))
+    row = dict(zip(result.column_names, result.rows[0]))
+    assert row["host.name"] == "KWL-FP4150-ASA-01"
+    assert row["device.id"] == "77"
+    assert row["device.domain"] == "Default" and row["domain.id"] == "1"
+    assert row["host.ip"] == "192.168.104.91"
+    assert row["latest_revision"] == "3829"
+    assert row["device.status"] == "Started"
+    assert row["topology"] == "True"
+    assert row["asset.type"] == "Firewall"
+
+
 def test_revisions_expose_who_what_when():
     # Shape mirrors SecureTrack R25-2 RevisionDTO: id/revisionId, split
     # date+time, admin, guiClient, nested comment, and a tickets wrapper.
