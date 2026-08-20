@@ -264,11 +264,13 @@ def _fetch_list(client, paths: Tuple[str, ...], keys: Tuple[str, ...]) -> List[d
 
     Tries each path variant (a paged request first, then the bare path for
     servers/endpoints that don't accept ``start``/``count``); for the first that
-    responds, reads the ``total`` the envelope reports and pages — advancing by
-    the count actually returned, so a server that caps the page size below the
-    request is still walked fully — until every item is collected. When the
-    envelope reports no ``total`` the shape isn't paginated (e.g. the nested
-    cleanup set, or a non-paging endpoint) and the single response is returned.
+    responds it pages, advancing by the count actually returned (so a server
+    that caps the page size below the request is still walked fully) until it
+    has everything. It stops using the envelope's ``total`` when present; when
+    no ``total`` is advertised it keeps paging only while a page comes back
+    *full* (== the requested size, i.e. there may be more) and stops on the
+    first short or empty page — so a genuinely single-page or non-paginated
+    shape (e.g. the nested cleanup set) makes exactly one call.
     """
     size = _page_size()
     for path in paths:
@@ -283,9 +285,13 @@ def _fetch_list(client, paths: Tuple[str, ...], keys: Tuple[str, ...]) -> List[d
             continue
         items = unwrap_items(payload, keys)
         total = _read_total(payload)
-        if total is None:
-            return items  # not a paginated envelope → one page is all there is
-        while len(items) < total and len(items) < _MAX_ITEMS:
+        last_len = len(items)
+        while len(items) < _MAX_ITEMS:
+            if total is not None:
+                if len(items) >= total:
+                    break
+            elif last_len < size:  # no total advertised → a short page ends it
+                break
             try:
                 payload = client.get(_page_path(path, len(items), size))
             except Exception:  # pragma: no cover
@@ -294,6 +300,7 @@ def _fetch_list(client, paths: Tuple[str, ...], keys: Tuple[str, ...]) -> List[d
             if not batch:
                 break
             items.extend(batch)
+            last_len = len(batch)
         return items
     return []
 
