@@ -789,225 +789,248 @@ def _order_key(rev_id: str):
         return (1, str(rev_id))
 
 
-def _revision_objects(client, revision_id: str) -> Dict[str, dict]:
-    payload = _first_payload(
-        client,
-        (f"revisions/{revision_id}/network_objects.json", f"revisions/{revision_id}/network_objects"),
-    )
-    out: Dict[str, dict] = {}
-    for obj in unwrap_items(payload, ("network_objects", "network_object")):
-        key = str(_first(obj, "uid", "id", "display_name", "name"))
-        if key:
-            out[key] = obj
+# Per-revision rulebase snapshot (persisted by TUF009). One row = one rule in
+# one revision of one device. The Compare / Policy views read these rows back
+# and diff them, so no live SecureTrack call is made at view time — you fetch
+# once (explicitly, or via Fetch-all / the scheduler) and compare the fetched
+# data, exactly like every other resource in the tool.
+REVISION_RULE_COLUMNS = [
+    "host.name", "device.id", "revision.id", "revision.number", "@timestamp", "changed_by",
+    "rule.uid", "rule.name", "src_zone", "source", "dst_zone", "destination",
+    "service", "action", "track", "disabled", "comment",
+]
+# (label shown in the compare detail  ->  column in REVISION_RULE_COLUMNS)
+_COMPARE_FIELDS: List[Tuple[str, str]] = [
+    ("name", "rule.name"), ("src_zone", "src_zone"), ("source", "source"),
+    ("dst_zone", "dst_zone"), ("destination", "destination"), ("service", "service"),
+    ("action", "action"), ("track", "track"), ("disabled", "disabled"), ("comment", "comment"),
+]
+# With no time range, how many of the most recent revisions to snapshot per
+# device; a time range (24h/7d/…) overrides this. Capped for safety.
+DEFAULT_REVISION_HISTORY = 5
+MAX_REVISION_HISTORY = 30
+
+
+def _select_recent_revisions(
+    revisions: List[dict], time_range: Optional[str], default_count: int, cap: int
+) -> List[dict]:
+    """Pick which revisions to snapshot: a time window, else the latest N."""
+    if not revisions:
+        return []
+    days = _RANGE_DAYS.get((time_range or "").lower())
+    if not days:
+        return revisions[-default_count:]
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    picked = [r for r in revisions if (_revision_time(r) is None or _revision_time(r) >= cutoff)]
+    if len(picked) < 2:  # always keep a baseline so at least one pair can be compared
+        picked = revisions[-2:]
+    return picked[-cap:]
+
+
+def _collect_revision_rules(
+    client, scan: int, time_range: Optional[str] = None
+) -> Tuple[List[str], List[List[Any]]]:
+    """Snapshot the rulebases of each device's recent revisions into flat rows."""
+    rows: List[List[Any]] = []
+    for device in _fetch_devices(client)[:scan]:
+        device_id, name = _device_key(device)
+        revisions = _revisions_sorted(client, device_id)
+        for rev in _select_recent_revisions(
+            revisions, time_range, DEFAULT_REVISION_HISTORY, MAX_REVISION_HISTORY
+        ):
+            rid = _rev_id(rev)
+            number = str(_first(rev, "revisionId"))
+            when = _join_datetime(rev)
+            admin = textish(_first(rev, "admin", "admin_name", "changed_by", "user"))
+            for uid, rule in _revision_rules(client, rid).items():
+                f = _rule_fields(rule)
+                rows.append([
+                    name, device_id, rid, number, when, admin, uid,
+                    f["name"], f["src_zone"], f["source"], f["dst_zone"], f["destination"],
+                    f["service"], f["action"], f["track"], f["disabled"], f["comment"],
+                ])
+    return REVISION_RULE_COLUMNS, rows
+
+
+# --------------------------------------------------------------------------- #
+# Revision comparison / policy view — computed from the SAVED snapshot rows
+# (no live client), so they read whatever the last TUF009 fetch persisted.
+# --------------------------------------------------------------------------- #
+
+def _colmap(columns: List[Any]) -> Tuple[List[str], Dict[str, int]]:
+    names = [c["name"] if isinstance(c, dict) else c for c in columns]
+    return names, {n: i for i, n in enumerate(names)}
+
+
+def _device_revision_rules(
+    columns: List[Any], rows: List[List[Any]], device_id: str
+) -> Tuple[str, Dict[str, dict]]:
+    """Group saved rows for one device into rev_id -> {meta, rules{uid->fields}}.
+
+    Rules keep their saved row order (i.e. rulebase order), which the moved
+    detection relies on. Returns the device name alongside.
+    """
+    _names, idx = _colmap(columns)
+
+    def cell(row: List[Any], key: str) -> str:
+        i = idx.get(key)
+        return str(row[i]) if i is not None and i < len(row) and row[i] is not None else ""
+
+    name = ""
+    revs: Dict[str, dict] = {}
+    for row in rows:
+        did = cell(row, "device.id")
+        hname = cell(row, "host.name")
+        if str(device_id) not in (did, hname):
+            continue
+        name = name or hname
+        rid = cell(row, "revision.id")
+        if not rid:
+            continue
+        rev = revs.get(rid)
+        if rev is None:
+            rev = revs[rid] = {
+                "meta": {"id": rid, "number": cell(row, "revision.number"),
+                         "date": cell(row, "@timestamp"), "admin": cell(row, "changed_by")},
+                "rules": {},
+            }
+        rev["rules"][cell(row, "rule.uid")] = {label: cell(row, col) for label, col in _COMPARE_FIELDS}
+    return name, revs
+
+
+def _saved_fingerprint(fields: Dict[str, str]) -> str:
+    return " | ".join(fields.get(k, "") for k in ("source", "destination", "service", "action", "disabled"))
+
+
+def index_revision_rules(columns: List[Any], rows: List[List[Any]]) -> List[dict]:
+    """Devices (with their revisions, newest first) present in the saved snapshot."""
+    _names, idx = _colmap(columns)
+
+    def cell(row: List[Any], key: str) -> str:
+        i = idx.get(key)
+        return str(row[i]) if i is not None and i < len(row) and row[i] is not None else ""
+
+    devices: Dict[str, dict] = {}
+    for row in rows:
+        did = cell(row, "device.id") or cell(row, "host.name")
+        if not did:
+            continue
+        dev = devices.get(did)
+        if dev is None:
+            dev = devices[did] = {"id": did, "name": cell(row, "host.name"), "_revs": {}}
+        rid = cell(row, "revision.id")
+        if rid and rid not in dev["_revs"]:
+            dev["_revs"][rid] = {"id": rid, "number": cell(row, "revision.number"),
+                                 "date": cell(row, "@timestamp"), "admin": cell(row, "changed_by")}
+    out = []
+    for dev in devices.values():
+        revs = sorted(dev["_revs"].values(), key=lambda r: _order_key(r["id"]), reverse=True)
+        out.append({"id": dev["id"], "name": dev["name"], "revisions": revs})
+    out.sort(key=lambda d: (d["name"] or "").lower())
     return out
 
 
-def _object_fingerprint(obj: dict) -> str:
-    return " | ".join([
-        textish(_first(obj, "@xsi.type", "type", "class_name")),
-        textish(_first(obj, "ip", "ip_address", "value")),
-        textish(_first(obj, "netmask")),
-        textish(_first(obj, "members", "member")),
-    ])
-
-
-def _object_display(obj: dict) -> str:
-    typ = textish(_first(obj, "@xsi.type", "type", "class_name")) or "object"
-    ip = textish(_first(obj, "ip", "ip_address", "value"))
-    return f"{typ}: {ip}" if ip else typ
-
-
-def _rule_change_entry(change_type: str, uid: str, before: Optional[dict], after: Optional[dict]) -> dict:
-    bf = _rule_fields(before) if before else {}
-    af = _rule_fields(after) if after else {}
-    changed = [label for label, _ in _RULE_FIELD_ORDER if before and after and bf.get(label) != af.get(label)]
-    return {
-        "change_type": change_type,
-        "rule_uid": uid,
-        "name": (af or bf).get("name", ""),
-        "before": bf,
-        "after": af,
-        "changed_fields": changed,
-    }
-
-
-def compare_revisions(
-    client,
-    device_id: str,
-    *,
-    old_rev: Optional[str] = None,
-    new_rev: Optional[str] = None,
+def compare_from_saved(
+    columns: List[Any], rows: List[List[Any]], device_id: str,
+    old_rev: Optional[str] = None, new_rev: Optional[str] = None,
 ) -> dict:
-    """Compare two revisions of one device's policy (SecureTrack-style report).
+    """Compare two saved revisions of one device (SecureTrack-style report).
 
-    Produces a *Summary* (New/Deleted/Modified/Moved counts for Security Rules
-    and Network Objects) plus a per-rule and per-object before→after detail.
-    With ``old_rev``/``new_rev`` omitted, compares the device's latest two
-    revisions. Given both, the numerically smaller id is the *before* baseline
-    so the report always reads oldest→newest regardless of pick order.
+    Reads the persisted TUF009 snapshot rows — no SecureTrack call. Summary of
+    New/Deleted/Modified/Moved security rules plus per-rule before→after detail.
+    Omitting the revisions compares the device's latest two *saved* revisions;
+    given both, they are ordered oldest→newest so the report reads forward.
     """
-    revisions = _revisions_sorted(client, device_id)
-    by_id = {_rev_id(r): r for r in revisions}
-    name = ""
-    for device in _fetch_devices(client):
-        did, dname = _device_key(device)
-        if did == str(device_id):
-            name = dname
-            break
+    name, revs = _device_revision_rules(columns, rows, device_id)
+    base = {"device": {"id": str(device_id), "name": name}, "summary": [], "rules": []}
+    if not revs:
+        base["error"] = "no saved rulebase for this device — run TUF009 (Revision Rulebases) first"
+        return base
 
+    ordered = sorted(revs.keys(), key=_order_key)
     if old_rev or new_rev:
-        ids = [str(x) for x in (old_rev, new_rev) if x not in (None, "")]
-        ids = sorted(set(ids), key=_order_key)
-        old_id = ids[0]
-        new_id = ids[-1] if len(ids) > 1 else ids[0]
-        older = by_id.get(old_id, {"id": old_id})
-        newer = by_id.get(new_id, {"id": new_id})
-    elif len(revisions) >= 2:
-        older, newer = revisions[-2], revisions[-1]
-        old_id, new_id = _rev_id(older), _rev_id(newer)
-    elif revisions:
-        older, newer = {}, revisions[-1]
-        old_id, new_id = "", _rev_id(newer)
+        ids = sorted({str(x) for x in (old_rev, new_rev) if x not in (None, "")}, key=_order_key)
+        old_id, new_id = ids[0], (ids[-1] if len(ids) > 1 else ids[0])
+    elif len(ordered) >= 2:
+        old_id, new_id = ordered[-2], ordered[-1]
     else:
-        return {
-            "device": {"id": str(device_id), "name": name},
-            "error": "device has no revisions",
-            "summary": [], "rules": [], "objects": [],
-        }
+        old_id, new_id = "", ordered[-1]
 
-    before_rules = _revision_rules(client, old_id) if old_id else {}
-    after_rules = _revision_rules(client, new_id) if new_id else {}
+    missing = [r for r in (old_id, new_id) if r and r not in revs]
+    if missing:
+        base["error"] = ("revision(s) " + ", ".join(missing) +
+                         " are not in the saved snapshot — re-run TUF009 with a wider range")
+        return base
 
-    # Moved detection: rules common to both, in each revision's rulebase order.
-    common_before = [u for u in before_rules if u in after_rules]
-    common_after = [u for u in after_rules if u in before_rules]
-    on_lcs = _lcs_keep(common_before, common_after)
+    before = revs.get(old_id, {}).get("rules", {}) if old_id else {}
+    after = revs.get(new_id, {}).get("rules", {}) if new_id else {}
 
+    on_lcs = _lcs_keep([u for u in before if u in after], [u for u in after if u in before])
     rule_rows: List[dict] = []
     counts = {"added": 0, "removed": 0, "modified": 0, "moved": 0}
-    for uid, after in after_rules.items():
-        before = before_rules.get(uid)
-        if before is None:
+    for uid, af in after.items():
+        bf = before.get(uid)
+        if bf is None:
             ctype = "added"
-        elif _rule_fingerprint(before) != _rule_fingerprint(after):
+        elif _saved_fingerprint(bf) != _saved_fingerprint(af):
             ctype = "modified"
         elif uid not in on_lcs:
             ctype = "moved"
         else:
-            continue  # unchanged
-        counts[ctype] += 1
-        rule_rows.append(_rule_change_entry(ctype, uid, before, after))
-    for uid, before in before_rules.items():
-        if uid not in after_rules:
-            counts["removed"] += 1
-            rule_rows.append(_rule_change_entry("removed", uid, before, None))
-
-    before_objs = _revision_objects(client, old_id) if old_id else {}
-    after_objs = _revision_objects(client, new_id) if new_id else {}
-    obj_rows: List[dict] = []
-    obj_counts = {"added": 0, "removed": 0, "modified": 0}
-    for key, after in after_objs.items():
-        before = before_objs.get(key)
-        if before is None:
-            ctype = "added"
-        elif _object_fingerprint(before) != _object_fingerprint(after):
-            ctype = "modified"
-        else:
             continue
-        obj_counts[ctype] += 1
-        obj_rows.append({
-            "change_type": ctype, "name": key,
-            "before": _object_display(before) if before else "",
-            "after": _object_display(after) if after else "",
-        })
-    for key, before in before_objs.items():
-        if key not in after_objs:
-            obj_counts["removed"] += 1
-            obj_rows.append({
-                "change_type": "removed", "name": key,
-                "before": _object_display(before), "after": "",
-            })
+        counts[ctype] += 1
+        changed = [label for label, _ in _COMPARE_FIELDS if bf and bf.get(label) != af.get(label)]
+        rule_rows.append({"change_type": ctype, "rule_uid": uid, "name": af.get("name", ""),
+                          "before": bf or {}, "after": af, "changed_fields": changed})
+    for uid, bf in before.items():
+        if uid not in after:
+            counts["removed"] += 1
+            rule_rows.append({"change_type": "removed", "rule_uid": uid, "name": bf.get("name", ""),
+                              "before": bf, "after": {}, "changed_fields": []})
 
-    auth_status, requester = _authorization(client, old_id, new_id) if (old_id and new_id) else ("", "")
-
-    _rank = {"added": 0, "removed": 1, "modified": 2, "moved": 3}
-    rule_rows.sort(key=lambda r: (_rank.get(r["change_type"], 9), _order_key(r["rule_uid"])))
-    obj_rows.sort(key=lambda r: (_rank.get(r["change_type"], 9), r["name"]))
+    rank = {"added": 0, "removed": 1, "modified": 2, "moved": 3}
+    rule_rows.sort(key=lambda r: (rank.get(r["change_type"], 9), _order_key(r["rule_uid"])))
 
     return {
         "device": {"id": str(device_id), "name": name},
-        "from": _rev_meta(older) if older else {"id": old_id},
-        "to": _rev_meta(newer) if newer else {"id": new_id},
-        "authorization": {"status": auth_status, "requester": requester},
+        "from": revs.get(old_id, {}).get("meta", {"id": old_id}),
+        "to": revs.get(new_id, {}).get("meta", {"id": new_id}),
         "summary": [
             {"category": "Security Rules", "added": counts["added"], "deleted": counts["removed"],
              "modified": counts["modified"], "moved": counts["moved"]},
-            {"category": "Network Objects", "added": obj_counts["added"], "deleted": obj_counts["removed"],
-             "modified": obj_counts["modified"], "moved": 0},
         ],
-        "rule_fields": [label for label, _ in _RULE_FIELD_ORDER],
+        "rule_fields": [label for label, _ in _COMPARE_FIELDS],
         "rules": rule_rows,
-        "objects": obj_rows,
     }
 
 
-def revision_rulebase(
-    client, device_id: str, revision_id: Optional[str] = None
+def policy_from_saved(
+    columns: List[Any], rows: List[List[Any]], device_id: str, revision_id: Optional[str] = None
 ) -> dict:
-    """Return the full rulebase of one revision as a column/row table.
-
-    Unlike the ``rules`` collector (which only ever shows each device's latest
-    rulebase), this views an *arbitrary* revision — pick a device and a point in
-    its history and read the policy exactly as it stood then. With
-    ``revision_id`` omitted the latest revision is used.
-    """
-    revisions = _revisions_sorted(client, device_id)
-    by_id = {_rev_id(r): r for r in revisions}
-    name = ""
-    for device in _fetch_devices(client):
-        did, dname = _device_key(device)
-        if did == str(device_id):
-            name = dname
-            break
-
-    if revision_id not in (None, ""):
-        rev = by_id.get(str(revision_id), {"id": str(revision_id)})
-        rev_id = str(revision_id)
-    elif revisions:
-        rev = revisions[-1]
-        rev_id = _rev_id(rev)
-    else:
+    """Return one saved revision's full rulebase as a column/row table."""
+    name, revs = _device_revision_rules(columns, rows, device_id)
+    if not revs:
         return {"device": {"id": str(device_id), "name": name},
-                "error": "device has no revisions", "columns": [], "rows": []}
-
-    rules = _revision_rules(client, rev_id)
-    labels = [label for label, _ in _RULE_FIELD_ORDER]
-    columns = ["host.name", "rule.uid"] + labels
-    rows: List[List[Any]] = []
-    for uid, rule in rules.items():
-        fields = _rule_fields(rule)
-        rows.append([name, uid] + [fields[label] for label in labels])
+                "error": "no saved rulebase for this device — run TUF009 (Revision Rulebases) first",
+                "columns": [], "rows": []}
+    ordered = sorted(revs.keys(), key=_order_key)
+    rid = str(revision_id) if revision_id not in (None, "") else ordered[-1]
+    if rid not in revs:
+        return {"device": {"id": str(device_id), "name": name},
+                "error": f"revision {rid} is not in the saved snapshot — re-run TUF009",
+                "columns": [], "rows": []}
+    labels = [label for label, _ in _COMPARE_FIELDS]
+    out_cols = ["rule.uid"] + labels
+    out_rows = [[uid] + [fields[label] for label in labels]
+                for uid, fields in revs[rid]["rules"].items()]
     return {
         "device": {"id": str(device_id), "name": name},
-        "revision": _rev_meta(rev) if rev else {"id": rev_id},
-        "columns": [{"name": c} for c in columns],
-        "rows": rows,
+        "revision": revs[rid]["meta"],
+        "columns": [{"name": c} for c in out_cols],
+        "rows": out_rows,
     }
-
-
-def list_devices(client) -> List[Dict[str, str]]:
-    """Lightweight {id, name, model} list for a revision-comparison device picker."""
-    out: List[Dict[str, str]] = []
-    for device in _fetch_devices(client):
-        did, name = _device_key(device)
-        out.append({"id": did, "name": name, "model": textish(_first(device, "model", "vendor"))})
-    return out
-
-
-def list_revisions(client, device_id: str) -> List[Dict[str, str]]:
-    """Newest-first revision metadata for a device (for the comparison picker)."""
-    revs = _revisions_sorted(client, device_id)
-    return [_rev_meta(r) for r in reversed(revs)]
 
 
 _COLLECTORS: Dict[str, Callable[..., Tuple[List[str], List[List[Any]]]]] = {
@@ -1019,6 +1042,7 @@ _COLLECTORS: Dict[str, Callable[..., Tuple[List[str], List[List[Any]]]]] = {
     "cleanups": _collect_cleanups,
     "zones": _collect_zones,
     "change_detail": _collect_change_detail,
+    "revision_rules": _collect_revision_rules,
 }
 
 
@@ -1049,6 +1073,10 @@ def run_query(
         columns, rows = _collect_change_detail(
             client, device_scan_limit, time_range, watermark_store
         )
+    elif resource == "revision_rules":
+        # Selects its own revision set from the time range; the @timestamp is a
+        # revision date and must not be used to drop baseline revisions.
+        columns, rows = _collect_revision_rules(client, device_scan_limit, time_range)
     else:
         columns, rows = collector(client, device_scan_limit)
         rows = _apply_time_range(columns, rows, time_range)

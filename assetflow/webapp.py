@@ -23,6 +23,7 @@ from . import merge as merge_mod
 from . import scheduler as scheduler_mod
 from . import service as service_mod
 from . import snapshotdiff as snapshotdiff_mod
+from . import tufin_runner as tufin_runner_mod
 from .runner import QueryResult
 
 _state: dict = {"manager": None}
@@ -365,29 +366,28 @@ def create_app(
         }
         return dash
 
-    @app.get("/api/adapters/{adapter_id}/tufin/devices")
-    def api_tufin_devices(adapter_id: str) -> dict:
-        a = _get_adapter(adapter_id)
-        if not hasattr(a, "list_devices"):
-            raise HTTPException(status_code=400, detail="not a Tufin adapter")
-        if not a.connected:
-            raise HTTPException(status_code=400, detail="adapter is not connected")
-        try:
-            return {"devices": a.list_devices()}
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"failed to list devices: {exc}")
+    # The revision Compare/Policy views read the SAVED "Revision Rulebases"
+    # (TUF009) snapshot from the DB — no live SecureTrack call — so they work
+    # offline and stay consistent with the rest of the fetch-then-view model.
+    _REVISION_RULES_QID = "TUF009"
 
-    @app.get("/api/adapters/{adapter_id}/tufin/devices/{device_id}/revisions")
-    def api_tufin_device_revisions(adapter_id: str, device_id: str) -> dict:
-        a = _get_adapter(adapter_id)
-        if not hasattr(a, "list_revisions"):
-            raise HTTPException(status_code=400, detail="not a Tufin adapter")
-        if not a.connected:
-            raise HTTPException(status_code=400, detail="adapter is not connected")
-        try:
-            return {"revisions": a.list_revisions(device_id)}
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"failed to list revisions: {exc}")
+    def _saved_revision_rules(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)  # 404 on unknown adapter
+        rec = db.latest_fetch(adapter_id, _REVISION_RULES_QID)
+        if rec is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No saved rulebase snapshot — run TUF009 (Revision Rulebases) first.",
+            )
+        return rec
+
+    @app.get("/api/adapters/{adapter_id}/tufin/revision-index")
+    def api_tufin_revision_index(adapter_id: str) -> dict:
+        rec = _saved_revision_rules(adapter_id)
+        return {
+            "ran_at": rec.get("ran_at"),
+            "devices": tufin_runner_mod.index_revision_rules(rec["columns"], rec["rows"]),
+        }
 
     @app.get("/api/adapters/{adapter_id}/tufin/revision-compare")
     def api_tufin_revision_compare(
@@ -396,15 +396,12 @@ def create_app(
         old_rev: Optional[str] = QueryParam(default=None),
         new_rev: Optional[str] = QueryParam(default=None),
     ) -> dict:
-        a = _get_adapter(adapter_id)
-        if not hasattr(a, "compare_revisions"):
-            raise HTTPException(status_code=400, detail="not a Tufin adapter")
-        if not a.connected:
-            raise HTTPException(status_code=400, detail="adapter is not connected")
-        try:
-            return a.compare_revisions(device_id, old_rev=old_rev, new_rev=new_rev)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"compare failed: {exc}")
+        rec = _saved_revision_rules(adapter_id)
+        out = tufin_runner_mod.compare_from_saved(
+            rec["columns"], rec["rows"], device_id, old_rev=old_rev, new_rev=new_rev
+        )
+        out["ran_at"] = rec.get("ran_at")
+        return out
 
     @app.get("/api/adapters/{adapter_id}/tufin/revision-policy")
     def api_tufin_revision_policy(
@@ -412,15 +409,12 @@ def create_app(
         device_id: str = QueryParam(...),
         revision_id: Optional[str] = QueryParam(default=None),
     ) -> dict:
-        a = _get_adapter(adapter_id)
-        if not hasattr(a, "revision_rulebase"):
-            raise HTTPException(status_code=400, detail="not a Tufin adapter")
-        if not a.connected:
-            raise HTTPException(status_code=400, detail="adapter is not connected")
-        try:
-            return a.revision_rulebase(device_id, revision_id=revision_id)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"policy fetch failed: {exc}")
+        rec = _saved_revision_rules(adapter_id)
+        out = tufin_runner_mod.policy_from_saved(
+            rec["columns"], rec["rows"], device_id, revision_id=revision_id
+        )
+        out["ran_at"] = rec.get("ran_at")
+        return out
 
     @app.get("/api/adapters/{adapter_id}/drift")
     def api_drift(adapter_id: str) -> dict:
@@ -834,6 +828,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <script>
 let ADAPTER=null, DETAIL=null, CURRENT=null, LASTROWS=null, SORT={col:null,dir:1};
+let RCDEVS=[], RPDEVS=[];   // devices (+embedded revisions) from the saved TUF009 snapshot
 
 async function j(url,opts){const r=await fetch(url,opts);const d=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(d.detail||('HTTP '+r.status)); return d;}
@@ -1432,48 +1427,50 @@ async function openChangeDashboard(){
 }
 
 // ----- Tufin revision comparison (SecureTrack-style compare report) -----
+// Reads the saved "Revision Rulebases" (TUF009) snapshot — fetch once, then
+// compare the fetched data offline.
+function rcNeedsFetch(m){
+  m.innerHTML='<h2>Compare Revisions — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Compares the saved <b>Revision Rulebases</b> snapshot.</div>'+
+    '<div class="err">No saved rulebase snapshot yet. Run <b>TUF009 — Revision Rulebases</b> '+
+    '(or use <b>Fetch all</b>) to snapshot recent revisions, then come back here to compare them.</div>';
+}
+
 async function openRevisionCompare(){
   CURRENT=null;
   document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
   const el=document.getElementById('ovRevCompare'); if(el) el.classList.add('active');
-  const m=document.getElementById('main');
-  if(!DETAIL.connected){
-    m.innerHTML='<h2>Compare Revisions</h2><div class="err">Connect the Tufin adapter first '+
-      '(Connection panel) — revision comparison reads live per-revision rulebases.</div>'; return;
-  }
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading saved revisions…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/revision-index'); }
+  catch(e){ if(/no saved/i.test(e.message)){ rcNeedsFetch(m); return; }
+    m.innerHTML='<h2>Compare Revisions</h2><div class="err">'+esc(e.message)+'</div>'; return; }
+  RCDEVS=d.devices||[];
+  const when=d.ran_at?(' · snapshot '+new Date(d.ran_at).toLocaleString()):'';
   m.innerHTML='<h2>Compare Revisions — '+esc(DETAIL.name)+'</h2>'+
     '<div class="sub">Pick a device and two revisions to see exactly what changed between them — '+
-    'new, deleted, modified and moved security rules and network objects. Defaults to the latest two revisions.</div>'+
+    'new, deleted, modified and moved security rules. From the saved Revision Rulebases snapshot'+when+'.</div>'+
     '<div class="rcbar">'+
-      '<label>Device<select id="rcDev"><option value="">Loading…</option></select></label>'+
+      '<label>Device<select id="rcDev"><option value="">Select a device…</option>'+
+        RCDEVS.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+' ('+(x.revisions||[]).length+' rev)</option>').join('')+
+      '</select></label>'+
       '<label>From (before)<select id="rcOld"></select></label>'+
       '<label>To (after)<select id="rcNew"></select></label>'+
       '<button id="rcGo" disabled>Compare</button>'+
     '</div><div id="rcout"></div>';
   document.getElementById('rcGo').onclick=rcRun;
-  const dsel=document.getElementById('rcDev'); dsel.onchange=rcLoadRevisions;
-  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices'); }
-  catch(e){ dsel.innerHTML='<option value="">(failed)</option>';
-    document.getElementById('rcout').innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
-  const devs=d.devices||[];
-  if(!devs.length){ dsel.innerHTML='<option value="">(no devices)</option>';
-    document.getElementById('rcout').innerHTML='<p class="hint">No devices returned by SecureTrack.</p>'; return; }
-  dsel.innerHTML='<option value="">Select a device…</option>'+
-    devs.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+(x.model?(' ('+esc(x.model)+')'):'')+'</option>').join('');
+  document.getElementById('rcDev').onchange=rcLoadRevisions;
+  if(!RCDEVS.length) document.getElementById('rcout').innerHTML='<p class="hint">The snapshot has no devices.</p>';
 }
 
-async function rcLoadRevisions(){
+function rcLoadRevisions(){
   const dev=document.getElementById('rcDev').value;
   const os=document.getElementById('rcOld'), ns=document.getElementById('rcNew'), go=document.getElementById('rcGo');
-  const out=document.getElementById('rcout'); out.innerHTML=''; go.disabled=true;
-  os.innerHTML=ns.innerHTML='';
+  const out=document.getElementById('rcout'); out.innerHTML=''; go.disabled=true; os.innerHTML=ns.innerHTML='';
   if(!dev) return;
-  os.innerHTML=ns.innerHTML='<option>Loading…</option>';
-  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices/'+encodeURIComponent(dev)+'/revisions'); }
-  catch(e){ out.innerHTML='<div class="err">'+esc(e.message)+'</div>'; os.innerHTML=ns.innerHTML=''; return; }
-  const revs=d.revisions||[];
+  const d=RCDEVS.find(x=>String(x.id)===String(dev)); const revs=(d&&d.revisions)||[];
   if(revs.length<2){ os.innerHTML=ns.innerHTML='<option value="">(need 2+)</option>';
-    out.innerHTML='<p class="hint">This device has fewer than two revisions to compare.</p>'; return; }
+    out.innerHTML='<p class="hint">This device has fewer than two revisions in the snapshot. '+
+      'Re-run TUF009 with a wider range to capture more.</p>'; return; }
   const opt=r=>'<option value="'+esc(r.id)+'">#'+esc(r.number||r.id)+' · '+esc(r.date||'')+(r.admin?(' · '+esc(r.admin)):'')+'</option>';
   os.innerHTML=revs.map(opt).join(''); ns.innerHTML=revs.map(opt).join('');
   ns.selectedIndex=0; os.selectedIndex=1;   // newest-first list → To=newest, From=second-newest
@@ -1506,12 +1503,11 @@ function rcCell(entry, label){
 
 function renderRevCompare(d){
   if(d.error) return '<div class="err">'+esc(d.error)+'</div>';
-  const f=d.from||{}, t=d.to||{}, au=d.authorization||{};
+  const f=d.from||{}, t=d.to||{};
   let h='<div class="meta">'+esc((d.device&&d.device.name)||'')+
     ' · from <b>#'+esc(f.number||f.id||'?')+'</b> ('+esc(f.date||'')+')'+
     ' → to <b>#'+esc(t.number||t.id||'?')+'</b> ('+esc(t.date||'')+')'+
-    (t.admin?(' · by '+esc(t.admin)):'')+
-    (au.status?(' · authorization: '+esc(au.status)+(au.requester?(' ('+esc(au.requester)+')'):'')):'')+'</div>';
+    (t.admin?(' · by '+esc(t.admin)):'')+'</div>';
   h+='<div class="sheethdr">Summary</div><div class="tablewrap"><table><thead><tr>'+
     '<th>Category</th><th>New</th><th>Deleted</th><th>Modified</th><th>Moved</th></tr></thead><tbody>';
   (d.summary||[]).forEach(s=>{ h+='<tr><td>'+esc(s.category)+'</td><td>'+(s.added||0)+'</td><td>'+
@@ -1528,60 +1524,48 @@ function renderRevCompare(d){
       flds.map(lbl=>'<td class="rcfld">'+rcCell(r,lbl)+'</td>').join('')+'</tr>'; });
     h+='</tbody></table></div>';
   }
-  const objs=d.objects||[];
-  h+='<div class="sheethdr">Network object changes ('+objs.length+')</div>';
-  if(!objs.length) h+='<p class="hint">No network-object changes between these revisions.</p>';
-  else{
-    h+='<div class="tablewrap"><table><thead><tr><th>Change</th><th>Object</th><th>Before</th><th>After</th></tr></thead><tbody>';
-    objs.forEach(o=>{ h+='<tr class="row-'+o.change_type+'"><td>'+rcTag(o.change_type)+'</td><td>'+esc(o.name)+
-      '</td><td class="rcfld">'+esc(o.before||'')+'</td><td class="rcfld">'+esc(o.after||'')+'</td></tr>'; });
-    h+='</tbody></table></div>';
-  }
   return h;
 }
 
-// ----- Tufin revision policy viewer (full rulebase of any one revision) -----
+// ----- Tufin revision policy viewer (full rulebase of any one saved revision) -----
 async function openRevisionPolicy(){
   CURRENT=null;
   document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
   const el=document.getElementById('ovRevPolicy'); if(el) el.classList.add('active');
-  const m=document.getElementById('main');
-  if(!DETAIL.connected){
-    m.innerHTML='<h2>Revision Policy</h2><div class="err">Connect the Tufin adapter first '+
-      '(Connection panel) — the policy viewer reads the live per-revision rulebase.</div>'; return;
-  }
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading saved revisions…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/revision-index'); }
+  catch(e){ if(/no saved/i.test(e.message)){
+      m.innerHTML='<h2>Revision Policy — '+esc(DETAIL.name)+'</h2>'+
+        '<div class="sub">Views the saved <b>Revision Rulebases</b> snapshot.</div>'+
+        '<div class="err">No saved rulebase snapshot yet. Run <b>TUF009 — Revision Rulebases</b> '+
+        '(or <b>Fetch all</b>) to snapshot revisions, then come back here.</div>'; return; }
+    m.innerHTML='<h2>Revision Policy</h2><div class="err">'+esc(e.message)+'</div>'; return; }
+  RPDEVS=d.devices||[];
+  const when=d.ran_at?(' · snapshot '+new Date(d.ran_at).toLocaleString()):'';
   m.innerHTML='<h2>Revision Policy — '+esc(DETAIL.name)+'</h2>'+
     '<div class="sub">View the full firewall rulebase exactly as it stood at any one revision — '+
-    'pick a device and a point in its history. Defaults to the latest revision.</div>'+
+    'pick a device and a point in its history. From the saved Revision Rulebases snapshot'+when+'.</div>'+
     '<div class="rcbar">'+
-      '<label>Device<select id="rpDev"><option value="">Loading…</option></select></label>'+
+      '<label>Device<select id="rpDev"><option value="">Select a device…</option>'+
+        RPDEVS.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+' ('+(x.revisions||[]).length+' rev)</option>').join('')+
+      '</select></label>'+
       '<label>Revision<select id="rpRev"></select></label>'+
       '<button id="rpGo" disabled>View</button>'+
     '</div><div id="rpmeta" class="meta"></div><div id="rpout"></div>';
   document.getElementById('rpGo').onclick=rpRun;
-  const dsel=document.getElementById('rpDev'); dsel.onchange=rpLoadRevisions;
-  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices'); }
-  catch(e){ dsel.innerHTML='<option value="">(failed)</option>';
-    document.getElementById('rpout').innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
-  const devs=d.devices||[];
-  if(!devs.length){ dsel.innerHTML='<option value="">(no devices)</option>';
-    document.getElementById('rpout').innerHTML='<p class="hint">No devices returned by SecureTrack.</p>'; return; }
-  dsel.innerHTML='<option value="">Select a device…</option>'+
-    devs.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+(x.model?(' ('+esc(x.model)+')'):'')+'</option>').join('');
+  document.getElementById('rpDev').onchange=rpLoadRevisions;
+  if(!RPDEVS.length) document.getElementById('rpout').innerHTML='<p class="hint">The snapshot has no devices.</p>';
 }
 
-async function rpLoadRevisions(){
+function rpLoadRevisions(){
   const dev=document.getElementById('rpDev').value;
   const rs=document.getElementById('rpRev'), go=document.getElementById('rpGo');
   const out=document.getElementById('rpout'); out.innerHTML=''; document.getElementById('rpmeta').innerHTML='';
   rs.innerHTML=''; go.disabled=true;
   if(!dev) return;
-  rs.innerHTML='<option>Loading…</option>';
-  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/devices/'+encodeURIComponent(dev)+'/revisions'); }
-  catch(e){ out.innerHTML='<div class="err">'+esc(e.message)+'</div>'; rs.innerHTML=''; return; }
-  const revs=d.revisions||[];
+  const d=RPDEVS.find(x=>String(x.id)===String(dev)); const revs=(d&&d.revisions)||[];
   if(!revs.length){ rs.innerHTML='<option value="">(none)</option>';
-    out.innerHTML='<p class="hint">This device has no revisions.</p>'; return; }
+    out.innerHTML='<p class="hint">This device has no revisions in the snapshot.</p>'; return; }
   rs.innerHTML=revs.map(r=>'<option value="'+esc(r.id)+'">#'+esc(r.number||r.id)+' · '+esc(r.date||'')+
     (r.admin?(' · '+esc(r.admin)):'')+'</option>').join('');
   rs.selectedIndex=0;   // newest-first

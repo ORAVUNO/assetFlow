@@ -67,8 +67,8 @@ DEVICES = {
 def test_tufin_registry_loads_and_validates():
     reg = load_registry(str(TUFIN_REGISTRY))
     assert reg.metadata.version == 1
-    assert len(reg.queries) == 8
-    assert len(reg.feeds) == 7
+    assert len(reg.queries) == 9
+    assert len(reg.feeds) == 8
     # every query names a resource the runner knows how to fetch
     for q in reg.queries:
         assert q.resource in tufin_runner_mod._COLLECTORS
@@ -500,7 +500,7 @@ def test_tufin_adapter_registered():
     a = manager.get("tufin")
     assert a.info.kind == "tufin"
     assert a.info.category == "Network Security Policy"
-    assert len(a.registry.queries) == 8
+    assert len(a.registry.queries) == 9
 
 
 def test_connect_form_and_run(monkeypatch):
@@ -537,12 +537,12 @@ def test_build_client_requires_host_and_creds():
 
 
 # --------------------------------------------------------------------------- #
-# Revision comparison (SecureTrack-style compare report)
+# Revision rulebase snapshot (TUF009) + saved-data comparison / policy views
 # --------------------------------------------------------------------------- #
 
 def _compare_mapping():
     """Device 1 with revisions 100 -> 101: r10 modified (service), r20 removed,
-    r30 added, r40 reordered (moved), plus one network-object add + modify."""
+    r30 added, r50 reordered (a clean 'moved' while r10/r40 stay put)."""
     mapping = dict(DEVICES)
     mapping["devices/1/revisions.json"] = {
         "revisions": [
@@ -558,8 +558,6 @@ def _compare_mapping():
         {"uid": "r40", "src_network": "1.1.1.1", "dst_network": "web", "dst_service": "tcp/80", "action": "accept"},
         {"uid": "r50", "src_network": "2.2.2.2", "dst_network": "dns", "dst_service": "udp/53", "action": "accept"},
     ]}
-    # r10 modified (service); r20 removed; r30 added; r50 jumps to the top with
-    # identical content -> a clean "moved" while r10/r40 stay put.
     mapping["revisions/101/rules.json"] = {"rules": [
         {"uid": "r50", "src_network": "2.2.2.2", "dst_network": "dns", "dst_service": "udp/53", "action": "accept"},
         {"uid": "r10", "src_network": "10.0.0.0/24", "dst_network": "db", "dst_service": "tcp/443",
@@ -568,84 +566,77 @@ def _compare_mapping():
         {"uid": "r30", "src_network": "196.10.15.20", "dst_network": "vpn", "dst_service": "tcp/3389",
          "action": "accept"},
     ]}
-    mapping["revisions/100/network_objects.json"] = {"network_objects": [
-        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.9"},
-    ]}
-    mapping["revisions/101/network_objects.json"] = {"network_objects": [
-        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.10"},  # ip modified
-        {"uid": "o2", "display_name": "srv-b", "type": "host", "ip": "10.0.0.20"},  # added
-    ]}
     return mapping
 
 
-def test_compare_revisions_summary_and_detail():
-    d = tufin_runner_mod.compare_revisions(FakeClient(_compare_mapping()), "1")
-    # Defaulted to the latest two revisions, oldest -> newest.
-    assert d["from"]["id"] == "100" and d["to"]["id"] == "101"
-    assert d["device"]["name"] == "HQ-Perimeter-FW"
-    assert d["to"]["admin"] == "jane"
+def _snapshot():
+    """Run the TUF009 collector and return its (columns, rows) — the saved shape
+    the compare/policy views read back."""
+    result = tufin_runner_mod.run_query(FakeClient(_compare_mapping()), _q("revision_rules"))
+    return result.columns, result.rows
 
-    summ = {s["category"]: s for s in d["summary"]}
-    rules = summ["Security Rules"]
-    assert rules["added"] == 1 and rules["deleted"] == 1 and rules["modified"] == 1
-    assert rules["moved"] == 1
-    objs = summ["Network Objects"]
-    assert objs["added"] == 1 and objs["modified"] == 1 and objs["deleted"] == 0
+
+def test_revision_rules_collector_snapshots_recent_revisions():
+    cols, rows = _snapshot()
+    names = [c["name"] for c in cols]
+    assert names[:7] == ["host.name", "device.id", "revision.id", "revision.number",
+                         "@timestamp", "changed_by", "rule.uid"]
+    # 4 rules in rev 100 + 4 rules in rev 101.
+    assert len(rows) == 8
+    revs = {r[names.index("revision.id")] for r in rows}
+    assert revs == {"100", "101"}
+
+
+def test_compare_from_saved_summary_and_detail():
+    cols, rows = _snapshot()
+    d = tufin_runner_mod.compare_from_saved(cols, rows, "1")
+    # Defaulted to the latest two saved revisions, oldest -> newest.
+    assert d["from"]["id"] == "100" and d["to"]["id"] == "101"
+    assert d["device"]["name"] == "HQ-Perimeter-FW" and d["to"]["admin"] == "jane"
+
+    rules = {s["category"]: s for s in d["summary"]}["Security Rules"]
+    assert rules["added"] == 1 and rules["deleted"] == 1
+    assert rules["modified"] == 1 and rules["moved"] == 1
 
     by = {(r["change_type"], r["rule_uid"]): r for r in d["rules"]}
-    assert ("added", "r30") in by
-    assert ("removed", "r20") in by
-    assert ("moved", "r50") in by
+    assert ("added", "r30") in by and ("removed", "r20") in by and ("moved", "r50") in by
     mod = by[("modified", "r10")]
     assert "service" in mod["changed_fields"]
     assert mod["before"]["service"] == "tcp/8443" and mod["after"]["service"] == "tcp/443"
-    # A moved rule's content is unchanged, so nothing is flagged as a field diff.
     assert by[("moved", "r50")]["changed_fields"] == []
 
-    obj_by = {(o["change_type"], o["name"]): o for o in d["objects"]}
-    assert ("modified", "o1") in obj_by and ("added", "o2") in obj_by
-    assert "10.0.0.10" in obj_by[("modified", "o1")]["after"]
 
-
-def test_compare_revisions_explicit_ids_are_ordered_oldest_first():
-    # Pass the ids reversed; the report must still read 100 -> 101.
-    d = tufin_runner_mod.compare_revisions(
-        FakeClient(_compare_mapping()), "1", old_rev="101", new_rev="100"
-    )
+def test_compare_from_saved_explicit_ids_ordered_and_missing_errors():
+    cols, rows = _snapshot()
+    # Reversed ids still read 100 -> 101.
+    d = tufin_runner_mod.compare_from_saved(cols, rows, "1", old_rev="101", new_rev="100")
     assert d["from"]["id"] == "100" and d["to"]["id"] == "101"
+    # A revision not in the snapshot is reported, not silently compared.
+    miss = tufin_runner_mod.compare_from_saved(cols, rows, "1", old_rev="100", new_rev="999")
+    assert "error" in miss and "999" in miss["error"]
+    # Unknown device -> needs a fetch.
+    none = tufin_runner_mod.compare_from_saved(cols, rows, "nope")
+    assert "error" in none and none["rules"] == []
 
 
-def test_compare_revisions_no_revisions_errors():
-    d = tufin_runner_mod.compare_revisions(FakeClient(dict(DEVICES)), "1")
-    assert "error" in d and d["rules"] == []
+def test_index_revision_rules_lists_devices_newest_first():
+    cols, rows = _snapshot()
+    idx = tufin_runner_mod.index_revision_rules(cols, rows)
+    assert idx[0]["id"] == "1" and idx[0]["name"] == "HQ-Perimeter-FW"
+    assert [r["id"] for r in idx[0]["revisions"]] == ["101", "100"]  # newest first
+    assert idx[0]["revisions"][0]["admin"] == "jane"
 
 
-def test_list_devices_and_revisions_for_picker():
-    client = FakeClient(_compare_mapping())
-    devs = tufin_runner_mod.list_devices(client)
-    assert devs[0]["id"] == "1" and devs[0]["name"] == "HQ-Perimeter-FW"
-    revs = tufin_runner_mod.list_revisions(client, "1")
-    # Newest-first for the picker.
-    assert [r["id"] for r in revs] == ["101", "100"]
-    assert revs[0]["admin"] == "jane"
-
-
-def test_revision_rulebase_views_specific_revision():
-    client = FakeClient(_compare_mapping())
-    # Explicit older revision -> its rulebase (4 rules, r10 with tcp/8443).
-    d = tufin_runner_mod.revision_rulebase(client, "1", revision_id="100")
+def test_policy_from_saved_views_specific_and_latest():
+    cols, rows = _snapshot()
+    d = tufin_runner_mod.policy_from_saved(cols, rows, "1", revision_id="100")
     assert d["revision"]["id"] == "100"
-    cols = [c["name"] for c in d["columns"]]
-    assert cols[:4] == ["host.name", "rule.uid", "name", "src_zone"]
-    by_uid = {r[1]: r for r in d["rows"]}
+    names = [c["name"] for c in d["columns"]]
+    assert names[:3] == ["rule.uid", "name", "src_zone"]
+    by_uid = {r[0]: r for r in d["rows"]}
     assert set(by_uid) == {"r10", "r20", "r40", "r50"}
-    svc_idx = cols.index("service")
-    assert by_uid["r10"][svc_idx] == "tcp/8443"
-    assert by_uid["r10"][0] == "HQ-Perimeter-FW"
-
-
-def test_revision_rulebase_defaults_to_latest():
-    d = tufin_runner_mod.revision_rulebase(FakeClient(_compare_mapping()), "1")
-    assert d["revision"]["id"] == "101"  # newest
-    by_uid = {r[1]: r for r in d["rows"]}
-    assert "r30" in by_uid and "r20" not in by_uid  # latest state
+    assert by_uid["r10"][names.index("service")] == "tcp/8443"
+    # Default -> latest revision.
+    latest = tufin_runner_mod.policy_from_saved(cols, rows, "1")
+    assert latest["revision"]["id"] == "101"
+    assert "r30" in {r[0] for r in latest["rows"]} and "r20" not in {r[0] for r in latest["rows"]}
