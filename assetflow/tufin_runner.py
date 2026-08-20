@@ -228,21 +228,91 @@ def _first_payload(client, paths: Tuple[str, ...]) -> Any:
     return None
 
 
+# SecureTrack paginates list endpoints (default page ~200) and reports the full
+# size as ``total`` in the envelope. Without paging we only ever saw page one.
+_PAGE_SIZE = 2000          # rows requested per page (server may cap lower)
+_MAX_ITEMS = 200_000       # hard safety ceiling across all pages of one list
+
+
+def _page_size() -> int:
+    try:
+        return max(1, int(os.getenv("TUFIN_PAGE_SIZE", str(_PAGE_SIZE))))
+    except ValueError:
+        return _PAGE_SIZE
+
+
+def _page_path(path: str, start: int, count: int) -> str:
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}start={start}&count={count}"
+
+
+def _read_total(payload: Any) -> Optional[int]:
+    """The list's full size from a SecureTrack envelope, if it advertises one."""
+    if isinstance(payload, dict):
+        value = payload.get("total")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def _fetch_list(client, paths: Tuple[str, ...], keys: Tuple[str, ...]) -> List[dict]:
+    """Fetch EVERY item of a list resource across pages.
+
+    Tries each path variant (a paged request first, then the bare path for
+    servers/endpoints that don't accept ``start``/``count``); for the first that
+    responds, reads the ``total`` the envelope reports and pages — advancing by
+    the count actually returned, so a server that caps the page size below the
+    request is still walked fully — until every item is collected. When the
+    envelope reports no ``total`` the shape isn't paginated (e.g. the nested
+    cleanup set, or a non-paging endpoint) and the single response is returned.
+    """
+    size = _page_size()
+    for path in paths:
+        payload = None
+        for candidate in (_page_path(path, 0, size), path):
+            try:
+                payload = client.get(candidate)
+                break
+            except Exception:  # pragma: no cover - network/endpoint dependent
+                payload = None
+        if payload is None:
+            continue
+        items = unwrap_items(payload, keys)
+        total = _read_total(payload)
+        if total is None:
+            return items  # not a paginated envelope → one page is all there is
+        while len(items) < total and len(items) < _MAX_ITEMS:
+            try:
+                payload = client.get(_page_path(path, len(items), size))
+            except Exception:  # pragma: no cover
+                break
+            batch = unwrap_items(payload, keys)
+            if not batch:
+                break
+            items.extend(batch)
+        return items
+    return []
+
+
 def _fetch_devices(client) -> List[dict]:
     # Serve a recent device list from a per-client cache so one Discover pass
     # (many collectors) hits /devices once, not once per collector.
     cached = getattr(client, "_af_devices_cache", None)
     if cached and (time.monotonic() - cached[0]) < _DEVICE_CACHE_TTL:
         return cached[1]
-    payload = _first_payload(
+    devices = _fetch_list(
         client,
         (
             "devices.json?show_os_version=true",
             "devices.json",
             "devices",
         ),
+        ("devices", "device"),
     )
-    devices = unwrap_items(payload, ("devices", "device"))
     try:
         client._af_devices_cache = (time.monotonic(), devices)
     except Exception:  # pragma: no cover - exotic client without __dict__
@@ -334,10 +404,8 @@ def _collect_per_device(
 ) -> Tuple[List[str], List[List[Any]]]:
     def rows_for(device: dict) -> List[List[Any]]:
         device_id, name = _device_key(device)
-        payload = _first_payload(client, paths_for(device_id, name, device))
-        if payload is None:
-            return []
-        return [row_for(item, device_id, name) for item in unwrap_items(payload, keys)]
+        items = _fetch_list(client, paths_for(device_id, name, device), keys)
+        return [row_for(item, device_id, name) for item in items]
 
     rows: List[List[Any]] = []
     for chunk in _map_devices(_scan(_fetch_devices(client), scan), rows_for):
@@ -590,11 +658,11 @@ def _rule_compact(rule: dict) -> str:
 
 
 def _revisions_sorted(client, device_id: str) -> List[dict]:
-    payload = _first_payload(
+    revs = _fetch_list(
         client,
         (f"devices/{device_id}/revisions.json", f"devices/{device_id}/revisions"),
+        ("revisions", "revision"),
     )
-    revs = unwrap_items(payload, ("revisions", "revision"))
 
     def order(rev: dict):
         raw = _first(rev, "id", "revisionId", "number")
@@ -675,11 +743,12 @@ def _incremental_pairs(
 
 
 def _revision_rules(client, revision_id: str) -> Dict[str, dict]:
-    payload = _first_payload(
+    rules = _fetch_list(
         client,
         (f"revisions/{revision_id}/rules.json", f"revisions/{revision_id}/rules"),
+        ("rules", "rule"),
     )
-    return {_rule_key(r): r for r in unwrap_items(payload, ("rules", "rule"))}
+    return {_rule_key(r): r for r in rules}
 
 
 def _authorization(client, old_id: str, new_id: str) -> Tuple[str, str]:
@@ -981,11 +1050,12 @@ def _collect_revision_objects(
             number = str(_first(rev, "revisionId"))
             when = _join_datetime(rev)
             admin = textish(_first(rev, "admin", "admin_name", "changed_by", "user"))
-            payload = _first_payload(
+            objects = _fetch_list(
                 client,
                 (f"revisions/{rid}/network_objects.json", f"revisions/{rid}/network_objects"),
+                ("network_objects", "network_object"),
             )
-            for obj in unwrap_items(payload, ("network_objects", "network_object")):
+            for obj in objects:
                 uid = str(_first(obj, "uid", "id", "display_name", "name"))
                 out.append([
                     name, device_id, rid, number, when, admin, uid,
