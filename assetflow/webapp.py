@@ -23,6 +23,7 @@ from . import merge as merge_mod
 from . import scheduler as scheduler_mod
 from . import service as service_mod
 from . import snapshotdiff as snapshotdiff_mod
+from . import tufin_profile as tufin_profile_mod
 from . import tufin_runner as tufin_runner_mod
 from .runner import QueryResult
 
@@ -420,6 +421,44 @@ def create_app(
         out["ran_at"] = rec.get("ran_at")
         return out
 
+    def _build_tufin_profile(a: adapters_mod.Adapter) -> dict:
+        """Fold every latest saved Tufin fetch + the change log into one profile."""
+        recs = db.latest_all(a.info.id, include_data=True)
+        sections: dict = {}
+        for rec in recs:
+            try:
+                q = a.registry.get_query(rec["query_id"])
+            except KeyError:
+                continue
+            res = (q.resource or "").strip()
+            # One saved table per resource; if two query ids share a resource,
+            # keep the richer (more rows) one.
+            if res and (res not in sections or rec["row_count"] > sections[res]["row_count"]):
+                sections[res] = rec
+        changes = db.change_log(a.info.id)
+        return tufin_profile_mod.build_profile(
+            sections, changes, datetime.now(timezone.utc).isoformat()
+        )
+
+    @app.get("/api/adapters/{adapter_id}/tufin/profile")
+    def api_tufin_profile(adapter_id: str) -> dict:
+        a = _get_adapter(adapter_id)
+        if a.info.kind != "tufin":
+            raise HTTPException(status_code=400, detail="not a Tufin adapter")
+        return _build_tufin_profile(a)
+
+    @app.post("/api/adapters/{adapter_id}/tufin/discover")
+    def api_tufin_discover(adapter_id: str) -> dict:
+        a = _get_adapter(adapter_id)
+        if a.info.kind != "tufin":
+            raise HTTPException(status_code=400, detail="not a Tufin adapter")
+        if not a.connected:
+            raise HTTPException(status_code=400, detail="adapter is not connected")
+        run = service_mod.run_all(a)  # fetch + save + dedupe every runnable feed
+        profile = _build_tufin_profile(a)
+        profile["discover"] = run
+        return profile
+
     @app.get("/api/adapters/{adapter_id}/drift")
     def api_drift(adapter_id: str) -> dict:
         _get_adapter(adapter_id)
@@ -718,6 +757,22 @@ INDEX_HTML = r"""<!doctype html>
   .rcfld .b4{color:var(--muted);text-decoration:line-through}
   .rcfld .af{color:var(--text);font-weight:600}
   .rcfld .arw{color:var(--muted);padding:0 4px}
+  /* discover / unified profile */
+  .advtoggle{cursor:pointer;user-select:none;color:var(--accent)}
+  .advtoggle:hover{color:var(--text)}
+  .ghostbtn{background:transparent;color:var(--accent);border:1px solid var(--border)}
+  .atchip{display:inline-block;font-size:12px;padding:3px 10px;margin:0 6px 6px 0;border-radius:20px;
+          background:var(--code);border:1px solid var(--border)}
+  .atchip b{color:var(--accent)}
+  tr.devrow{cursor:pointer}
+  tr.devrow:hover td{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+  tr.devrow.open td{background:color-mix(in srgb,var(--accent) 12%,transparent);font-weight:600}
+  td.exptoggle{width:22px;color:var(--muted);text-align:center}
+  .devdetinner{padding:10px 6px 14px}
+  .dtabs{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 8px}
+  .dtab{background:var(--code);color:var(--text);border:1px solid var(--border);border-radius:7px;
+        padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer}
+  .dtab.active{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
   /* unified inventory */
   tr.multi td{background:color-mix(in srgb,var(--accent) 12%,transparent) !important;font-weight:600}
   .invbtn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
@@ -833,6 +888,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let ADAPTER=null, DETAIL=null, CURRENT=null, LASTROWS=null, SORT={col:null,dir:1};
 let RCDEVS=[], RPDEVS=[];   // devices (+embedded revisions) from the saved TUF009 snapshot
+let PROFILE=null;           // unified Tufin device-profile (Discover view)
 
 async function j(url,opts){const r=await fetch(url,opts);const d=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(d.detail||('HTTP '+r.status)); return d;}
@@ -1614,6 +1670,144 @@ async function rpRun(){
   else out.innerHTML='<p class="hint">This revision has no rules.</p>';
 }
 
+// ----- Discover: unified device-centric Tufin view (dashboard + nested tables) -----
+async function openDiscover(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovDiscover'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Building unified view…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/profile'); }
+  catch(e){ m.innerHTML='<h2>Discover</h2><div class="err">'+esc(e.message)+'</div>'; return; }
+  PROFILE=d; renderDiscover(d, false);
+}
+
+async function runDiscover(){
+  if(!DETAIL.connected){ alert('Connect the Tufin adapter first (Connection panel) — Discover fetches every feed live.'); return; }
+  const btn=document.getElementById('discBtn');
+  if(btn){ btn.disabled=true; btn.textContent='Discovering… fetching all feeds'; }
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/discover',{method:'POST'}); }
+  catch(e){ const m=document.getElementById('main');
+    if(m) m.innerHTML='<h2>Discover</h2><div class="err">'+esc(e.message)+'</div>'; return; }
+  PROFILE=d; renderDiscover(d, true);
+}
+
+function downloadProfile(){
+  if(!PROFILE) return;
+  const blob=new Blob([JSON.stringify(PROFILE,null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download=(DETAIL.name||'tufin').replace(/[^a-z0-9_-]+/gi,'_')+'-profile.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+}
+
+function dtile(label,val,sub){
+  return '<div style="flex:1;min-width:120px;border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--panel)">'+
+    '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">'+esc(label)+'</div>'+
+    '<div style="font-size:24px;font-weight:700;margin-top:3px">'+esc(val==null?'—':val)+'</div>'+
+    (sub?'<div style="font-size:11px;color:var(--muted)">'+esc(sub)+'</div>':'')+'</div>';
+}
+
+function renderDiscover(d, justRan){
+  const m=document.getElementById('main');
+  const t=d.totals||{}, ch=t.changes||{}, at=t.by_asset_type||{};
+  const gen=d.generated_at?new Date(d.generated_at).toLocaleString():'';
+  const devs=d.devices||[];
+  const ran=(justRan&&d.discover)?('<span class="meta">fetched '+d.discover.ran+' feed(s)'+
+    (d.discover.failed?(', '+d.discover.failed+' failed'):'')+'</span>'):'';
+  let h='<h2>Discover — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Every Tufin feed folded into one device-centric view. '+
+    (gen?('Built '+esc(gen)+'.'):'Not built yet.')+'</div>'+
+    '<div class="controls">'+
+      '<button id="discBtn" onclick="runDiscover()">🔄 Discover (fetch all)</button>'+
+      '<button class="ghostbtn" onclick="downloadProfile()">⬇ Download JSON</button>'+ran+
+    '</div>';
+  if(!devs.length){
+    h+='<div class="err">No Tufin data yet. Click <b>Discover (fetch all)</b> to fetch every feed and '+
+       'build the unified view (needs the adapter connected).</div>';
+    m.innerHTML=h; return;
+  }
+  // Estate tiles
+  h+='<div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">'+
+      dtile('Devices', t.devices)+ dtile('Rules', t.rules)+ dtile('Objects', t.objects)+
+      dtile('Services', t.services)+ dtile('Zones', t.zones)+ dtile('Revisions', t.revisions)+
+      dtile('Cleanups', t.cleanups)+
+    '</div>'+
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 10px">'+
+      dtile('Changes', ch.total||0)+ dtile('Added', ch.added||0)+ dtile('Modified', ch.modified||0)+
+      dtile('Removed', ch.removed||0)+ dtile('Unauthorized', ch.unauthorized||0)+
+    '</div>';
+  // Asset-type breakdown
+  const chips=Object.keys(at).sort().map(k=>'<span class="atchip">'+esc(k)+' <b>'+at[k]+'</b></span>').join('');
+  if(chips) h+='<div class="sheethdr">Devices by asset type</div><div style="margin:4px 0 10px">'+chips+'</div>';
+  // Device table (expandable)
+  h+='<div class="sheethdr">Devices ('+devs.length+') — click a row to expand</div>'+
+     '<div class="tablewrap"><table><thead><tr>'+
+     '<th></th><th>Device</th><th>Asset type</th><th>Vendor / model</th><th>IP</th>'+
+     '<th>Rules</th><th>Objects</th><th>Revisions</th><th>Changes</th></tr></thead><tbody>';
+  devs.forEach((dev,idx)=>{
+    const c=dev.counts||{}, dch=dev.changes||{};
+    const chg=dch.total||0;
+    const badge=chg?('<span class="rctag rc-modified">'+chg+'</span>'):'<span class="hint">0</span>';
+    const unauth=dch.unauthorized?(' <span class="rctag rc-removed">'+dch.unauthorized+' unauth</span>'):'';
+    h+='<tr class="devrow" id="devrow-'+idx+'" onclick="discToggle('+idx+')">'+
+       '<td class="exptoggle">▸</td>'+
+       '<td><b>'+esc(dev.name)+'</b></td>'+
+       '<td>'+esc(dev.asset_type||'')+'</td>'+
+       '<td>'+esc([dev.vendor,dev.model].filter(Boolean).join(' / '))+'</td>'+
+       '<td>'+esc(dev.ip||'')+'</td>'+
+       '<td>'+(c.rules||0)+'</td><td>'+(c.objects||0)+'</td><td>'+(c.revisions||0)+'</td>'+
+       '<td>'+badge+unauth+'</td></tr>'+
+       '<tr class="devdet hidden" id="devdet-'+idx+'"><td colspan="9"><div class="devdetinner"></div></td></tr>';
+  });
+  h+='</tbody></table></div>';
+  m.innerHTML=h;
+}
+
+function discToggle(idx){
+  const det=document.getElementById('devdet-'+idx), row=document.getElementById('devrow-'+idx);
+  if(!det) return;
+  const show=det.classList.contains('hidden');
+  det.classList.toggle('hidden'); row.classList.toggle('open', show);
+  const arr=row.querySelector('.exptoggle'); if(arr) arr.textContent=show?'▾':'▸';
+  if(show && !det.dataset.built){ buildDeviceDetail(idx); det.dataset.built='1'; }
+}
+
+function mountObjs(container, rows, preferredCols){
+  if(!rows || !rows.length){ container.innerHTML='<p class="hint">None.</p>'; return; }
+  const cols=(preferredCols&&preferredCols.length)?preferredCols.slice():Object.keys(rows[0]);
+  const seen=new Set(cols);
+  rows.forEach(r=>Object.keys(r).forEach(k=>{ if(!seen.has(k)){ seen.add(k); cols.push(k); } }));
+  const data=rows.map(r=>cols.map(k=>r[k]==null?'':r[k]));
+  mountTable(container, cols, data, {});
+}
+
+function buildDeviceDetail(idx){
+  const dev=PROFILE.devices[idx];
+  const body=document.getElementById('devdet-'+idx).querySelector('.devdetinner');
+  const secs=[['rules','Rules'],['objects','Objects'],['services','Services'],
+              ['zones','Zones'],['revisions','Revisions'],['cleanups','Cleanups']];
+  const tabs=[]; let first=null;
+  secs.forEach(([k,label])=>{ const n=(dev[k]||[]).length; if(n){ tabs.push([k,label+' ('+n+')']); if(!first)first=k; } });
+  const recent=(dev.changes&&dev.changes.recent)||[];
+  if(recent.length){ tabs.push(['changes','Changes ('+recent.length+')']); if(!first)first='changes'; }
+  if(!tabs.length){ body.innerHTML='<p class="hint">No detail fetched for this device. Run Discover (fetch all).</p>'; return; }
+  body.innerHTML='<div class="dtabs">'+
+    tabs.map(([k,l])=>'<button class="dtab" data-k="'+k+'" onclick="discShow('+idx+',&quot;'+k+'&quot;)">'+esc(l)+'</button>').join('')+
+    '</div><div class="dsecbody" id="dsec-'+idx+'"></div>';
+  discShow(idx, first);
+}
+
+function discShow(idx, k){
+  const dev=PROFILE.devices[idx];
+  const body=document.getElementById('dsec-'+idx);
+  document.querySelectorAll('#devdet-'+idx+' .dtab').forEach(b=>b.classList.toggle('active', b.dataset.k===k));
+  if(k==='changes')
+    mountObjs(body, (dev.changes&&dev.changes.recent)||[],
+      ['revision.id','@timestamp','changed_by','change_type','rule.uid','before','after','authorized','requester']);
+  else
+    mountObjs(body, dev[k]||[]);
+}
+
 async function openDrift(){
   CURRENT=null;
   document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
@@ -1649,6 +1843,13 @@ function renderSidebar(){
   const qById={}; DETAIL.queries.forEach(q=>qById[q.id]=q);
   const side=document.getElementById('sidebar'); side.innerHTML='';
   const ovh=document.createElement('div'); ovh.className='feed'; ovh.textContent='OVERVIEW'; side.appendChild(ovh);
+  // Discover is the headline unified view for Tufin — one click fetches every
+  // feed and folds it into a device-centric dashboard + nested tables.
+  if(DETAIL.kind==='tufin'){
+    const dc=document.createElement('div'); dc.className='q ov'; dc.id='ovDiscover';
+    dc.innerHTML='<span class="qid">🔎 Discover</span>';
+    dc.onclick=openDiscover; side.appendChild(dc);
+  }
   const all=document.createElement('div'); all.className='q ov'; all.id='ovAll';
   all.innerHTML='<span class="qid">★ All Fetched Results</span>';
   all.onclick=openMerged; side.appendChild(all);
@@ -1674,16 +1875,30 @@ function renderSidebar(){
   const dl=document.createElement('div'); dl.className='q ov'; dl.id='ovDrift';
   dl.innerHTML='<span class="qid">⇄ Drift Log</span>';
   dl.onclick=openDrift; side.appendChild(dl);
+  // Raw per-resource feeds. For Tufin these are a power-user drill-down behind
+  // an Advanced toggle (Discover is the primary view); other adapters show them
+  // directly.
+  const advanced=(DETAIL.kind!=='tufin');
+  const feedWrap=document.createElement('div'); feedWrap.id='feedWrap';
+  if(!advanced) feedWrap.classList.add('hidden');
+  if(DETAIL.kind==='tufin'){
+    const tog=document.createElement('div'); tog.className='feed advtoggle'; tog.id='advToggle';
+    tog.innerHTML='▸ Advanced — raw feeds';
+    tog.onclick=()=>{ feedWrap.classList.toggle('hidden');
+      tog.innerHTML=(feedWrap.classList.contains('hidden')?'▸':'▾')+' Advanced — raw feeds'; };
+    side.appendChild(tog);
+  }
   DETAIL.feeds.forEach(f=>{
-    const h=document.createElement('div'); h.className='feed'; h.textContent=f.name; side.appendChild(h);
+    const h=document.createElement('div'); h.className='feed'; h.textContent=f.name; feedWrap.appendChild(h);
     f.query_ids.forEach(qid=>{
       const q=qById[qid]; if(!q) return;
       const row=document.createElement('div'); row.className='q'; row.dataset.id=q.id;
       row.innerHTML='<span><span class="qid">'+esc(q.id)+'</span> <span class="qname">'+esc(q.name)+'</span></span>'+
         '<span class="badge b-'+q.status+'">'+q.status.replace(/_/g,' ')+'</span>';
-      row.onclick=()=>select(q.id); side.appendChild(row);
+      row.onclick=()=>select(q.id); feedWrap.appendChild(row);
     });
   });
+  side.appendChild(feedWrap);
 }
 
 function select(id){
