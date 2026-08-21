@@ -402,6 +402,40 @@ def test_change_detail_folds_in_object_changes():
     assert "srv-a" in o1["summary"]
 
 
+def test_change_detail_object_widening_and_blast_radius():
+    # Two rules reference group g1; the group gains a member (widened) and a host
+    # object h1 broadens its subnet. Rules themselves are unchanged.
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {"revisions": [
+        {"id": "1", "date": "2026-01-01", "time": "00:00:00", "admin": "jane"},
+        {"id": "2", "date": "2026-01-02", "time": "00:00:00", "admin": "jane"},
+    ]}
+    rules = {"rules": [
+        {"uid": "r1", "src_network": [{"uid": "g1", "display_name": "Web-Servers"}],
+         "dst_network": [{"ip": "1.1.1.1"}], "dst_service": [{"display_name": "https"}], "action": "accept"},
+        {"uid": "r2", "src_network": [{"uid": "g1"}], "dst_network": [{"ip": "2.2.2.2"}], "action": "accept"},
+        {"uid": "r3", "src_network": [{"uid": "h1", "display_name": "sat01"}], "action": "accept"},
+    ]}
+    mapping["revisions/1/rules.json"] = rules
+    mapping["revisions/2/rules.json"] = rules  # rules unchanged; only objects move
+    mapping["revisions/1/network_objects.json"] = {"network_objects": [
+        {"uid": "g1", "display_name": "Web-Servers", "type": "group", "members": [{"uid": "m1"}]},
+        {"uid": "h1", "display_name": "sat01", "type": "subnet", "ip": "10.0.0.0", "netmask": "255.255.255.0"},
+    ]}
+    mapping["revisions/2/network_objects.json"] = {"network_objects": [
+        {"uid": "g1", "display_name": "Web-Servers", "type": "group", "members": [{"uid": "m1"}, {"uid": "m2"}]},
+        {"uid": "h1", "display_name": "sat01", "type": "subnet", "ip": "10.0.0.0", "netmask": "255.255.0.0"},
+    ]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    by = {r[result.column_names.index("rule.uid")]:
+          dict(zip(result.column_names, r)) for r in result.rows}
+
+    assert by["g1"]["risk"] == "widened (members added)"
+    assert by["g1"]["blast_radius"] == "2"        # r1 and r2 both use the group
+    assert by["h1"]["risk"] == "widened (broader subnet)"   # /24 -> /16
+    assert by["h1"]["blast_radius"] == "1"        # only r3 uses it
+
+
 def test_change_detail_ignores_pure_rename():
     mapping = dict(DEVICES)
     mapping["devices/1/revisions.json"] = {

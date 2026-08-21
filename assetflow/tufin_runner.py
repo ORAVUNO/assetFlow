@@ -878,6 +878,77 @@ def _object_summary(change_type: str, name: str, before: dict, after: dict) -> s
     return f"Modified object '{label}' — " + "; ".join(parts) if parts else f"Modified object '{label}'"
 
 
+# --- security lens: did an object change *widen* access, and how many rules
+# does it affect (blast radius)? ------------------------------------------- #
+
+def _as_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    return [] if value in (None, "") else [value]
+
+
+def _object_member_keys(obj: dict) -> set:
+    keys = set()
+    for item in _as_list(_first(obj, "members", "member")):
+        if isinstance(item, dict):
+            keys.add(str(_first(item, "uid", "id", "display_name", "name", "ip")))
+        elif item not in (None, ""):
+            keys.add(str(item))
+    return {k for k in keys if k}
+
+
+def _prefix_len(obj: dict) -> Optional[int]:
+    """CIDR prefix length of a host/subnet object (smaller = broader)."""
+    ip = textish(_first(obj, "ip", "ip_address", "value"))
+    if "/" in ip:
+        try:
+            return int(ip.split("/", 1)[1])
+        except ValueError:
+            pass
+    netmask = textish(_first(obj, "netmask"))
+    if netmask.isdigit():
+        return int(netmask)
+    if netmask.count(".") == 3:
+        try:
+            return sum(bin(int(o)).count("1") for o in netmask.split("."))
+        except ValueError:
+            pass
+    return None
+
+
+def _object_risk(before: dict, after: dict) -> str:
+    """Classify a modified object as widened / narrowed / changed access.
+
+    A *widening* (members added, or a broader subnet) increases what every rule
+    using the object permits — the security-relevant direction.
+    """
+    bm, am = _object_member_keys(before), _object_member_keys(after)
+    if bm or am:
+        if am - bm and not (bm - am):
+            return "widened (members added)"
+        if bm - am and not (am - bm):
+            return "narrowed (members removed)"
+        if am != bm:
+            return "members changed"
+    bp, ap = _prefix_len(before), _prefix_len(after)
+    if bp is not None and ap is not None and bp != ap:
+        return "widened (broader subnet)" if ap < bp else "narrowed (tighter subnet)"
+    return "changed"
+
+
+def _rule_object_refs(rules: Dict[str, dict]) -> Dict[str, set]:
+    """Map each referenced object (by uid and by name) → the rule uids using it."""
+    idx: Dict[str, set] = {}
+    for ruid, rule in rules.items():
+        for netval in (_rule_src(rule), _rule_dst(rule)):
+            for item in _as_list(netval):
+                if isinstance(item, dict):
+                    for k in (_first(item, "uid", "id"), _first(item, "display_name", "name")):
+                        if k:
+                            idx.setdefault(str(k), set()).add(ruid)
+    return idx
+
+
 def _collect_change_detail(
     client, scan: int, time_range: Optional[str] = None, watermark_store=None
 ) -> Tuple[List[str], List[List[Any]]]:
@@ -899,7 +970,7 @@ def _collect_change_detail(
     """
     columns = [
         "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
-        "change_type", "entity", "rule.uid", "summary", "changed_fields",
+        "change_type", "entity", "rule.uid", "summary", "changed_fields", "risk", "blast_radius",
         "src_zone", "source", "dst_zone", "destination", "service",
         "before", "after", "authorized", "requester",
     ]
@@ -970,7 +1041,7 @@ def _collect_change_detail(
                     changed_fields = ""
                 dev_rows.append([
                     name, new_id, when, admin, action, policy_package, change_type, "rule", uid,
-                    _change_summary(change_type, before, after), changed_fields,
+                    _change_summary(change_type, before, after), changed_fields, "", "",
                     textish(_rule_src_zone(ctx)), _rule_any(_rule_src(ctx)),
                     textish(_rule_dst_zone(ctx)), _rule_any(_rule_dst(ctx)),
                     _rule_any(_rule_svc(ctx)),
@@ -979,16 +1050,27 @@ def _collect_change_detail(
                     status, requester,
                 ])
 
+            # Which rules reference each object (blast radius). A removed object's
+            # references live in the pre-change rulebase; otherwise the after one.
+            after_refs = _rule_object_refs(after_rules)
+            before_refs = _rule_object_refs(before_rules)
+
             def emit_obj(change_type: str, uid: str, before: dict, after: dict) -> None:
                 # A rule can reference a named object; editing the object changes
                 # what every rule using it permits while the rule text is unchanged.
-                # Folding object edits into the same stream surfaces those.
+                # Folding object edits into the same stream surfaces those, tagged
+                # with whether access *widened* and how many rules it affects.
                 ctx = after or before
+                nm = _object_name(ctx)
                 changed_fields = (", ".join(f for f, _, _ in _object_field_delta(before, after))
                                   if change_type == "modified" else "")
+                risk = _object_risk(before, after) if change_type == "modified" else ""
+                refs = before_refs if change_type == "removed" else after_refs
+                blast = len(refs.get(str(uid), set()) | refs.get(str(nm), set()))
                 dev_rows.append([
                     name, new_id, when, admin, action, policy_package, change_type, "object", uid,
-                    _object_summary(change_type, _object_name(ctx), before, after), changed_fields,
+                    _object_summary(change_type, nm, before, after), changed_fields,
+                    risk, (str(blast) if blast else ""),
                     "", "", "", "", "",  # zone/source/dest/service are rule-only
                     _object_disp(before) if before else "",
                     _object_disp(after) if after else "",

@@ -1460,6 +1460,9 @@ async function openChangeDashboard(){
   const act=d.by_action||{};
   let automatic=0, manual=0;
   Object.keys(act).forEach(k=>{ if(/automat/i.test(k)) automatic+=act[k]; else if(k) manual+=act[k]; });
+  const risk=d.by_risk||{};
+  let widened=0;
+  Object.keys(risk).forEach(k=>{ if(/widen/i.test(k)) widened+=risk[k]; });
   let h='<h2>Changes Dashboard — '+esc(DETAIL.name)+'</h2>'+
     '<div class="sub">Aggregated from the deduplicated Change Log. Run Change Detail (TUF008) to populate; TUF001/TUF003/TUF007 add inventory context.</div>'+
     '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">'+
@@ -1470,6 +1473,7 @@ async function openChangeDashboard(){
     '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px">'+
       tile('Automatic', automatic, 'system / auto-install')+
       tile('Manual', manual, 'named admin action')+
+      tile('Widened access', widened, 'object change grew scope')+
     '</div>'+
     '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px">'+
       tile('Devices', inv.devices?inv.devices.value:null,'TUF001')+

@@ -317,6 +317,8 @@ queries:
       - rule.uid               # rule uid, or the network-object uid when entity=object
       - summary                # plain-language "what happened" for this unit change
       - changed_fields         # for a modification: which fields changed
+      - risk                   # object change: widened / narrowed / changed access
+      - blast_radius           # object change: how many rules reference the object
       - src_zone               # the changed rule's zones/source/dest/service
       - source
       - dst_zone

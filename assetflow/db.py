@@ -146,6 +146,8 @@ class TufinChange(Base):
     changed_at: Mapped[str] = mapped_column(String(64), default="")
     summary: Mapped[str] = mapped_column(Text, default="")
     changed_fields: Mapped[str] = mapped_column(String(256), default="")
+    risk: Mapped[str] = mapped_column(String(64), default="")
+    blast_radius: Mapped[str] = mapped_column(String(16), default="")
     action: Mapped[str] = mapped_column(String(64), default="")
     policy_package: Mapped[str] = mapped_column(String(256), default="")
     src_zone: Mapped[str] = mapped_column(String(256), default="")
@@ -172,6 +174,8 @@ class TufinChange(Base):
             "rule.uid": self.rule_uid,
             "summary": self.summary,
             "changed_fields": self.changed_fields,
+            "risk": self.risk,
+            "blast_radius": self.blast_radius,
             "src_zone": self.src_zone,
             "source": self.source,
             "dst_zone": self.dst_zone,
@@ -187,7 +191,7 @@ class TufinChange(Base):
 # Column order for the change-log view (matches the change_detail result shape).
 _CHANGE_COLUMNS = [
     "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
-    "change_type", "entity", "rule.uid", "summary", "changed_fields",
+    "change_type", "entity", "rule.uid", "summary", "changed_fields", "risk", "blast_radius",
     "src_zone", "source", "dst_zone", "destination", "service",
     "before", "after", "authorized", "requester",
 ]
@@ -299,8 +303,8 @@ def init_engine(url: Optional[str] = None):
 # SQLite database needs these added by hand (all nullable text, default '').
 _ADDED_COLUMNS = {
     "tufin_changes": [
-        "entity", "summary", "changed_fields", "action", "policy_package",
-        "src_zone", "source", "dst_zone", "destination", "service",
+        "entity", "summary", "changed_fields", "risk", "blast_radius", "action",
+        "policy_package", "src_zone", "source", "dst_zone", "destination", "service",
     ],
 }
 
@@ -669,6 +673,8 @@ def record_changes(adapter: str, result) -> int:
                     changed_at=str(r.get("@timestamp", "")),
                     summary=str(r.get("summary", "")),
                     changed_fields=str(r.get("changed_fields", "")),
+                    risk=str(r.get("risk", "")),
+                    blast_radius=str(r.get("blast_radius", "")),
                     action=str(r.get("action", "")),
                     policy_package=str(r.get("policy_package", "")),
                     src_zone=str(r.get("src_zone", "")),
@@ -728,6 +734,7 @@ def change_dashboard(adapter: str, recent: int = 25, top: int = 10) -> dict:
         by_type = {row["key"]: row["count"] for row in grouped(TufinChange.change_type)}
         by_auth = {row["key"]: row["count"] for row in grouped(TufinChange.authorized)}
         by_action = {row["key"]: row["count"] for row in grouped(TufinChange.action)}
+        by_risk = {row["key"]: row["count"] for row in grouped(TufinChange.risk) if row["key"]}
         by_device = grouped(TufinChange.device_name, top)
         by_admin = grouped(TufinChange.changed_by, top)
 
@@ -744,6 +751,7 @@ def change_dashboard(adapter: str, recent: int = 25, top: int = 10) -> dict:
         "by_type": by_type,
         "by_authorization": by_auth,
         "by_action": by_action,
+        "by_risk": by_risk,
         "top_devices": by_device,
         "top_admins": by_admin,
         "recent": {
