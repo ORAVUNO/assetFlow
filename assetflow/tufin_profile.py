@@ -40,10 +40,10 @@ _DEVICE_ATTRS = [
 ]
 
 # change-log columns copied into each device's recent-changes list
-_CHANGE_KEYS = ("revision.id", "@timestamp", "changed_by", "action", "policy_package",
+_CHANGE_KEYS = ("revision.id", "@timestamp", "changed_by", "revision.action", "policy_package",
                 "change_type", "entity", "rule.uid", "summary", "changed_fields", "risk",
                 "blast_radius", "src_zone", "source", "dst_zone", "destination", "service",
-                "before", "after", "authorized", "requester")
+                "rule.action", "before", "after", "authorized", "requester")
 _MAX_RECENT = 25
 
 

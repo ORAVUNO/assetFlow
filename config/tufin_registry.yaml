@@ -310,7 +310,7 @@ queries:
       - revision.id            # the new revision
       - "@timestamp"           # revision date + time
       - changed_by             # RevisionDTO.admin ((automatic)/(unattributed) when blank)
-      - action                 # RevisionDTO.action (automatic / installed …)
+      - revision.action        # RevisionDTO.action — how it was installed (automatic / installed …)
       - policy_package         # RevisionDTO.policyPackage
       - change_type            # added / modified / removed / moved
       - entity                 # rule | object (network-object edits share this stream)
@@ -324,6 +324,7 @@ queries:
       - dst_zone
       - destination
       - service
+      - rule.action            # the rule's own action (accept / drop / reject) — for ticket matching
       - before                 # rule effect before the change
       - after                  # rule effect after the change
       - authorized             # ChangeAuthorizationDTO.status (if enabled)

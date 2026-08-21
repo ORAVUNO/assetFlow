@@ -148,13 +148,14 @@ class TufinChange(Base):
     changed_fields: Mapped[str] = mapped_column(String(256), default="")
     risk: Mapped[str] = mapped_column(String(64), default="")
     blast_radius: Mapped[str] = mapped_column(String(16), default="")
-    action: Mapped[str] = mapped_column(String(64), default="")
+    action: Mapped[str] = mapped_column(String(64), default="")  # the REVISION action
     policy_package: Mapped[str] = mapped_column(String(256), default="")
     src_zone: Mapped[str] = mapped_column(String(256), default="")
     source: Mapped[str] = mapped_column(Text, default="")
     dst_zone: Mapped[str] = mapped_column(String(256), default="")
     destination: Mapped[str] = mapped_column(Text, default="")
     service: Mapped[str] = mapped_column(Text, default="")
+    rule_action: Mapped[str] = mapped_column(String(32), default="")  # accept/drop/reject
     before: Mapped[str] = mapped_column(Text, default="")
     after: Mapped[str] = mapped_column(Text, default="")
     authorized: Mapped[str] = mapped_column(String(32), default="")
@@ -167,7 +168,7 @@ class TufinChange(Base):
             "revision.id": self.revision_id,
             "@timestamp": self.changed_at,
             "changed_by": self.changed_by,
-            "action": self.action,
+            "revision.action": self.action,
             "policy_package": self.policy_package,
             "change_type": self.change_type,
             "entity": self.entity,
@@ -181,6 +182,7 @@ class TufinChange(Base):
             "dst_zone": self.dst_zone,
             "destination": self.destination,
             "service": self.service,
+            "rule.action": self.rule_action,
             "before": self.before,
             "after": self.after,
             "authorized": self.authorized,
@@ -190,9 +192,9 @@ class TufinChange(Base):
 
 # Column order for the change-log view (matches the change_detail result shape).
 _CHANGE_COLUMNS = [
-    "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
+    "host.name", "revision.id", "@timestamp", "changed_by", "revision.action", "policy_package",
     "change_type", "entity", "rule.uid", "summary", "changed_fields", "risk", "blast_radius",
-    "src_zone", "source", "dst_zone", "destination", "service",
+    "src_zone", "source", "dst_zone", "destination", "service", "rule.action",
     "before", "after", "authorized", "requester",
 ]
 
@@ -305,6 +307,7 @@ _ADDED_COLUMNS = {
     "tufin_changes": [
         "entity", "summary", "changed_fields", "risk", "blast_radius", "action",
         "policy_package", "src_zone", "source", "dst_zone", "destination", "service",
+        "rule_action",
     ],
 }
 
@@ -675,13 +678,14 @@ def record_changes(adapter: str, result) -> int:
                     changed_fields=str(r.get("changed_fields", "")),
                     risk=str(r.get("risk", "")),
                     blast_radius=str(r.get("blast_radius", "")),
-                    action=str(r.get("action", "")),
+                    action=str(r.get("revision.action", r.get("action", ""))),
                     policy_package=str(r.get("policy_package", "")),
                     src_zone=str(r.get("src_zone", "")),
                     source=str(r.get("source", "")),
                     dst_zone=str(r.get("dst_zone", "")),
                     destination=str(r.get("destination", "")),
                     service=str(r.get("service", "")),
+                    rule_action=str(r.get("rule.action", "")),
                     before=str(r.get("before", "")),
                     after=str(r.get("after", "")),
                     authorized=str(r.get("authorized", "")),

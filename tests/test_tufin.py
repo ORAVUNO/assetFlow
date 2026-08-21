@@ -312,7 +312,8 @@ def test_change_detail_automatic_action_labels_the_actor():
     result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
     row = dict(zip(result.column_names, result.rows[0]))
     assert row["change_type"] == "added" and row["rule.uid"] == "b"
-    assert row["action"] == "automatic"
+    assert row["revision.action"] == "automatic"   # how it was installed
+    assert row["rule.action"] == "accept"          # the rule's own action (for ticket matching)
     assert row["changed_by"] == "(automatic)"      # blank actor labelled from the action
     assert row["policy_package"] == "KWL_DCN_INTERNET_ACP"
     assert row["source"] == "10.1.1.1" and row["destination"] == "web"
