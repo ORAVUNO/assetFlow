@@ -140,6 +140,7 @@ class TufinChange(Base):
     revision_id: Mapped[str] = mapped_column(String(64), default="")
     rule_uid: Mapped[str] = mapped_column(String(128), default="")
     change_type: Mapped[str] = mapped_column(String(16), default="")
+    entity: Mapped[str] = mapped_column(String(16), default="rule")
     device_name: Mapped[str] = mapped_column(String(256), default="")
     changed_by: Mapped[str] = mapped_column(String(256), default="")
     changed_at: Mapped[str] = mapped_column(String(64), default="")
@@ -167,6 +168,7 @@ class TufinChange(Base):
             "action": self.action,
             "policy_package": self.policy_package,
             "change_type": self.change_type,
+            "entity": self.entity,
             "rule.uid": self.rule_uid,
             "summary": self.summary,
             "changed_fields": self.changed_fields,
@@ -185,7 +187,7 @@ class TufinChange(Base):
 # Column order for the change-log view (matches the change_detail result shape).
 _CHANGE_COLUMNS = [
     "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
-    "change_type", "rule.uid", "summary", "changed_fields",
+    "change_type", "entity", "rule.uid", "summary", "changed_fields",
     "src_zone", "source", "dst_zone", "destination", "service",
     "before", "after", "authorized", "requester",
 ]
@@ -297,8 +299,8 @@ def init_engine(url: Optional[str] = None):
 # SQLite database needs these added by hand (all nullable text, default '').
 _ADDED_COLUMNS = {
     "tufin_changes": [
-        "summary", "changed_fields", "action", "policy_package", "src_zone",
-        "source", "dst_zone", "destination", "service",
+        "entity", "summary", "changed_fields", "action", "policy_package",
+        "src_zone", "source", "dst_zone", "destination", "service",
     ],
 }
 
@@ -661,6 +663,7 @@ def record_changes(adapter: str, result) -> int:
                     revision_id=key[0],
                     rule_uid=key[1],
                     change_type=key[2],
+                    entity=str(r.get("entity", "rule") or "rule"),
                     device_name=str(r.get("host.name", "")),
                     changed_by=str(r.get("changed_by", "")),
                     changed_at=str(r.get("@timestamp", "")),

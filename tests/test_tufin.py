@@ -365,6 +365,43 @@ def test_change_detail_detects_disable_and_move():
     assert "Moved" in by["r3"]["summary"] and by["r3"]["changed_fields"] == "position"
 
 
+def test_change_detail_folds_in_object_changes():
+    # Same revision pair changes a rule AND edits network objects; both kinds
+    # land in the one change stream, tagged by `entity`.
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {"revisions": [
+        {"id": "1", "date": "2026-01-01", "time": "00:00:00", "admin": "jane"},
+        {"id": "2", "date": "2026-01-02", "time": "00:00:00", "admin": "jane"},
+    ]}
+    mapping["revisions/1/rules.json"] = {"rules": [
+        {"uid": "r1", "src_network": "a", "dst_network": "b", "dst_service": "tcp/80", "action": "accept"},
+    ]}
+    mapping["revisions/2/rules.json"] = {"rules": [
+        {"uid": "r1", "src_network": "a", "dst_network": "b", "dst_service": "tcp/443", "action": "accept"},
+    ]}
+    # o1 ip modified, o2 added, o3 removed.
+    mapping["revisions/1/network_objects.json"] = {"network_objects": [
+        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.9"},
+        {"uid": "o3", "display_name": "old", "type": "host", "ip": "10.0.0.3"},
+    ]}
+    mapping["revisions/2/network_objects.json"] = {"network_objects": [
+        {"uid": "o1", "display_name": "srv-a", "type": "host", "ip": "10.0.0.10"},
+        {"uid": "o2", "display_name": "srv-b", "type": "host", "ip": "10.0.0.20"},
+    ]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    rows = [dict(zip(result.column_names, r)) for r in result.rows]
+    by = {(r["entity"], r["change_type"], r["rule.uid"]): r for r in rows}
+
+    assert ("rule", "modified", "r1") in by
+    assert ("object", "modified", "o1") in by
+    assert ("object", "added", "o2") in by
+    assert ("object", "removed", "o3") in by
+    o1 = by[("object", "modified", "o1")]
+    assert o1["changed_fields"] == "value"
+    assert "10.0.0.9" in o1["before"] and "10.0.0.10" in o1["after"]
+    assert "srv-a" in o1["summary"]
+
+
 def test_change_detail_ignores_pure_rename():
     mapping = dict(DEVICES)
     mapping["devices/1/revisions.json"] = {

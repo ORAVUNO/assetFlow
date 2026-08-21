@@ -822,6 +822,62 @@ def _change_summary(change_type: str, before: dict, after: dict) -> str:
     return "Modified — " + "; ".join(parts) if parts else "Modified rule"
 
 
+# --- network-object change detection (folded into the same change stream) --- #
+
+def _revision_objects_map(client, revision_id: str) -> Dict[str, dict]:
+    objs = _fetch_list(
+        client,
+        (f"revisions/{revision_id}/network_objects.json", f"revisions/{revision_id}/network_objects"),
+        ("network_objects", "network_object"),
+    )
+    out: Dict[str, dict] = {}
+    for obj in objs:
+        key = str(_first(obj, "uid", "id", "display_name", "name"))
+        if key:
+            out[key] = obj
+    return out
+
+
+def _object_type(obj: dict) -> str:
+    return textish(_first(obj, "@xsi.type", "type", "class_name"))
+
+
+def _object_name(obj: dict) -> str:
+    return textish(_first(obj, "display_name", "name"))
+
+
+def _object_disp(obj: dict) -> str:
+    typ = _object_type(obj) or "object"
+    val = _object_value(obj)
+    return f"{typ}: {val}" if val else typ
+
+
+def _object_fp(obj: dict) -> str:
+    return f"{_object_type(obj)} | {_object_value(obj)}"
+
+
+def _object_field_delta(before: dict, after: dict) -> List[Tuple[str, str, str]]:
+    fields = [("type", _object_type), ("value", _object_value),
+              ("comment", lambda o: textish(_first(o, "comment")))]
+    out = []
+    for label, fn in fields:
+        b = fn(before) if before else ""
+        a = fn(after) if after else ""
+        if b != a:
+            out.append((label, b, a))
+    return out
+
+
+def _object_summary(change_type: str, name: str, before: dict, after: dict) -> str:
+    label = name or "(object)"
+    if change_type == "added":
+        return f"Added object '{label}' — {_object_disp(after)}"
+    if change_type == "removed":
+        return f"Removed object '{label}' — {_object_disp(before)}"
+    parts = [f"{f}: {(b or '∅')} → {(a or '∅')}" for f, b, a in _object_field_delta(before, after)]
+    return f"Modified object '{label}' — " + "; ".join(parts) if parts else f"Modified object '{label}'"
+
+
 def _collect_change_detail(
     client, scan: int, time_range: Optional[str] = None, watermark_store=None
 ) -> Tuple[List[str], List[List[Any]]]:
@@ -843,7 +899,7 @@ def _collect_change_detail(
     """
     columns = [
         "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
-        "change_type", "rule.uid", "summary", "changed_fields",
+        "change_type", "entity", "rule.uid", "summary", "changed_fields",
         "src_zone", "source", "dst_zone", "destination", "service",
         "before", "after", "authorized", "requester",
     ]
@@ -872,18 +928,26 @@ def _collect_change_detail(
 
         dev_rows: List[List[Any]] = []
         rules_cache: Dict[str, Dict[str, dict]] = {}
+        objects_cache: Dict[str, Dict[str, dict]] = {}
 
         def rules_for(rev_id: str) -> Dict[str, dict]:
             if rev_id not in rules_cache:
                 rules_cache[rev_id] = _revision_rules(client, rev_id)
             return rules_cache[rev_id]
 
+        def objects_for(rev_id: str) -> Dict[str, dict]:
+            if rev_id not in objects_cache:
+                objects_cache[rev_id] = _revision_objects_map(client, rev_id)
+            return objects_cache[rev_id]
+
         for older, newer in pairs:
             old_id = str(_first(older, "id", "revisionId"))
             new_id = str(_first(newer, "id", "revisionId"))
             before_rules = rules_for(old_id)
             after_rules = rules_for(new_id)
-            if not before_rules and not after_rules:
+            before_objs = objects_for(old_id)
+            after_objs = objects_for(new_id)
+            if not (before_rules or after_rules or before_objs or after_objs):
                 continue
             when = _join_datetime(newer)
             action = textish(_first(newer, "action"))
@@ -905,7 +969,7 @@ def _collect_change_detail(
                 else:
                     changed_fields = ""
                 dev_rows.append([
-                    name, new_id, when, admin, action, policy_package, change_type, uid,
+                    name, new_id, when, admin, action, policy_package, change_type, "rule", uid,
                     _change_summary(change_type, before, after), changed_fields,
                     textish(_rule_src_zone(ctx)), _rule_any(_rule_src(ctx)),
                     textish(_rule_dst_zone(ctx)), _rule_any(_rule_dst(ctx)),
@@ -915,7 +979,23 @@ def _collect_change_detail(
                     status, requester,
                 ])
 
-            # Position tracking so a pure reorder reads as "moved", not modified.
+            def emit_obj(change_type: str, uid: str, before: dict, after: dict) -> None:
+                # A rule can reference a named object; editing the object changes
+                # what every rule using it permits while the rule text is unchanged.
+                # Folding object edits into the same stream surfaces those.
+                ctx = after or before
+                changed_fields = (", ".join(f for f, _, _ in _object_field_delta(before, after))
+                                  if change_type == "modified" else "")
+                dev_rows.append([
+                    name, new_id, when, admin, action, policy_package, change_type, "object", uid,
+                    _object_summary(change_type, _object_name(ctx), before, after), changed_fields,
+                    "", "", "", "", "",  # zone/source/dest/service are rule-only
+                    _object_disp(before) if before else "",
+                    _object_disp(after) if after else "",
+                    status, requester,
+                ])
+
+            # Rules — position tracking so a pure reorder reads as "moved".
             on_lcs = _lcs_keep(
                 [u for u in before_rules if u in after_rules],
                 [u for u in after_rules if u in before_rules],
@@ -931,6 +1011,17 @@ def _collect_change_detail(
             for uid, before in before_rules.items():
                 if uid not in after_rules:
                     emit("removed", uid, before, {})
+
+            # Network objects — added / removed / modified.
+            for uid, after in after_objs.items():
+                before = before_objs.get(uid)
+                if before is None:
+                    emit_obj("added", uid, {}, after)
+                elif _object_fp(before) != _object_fp(after):
+                    emit_obj("modified", uid, before, after)
+            for uid, before in before_objs.items():
+                if uid not in after_objs:
+                    emit_obj("removed", uid, before, {})
         return dev_rows, wm_update
 
     rows: List[List[Any]] = []
