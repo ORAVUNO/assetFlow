@@ -22,6 +22,7 @@ from . import export as export_mod
 from . import merge as merge_mod
 from . import scheduler as scheduler_mod
 from . import service as service_mod
+from . import impact as impact_mod
 from . import reconcile as reconcile_mod
 from . import snapshotdiff as snapshotdiff_mod
 from . import tufin_profile as tufin_profile_mod
@@ -514,6 +515,41 @@ def create_app(
         profile = _build_tufin_profile(a)
         profile["discover"] = run
         return profile
+
+    @app.get("/api/adapters/{adapter_id}/tufin/object-impact")
+    def api_object_impact(
+        adapter_id: str,
+        object: str = QueryParam(...),
+        device: Optional[str] = QueryParam(default=None),
+        member: Optional[str] = QueryParam(default=None),
+    ) -> dict:
+        _get_adapter(adapter_id)
+        rec = db.latest_fetch(adapter_id, "TUF003")  # the effective rulebase
+        if rec is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No saved rulebase — run TUF003 (Effective Policy Rules) or Fetch all first.",
+            )
+        imp = impact_mod.object_impact(object, rec, device=device or None)
+        imp["sentences"] = impact_mod.member_sentences(object, imp, member)
+        imp["ran_at"] = rec.get("ran_at")
+        return imp
+
+    @app.get("/api/adapters/{adapter_id}/tufin/rule-devices")
+    def api_rule_devices(adapter_id: str) -> dict:
+        """Distinct device names present in the saved rulebase (for the picker)."""
+        _get_adapter(adapter_id)
+        rec = db.latest_fetch(adapter_id, "TUF003")
+        if rec is None:
+            return {"devices": []}
+        names = [c["name"] for c in rec["columns"]]
+        di = names.index("host.name") if "host.name" in names else 0
+        seen = []
+        for row in rec["rows"]:
+            v = str(row[di]) if di < len(row) else ""
+            if v and v not in seen:
+                seen.append(v)
+        return {"devices": sorted(seen)}
 
     @app.get("/api/adapters/{adapter_id}/drift")
     def api_drift(adapter_id: str) -> dict:
@@ -1664,6 +1700,61 @@ function renderAuth(){
   t.innerHTML=ht;
 }
 
+// ----- Access Impact: which rules apply to an object / a member added to it -----
+async function openAccessImpact(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovImpact'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading…</p>';
+  let devs=[]; try{ devs=((await j('/api/adapters/'+ADAPTER+'/tufin/rule-devices')).devices)||[]; }catch(e){}
+  m.innerHTML='<h2>Access Impact — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Enter an object (group/host) and, optionally, an IP being added to it. '+
+    'The tool lists every rule that applies to that object — so a member added to it inherits exactly '+
+    'these — and shows who can now reach it. Reads the saved effective rulebase (TUF003).</div>'+
+    '<div class="rcbar">'+
+      '<label>Device (optional)<select id="aiDev"><option value="">— any —</option>'+
+        devs.map(x=>'<option value="'+esc(x)+'">'+esc(x)+'</option>').join('')+'</select></label>'+
+      '<label>Object name<input type="text" id="aiObj" placeholder="e.g. Web-Servers"></label>'+
+      '<label>Member IP (optional)<input type="text" id="aiMem" placeholder="e.g. 10.1.1.9"></label>'+
+      '<button id="aiGo" onclick="aiRun()">Analyze</button>'+
+    '</div><div id="aiout"></div>';
+  if(!devs.length) document.getElementById('aiout').innerHTML=
+    '<p class="hint">No saved rulebase yet — run <b>TUF003</b> (Effective Policy Rules) or <b>Fetch all</b> first.</p>';
+}
+
+async function aiRun(){
+  const obj=(document.getElementById('aiObj').value||'').trim();
+  const dev=document.getElementById('aiDev').value, mem=(document.getElementById('aiMem').value||'').trim();
+  const out=document.getElementById('aiout');
+  if(!obj){ out.innerHTML='<p class="hint">Enter an object name.</p>'; return; }
+  out.innerHTML='<p class="hint">Analyzing…</p>';
+  const p=new URLSearchParams({object:obj}); if(dev) p.set('device',dev); if(mem) p.set('member',mem);
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/tufin/object-impact?'+p.toString()); }
+  catch(e){ out.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  const sents=d.sentences||[];
+  const who=mem?esc(mem):("any member of '"+esc(obj)+"'");
+  let h='<div class="meta">Object <b>'+esc(obj)+'</b>'+(dev?(' on '+esc(dev)):'')+
+    ' is referenced by <b>'+(d.rule_count||0)+'</b> rule(s). '+
+    (mem?('Adding <b>'+esc(mem)+'</b> grants it the access below.'):'A member added to it inherits the access below.')+'</div>';
+  if(!sents.length){ h+='<p class="hint">No rules reference this object. A member added to it gains no access '+
+    '(check the exact object name as it appears in the rulebase).</p>'; out.innerHTML=h; return; }
+  const canReach=sents.filter(s=>s.direction==='can reach');
+  const reachBy=sents.filter(s=>s.direction==='reachable by');
+  const tbl=(title,rows,exposureCol)=>{
+    if(!rows.length) return '';
+    let t='<div class="sheethdr">'+title+' ('+rows.length+')</div><div class="tablewrap"><table><thead><tr>'+
+      '<th>Effective access</th><th>service</th><th>action</th>'+(exposureCol?'<th>reachable by (exposure)</th>':'')+
+      '<th>rule.uid</th><th>device</th></tr></thead><tbody>';
+    rows.forEach(s=>{ t+='<tr><td class="rcfld"><b>'+esc(s.text)+'</b></td><td>'+esc(s.service||'')+'</td>'+
+      '<td>'+esc(s.action||'')+'</td>'+(exposureCol?('<td class="rcfld">'+esc(s.reachable_by||'')+'</td>'):'')+
+      '<td>'+esc(s['rule.uid']||'')+'</td><td>'+esc(s['host.name']||'')+'</td></tr>'; });
+    return t+'</tbody></table></div>';
+  };
+  h+=tbl('Can reach (member is a source)', canReach, false);
+  h+=tbl('Reachable by (member is a destination — check the exposure)', reachBy, true);
+  out.innerHTML=h;
+}
+
 // ----- Tufin revision comparison (SecureTrack-style compare report) -----
 // Reads the saved "Revision Rulebases" (TUF009) snapshot — fetch once, then
 // compare the fetched data offline.
@@ -2052,6 +2143,9 @@ function renderSidebar(){
     const rp=document.createElement('div'); rp.className='q ov'; rp.id='ovRevPolicy';
     rp.innerHTML='<span class="qid">📜 Revision Policy</span>';
     rp.onclick=openRevisionPolicy; side.appendChild(rp);
+    const ai=document.createElement('div'); ai.className='q ov'; ai.id='ovImpact';
+    ai.innerHTML='<span class="qid">🎯 Access Impact</span>';
+    ai.onclick=openAccessImpact; side.appendChild(ai);
   }
   const dl=document.createElement('div'); dl.className='q ov'; dl.id='ovDrift';
   dl.innerHTML='<span class="qid">⇄ Drift Log</span>';
