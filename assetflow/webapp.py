@@ -1985,7 +1985,8 @@ async function runAll(){
   const btn=document.getElementById('fetchall'); const label=btn.textContent;
   btn.disabled=true; btn.textContent='Fetching all…';
   try{
-    const d=await j('/api/adapters/'+ADAPTER+'/run-all?limit=200',{method:'POST'});
+    // No limit — fetch every row of every feed (paginated across the whole estate).
+    const d=await j('/api/adapters/'+ADAPTER+'/run-all',{method:'POST'});
     const nc=d.results.reduce((s,r)=>s+(r.new_changes||0),0);
     alert('Fetched all endpoints for '+DETAIL.name+':\n'+d.ran+' ran, '+d.failed+' failed'+
           (nc?('\n'+nc+' new change(s) recorded'):''));
