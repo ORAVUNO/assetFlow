@@ -143,6 +143,13 @@ class TufinChange(Base):
     device_name: Mapped[str] = mapped_column(String(256), default="")
     changed_by: Mapped[str] = mapped_column(String(256), default="")
     changed_at: Mapped[str] = mapped_column(String(64), default="")
+    action: Mapped[str] = mapped_column(String(64), default="")
+    policy_package: Mapped[str] = mapped_column(String(256), default="")
+    src_zone: Mapped[str] = mapped_column(String(256), default="")
+    source: Mapped[str] = mapped_column(Text, default="")
+    dst_zone: Mapped[str] = mapped_column(String(256), default="")
+    destination: Mapped[str] = mapped_column(Text, default="")
+    service: Mapped[str] = mapped_column(Text, default="")
     before: Mapped[str] = mapped_column(Text, default="")
     after: Mapped[str] = mapped_column(Text, default="")
     authorized: Mapped[str] = mapped_column(String(32), default="")
@@ -155,8 +162,15 @@ class TufinChange(Base):
             "revision.id": self.revision_id,
             "@timestamp": self.changed_at,
             "changed_by": self.changed_by,
+            "action": self.action,
+            "policy_package": self.policy_package,
             "change_type": self.change_type,
             "rule.uid": self.rule_uid,
+            "src_zone": self.src_zone,
+            "source": self.source,
+            "dst_zone": self.dst_zone,
+            "destination": self.destination,
+            "service": self.service,
             "before": self.before,
             "after": self.after,
             "authorized": self.authorized,
@@ -166,8 +180,9 @@ class TufinChange(Base):
 
 # Column order for the change-log view (matches the change_detail result shape).
 _CHANGE_COLUMNS = [
-    "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
-    "rule.uid", "before", "after", "authorized", "requester",
+    "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
+    "change_type", "rule.uid", "src_zone", "source", "dst_zone", "destination", "service",
+    "before", "after", "authorized", "requester",
 ]
 
 
@@ -267,8 +282,38 @@ def init_engine(url: Optional[str] = None):
     connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
     _engine = create_engine(url, future=True, connect_args=connect_args)
     Base.metadata.create_all(_engine)
+    _migrate_added_columns(_engine)
     _Session = sessionmaker(_engine, expire_on_commit=False, class_=Session)
     return _engine
+
+
+# Columns added to existing tables after their first release. ``create_all``
+# only creates missing *tables*, not missing *columns*, so an already-created
+# SQLite database needs these added by hand (all nullable text, default '').
+_ADDED_COLUMNS = {
+    "tufin_changes": [
+        "action", "policy_package", "src_zone", "source", "dst_zone",
+        "destination", "service",
+    ],
+}
+
+
+def _migrate_added_columns(engine) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        for table, columns in _ADDED_COLUMNS.items():
+            try:
+                existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            except Exception:  # pragma: no cover - non-sqlite backends
+                existing = set()
+                if not str(engine.url).startswith("sqlite"):
+                    continue
+            if not existing:
+                continue  # table absent (a fresh DB already has the new schema)
+            for name in columns:
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} TEXT DEFAULT ''"))
 
 
 def _session() -> Session:
@@ -614,6 +659,13 @@ def record_changes(adapter: str, result) -> int:
                     device_name=str(r.get("host.name", "")),
                     changed_by=str(r.get("changed_by", "")),
                     changed_at=str(r.get("@timestamp", "")),
+                    action=str(r.get("action", "")),
+                    policy_package=str(r.get("policy_package", "")),
+                    src_zone=str(r.get("src_zone", "")),
+                    source=str(r.get("source", "")),
+                    dst_zone=str(r.get("dst_zone", "")),
+                    destination=str(r.get("destination", "")),
+                    service=str(r.get("service", "")),
                     before=str(r.get("before", "")),
                     after=str(r.get("after", "")),
                     authorized=str(r.get("authorized", "")),
@@ -665,6 +717,7 @@ def change_dashboard(adapter: str, recent: int = 25, top: int = 10) -> dict:
 
         by_type = {row["key"]: row["count"] for row in grouped(TufinChange.change_type)}
         by_auth = {row["key"]: row["count"] for row in grouped(TufinChange.authorized)}
+        by_action = {row["key"]: row["count"] for row in grouped(TufinChange.action)}
         by_device = grouped(TufinChange.device_name, top)
         by_admin = grouped(TufinChange.changed_by, top)
 
@@ -680,6 +733,7 @@ def change_dashboard(adapter: str, recent: int = 25, top: int = 10) -> dict:
         "total_changes": total,
         "by_type": by_type,
         "by_authorization": by_auth,
+        "by_action": by_action,
         "top_devices": by_device,
         "top_admins": by_admin,
         "recent": {

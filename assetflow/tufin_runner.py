@@ -815,8 +815,9 @@ def _collect_change_detail(
     Rules for a given revision are fetched once and reused across adjacent pairs.
     """
     columns = [
-        "host.name", "revision.id", "@timestamp", "changed_by", "change_type",
-        "rule.uid", "before", "after", "authorized", "requester",
+        "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
+        "change_type", "rule.uid", "src_zone", "source", "dst_zone", "destination", "service",
+        "before", "after", "authorized", "requester",
     ]
     incremental = (time_range or "").lower() in INCREMENTAL_TOKENS and watermark_store is not None
     devices = _scan(_fetch_devices(client), scan)
@@ -857,12 +858,23 @@ def _collect_change_detail(
             if not before_rules and not after_rules:
                 continue
             when = _join_datetime(newer)
+            action = textish(_first(newer, "action"))
+            policy_package = textish(_first(newer, "policyPackage", "policy_package", "policy"))
             admin = textish(_first(newer, "admin", "admin_name", "changed_by", "user"))
+            if not admin:  # SecureTrack leaves the actor blank for system/automatic installs
+                admin = "(automatic)" if "automat" in action.lower() else "(unattributed)"
             status, requester = _authorization(client, old_id, new_id)
 
             def emit(change_type: str, uid: str, before: dict, after: dict) -> None:
+                # Describe the rule with its actual fields (the state that exists
+                # after the change, or the pre-change state for a removed rule) so
+                # a reader has full context without decoding the compact summary.
+                ctx = after or before
                 dev_rows.append([
-                    name, new_id, when, admin, change_type, uid,
+                    name, new_id, when, admin, action, policy_package, change_type, uid,
+                    textish(_rule_src_zone(ctx)), _rule_any(_rule_src(ctx)),
+                    textish(_rule_dst_zone(ctx)), _rule_any(_rule_dst(ctx)),
+                    _rule_any(_rule_svc(ctx)),
                     _rule_compact(before) if before else "",
                     _rule_compact(after) if after else "",
                     status, requester,

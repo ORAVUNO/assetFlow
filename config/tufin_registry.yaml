@@ -308,9 +308,16 @@ queries:
       - host.name              # device
       - revision.id            # the new revision
       - "@timestamp"           # revision date + time
-      - changed_by             # RevisionDTO.admin
+      - changed_by             # RevisionDTO.admin ((automatic)/(unattributed) when blank)
+      - action                 # RevisionDTO.action (automatic / installed …)
+      - policy_package         # RevisionDTO.policyPackage
       - change_type            # added / modified / removed
       - rule.uid
+      - src_zone               # the changed rule's zones/source/dest/service
+      - source
+      - dst_zone
+      - destination
+      - service
       - before                 # rule effect before the change
       - after                  # rule effect after the change
       - authorized             # ChangeAuthorizationDTO.status (if enabled)

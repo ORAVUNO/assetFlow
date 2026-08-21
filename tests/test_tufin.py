@@ -287,6 +287,35 @@ def test_change_detail_diffs_revisions_with_authorization():
     assert modified["revision.id"] == "1052"
     assert modified["authorized"] == "unauthorized"
     assert modified["requester"] == "Alice Requester"
+    # Full context: the changed rule's actual after-state fields, plus action.
+    assert modified["source"] == "10.0.0.0/24"
+    assert modified["destination"] == "db"
+    assert modified["service"] == "tcp/443"
+    # A removed rule carries its pre-change fields (there is no after-state).
+    assert by_type[("removed", "r20")]["destination"] == "net"
+
+
+def test_change_detail_automatic_action_labels_the_actor():
+    # A revision with no admin but an "automatic" action -> changed_by filled.
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {"revisions": [
+        {"id": "1", "date": "2026-01-01", "time": "00:00:00", "action": "automatic",
+         "policyPackage": "KWL_DCN_INTERNET_ACP"},
+        {"id": "2", "date": "2026-01-02", "time": "00:00:00", "action": "automatic",
+         "policyPackage": "KWL_DCN_INTERNET_ACP"},  # no admin
+    ]}
+    mapping["revisions/1/rules.json"] = {"rules": [{"uid": "a", "service": "tcp/80", "action": "accept"}]}
+    mapping["revisions/2/rules.json"] = {"rules": [
+        {"uid": "a", "service": "tcp/80", "action": "accept"},
+        {"uid": "b", "src_network": "10.1.1.1", "dst_network": "web", "service": "tcp/443", "action": "accept"},
+    ]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    row = dict(zip(result.column_names, result.rows[0]))
+    assert row["change_type"] == "added" and row["rule.uid"] == "b"
+    assert row["action"] == "automatic"
+    assert row["changed_by"] == "(automatic)"      # blank actor labelled from the action
+    assert row["policy_package"] == "KWL_DCN_INTERNET_ACP"
+    assert row["source"] == "10.1.1.1" and row["destination"] == "web"
 
 
 def test_change_detail_ignores_pure_rename():

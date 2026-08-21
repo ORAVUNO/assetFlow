@@ -1457,12 +1457,19 @@ async function openChangeDashboard(){
     '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">'+esc(label)+'</div>'+
     '<div style="font-size:26px;font-weight:700;margin-top:4px">'+esc(val==null?'—':val)+'</div>'+
     (sub?'<div style="font-size:11px;color:var(--muted)">'+esc(sub)+'</div>':'')+'</div>';
+  const act=d.by_action||{};
+  let automatic=0, manual=0;
+  Object.keys(act).forEach(k=>{ if(/automat/i.test(k)) automatic+=act[k]; else if(k) manual+=act[k]; });
   let h='<h2>Changes Dashboard — '+esc(DETAIL.name)+'</h2>'+
     '<div class="sub">Aggregated from the deduplicated Change Log. Run Change Detail (TUF008) to populate; TUF001/TUF003/TUF007 add inventory context.</div>'+
     '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">'+
       tile('Total changes', d.total_changes)+ tile('Added', t.added||0)+
       tile('Modified', t.modified||0)+ tile('Removed', t.removed||0)+
       tile('Unauthorized', au.unauthorized||0)+
+    '</div>'+
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px">'+
+      tile('Automatic', automatic, 'system / auto-install')+
+      tile('Manual', manual, 'named admin action')+
     '</div>'+
     '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px">'+
       tile('Devices', inv.devices?inv.devices.value:null,'TUF001')+
