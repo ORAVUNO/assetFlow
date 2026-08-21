@@ -126,3 +126,40 @@ def test_change_dashboard_aggregates(tmp_path):
     assert d["top_devices"][0] == {"key": "FW-A", "count": 2}
     assert d["top_admins"][0]["key"] == "jane"
     assert len(d["recent"]["rows"]) == 3
+
+
+def test_change_log_enriched_columns_and_migration(tmp_path):
+    from assetflow import db
+    from assetflow.runner import QueryResult
+    import sqlalchemy as sa
+
+    url = f"sqlite:///{tmp_path}/enrich.db"
+
+    # Simulate an OLD database: create tufin_changes without the new columns.
+    eng = sa.create_engine(url)
+    with eng.begin() as c:
+        c.execute(sa.text(
+            "CREATE TABLE tufin_changes ("
+            "id INTEGER PRIMARY KEY, adapter VARCHAR, revision_id VARCHAR, rule_uid VARCHAR,"
+            " change_type VARCHAR, device_name VARCHAR, changed_by VARCHAR, changed_at VARCHAR,"
+            " before TEXT, after TEXT, authorized VARCHAR, requester VARCHAR,"
+            " first_seen_at DATETIME)"
+        ))
+    eng.dispose()
+
+    # init_engine must migrate the missing columns in without error.
+    db.init_engine(url)
+    cols = [{"name": n} for n in [
+        "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
+        "change_type", "rule.uid", "src_zone", "source", "dst_zone", "destination", "service",
+        "before", "after", "authorized", "requester",
+    ]]
+    rows = [["FW-A", "101", "t", "(automatic)", "automatic", "PKG", "added", "r1",
+             "z1", "10.0.0.1", "z2", "web", "tcp/443", "", "x", "", ""]]
+    assert db.record_changes("tufin", QueryResult(columns=cols, rows=rows)) == 1
+    log = db.change_log("tufin")
+    rec = dict(zip([c["name"] for c in log["columns"]], log["rows"][0]))
+    assert rec["action"] == "automatic" and rec["policy_package"] == "PKG"
+    assert rec["source"] == "10.0.0.1" and rec["service"] == "tcp/443"
+    d = db.change_dashboard("tufin")
+    assert d["by_action"]["automatic"] == 1
