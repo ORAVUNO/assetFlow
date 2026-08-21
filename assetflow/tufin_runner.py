@@ -875,7 +875,19 @@ def _object_summary(change_type: str, name: str, before: dict, after: dict) -> s
     if change_type == "removed":
         return f"Removed object '{label}' — {_object_disp(before)}"
     parts = [f"{f}: {(b or '∅')} → {(a or '∅')}" for f, b, a in _object_field_delta(before, after)]
-    return f"Modified object '{label}' — " + "; ".join(parts) if parts else f"Modified object '{label}'"
+    bm, am = _object_members_map(before), _object_members_map(after)
+    added = [am[k] for k in am if k not in bm]
+    removed = [bm[k] for k in bm if k not in am]
+    member = ""
+    if added or removed:
+        bits = []
+        if added:
+            bits.append("+" + ", ".join(added[:6]))
+        if removed:
+            bits.append("-" + ", ".join(removed[:6]))
+        member = " [members " + " ".join(bits) + "]"
+    body = "; ".join(parts) if parts else "changed"
+    return f"Modified object '{label}' — {body}{member}"
 
 
 # --- security lens: did an object change *widen* access, and how many rules
@@ -888,13 +900,21 @@ def _as_list(value: Any) -> List[Any]:
 
 
 def _object_member_keys(obj: dict) -> set:
-    keys = set()
+    return set(_object_members_map(obj).keys())
+
+
+def _object_members_map(obj: dict) -> Dict[str, str]:
+    """member key → human display (its ip/address, else its name)."""
+    out: Dict[str, str] = {}
     for item in _as_list(_first(obj, "members", "member")):
         if isinstance(item, dict):
-            keys.add(str(_first(item, "uid", "id", "display_name", "name", "ip")))
-        elif item not in (None, ""):
-            keys.add(str(item))
-    return {k for k in keys if k}
+            key = str(_first(item, "uid", "id", "display_name", "name", "ip"))
+            disp = textish(_first(item, "ip", "ip_address", "value", "display_name", "name")) or key
+        else:
+            key = disp = str(item)
+        if key:
+            out[key] = disp
+    return out
 
 
 def _prefix_len(obj: dict) -> Optional[int]:

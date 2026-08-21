@@ -20,6 +20,7 @@ guide is about *what the integration does and how the code does it*.
 - [Deduplicated change log & dashboard](#deduplicated-change-log--dashboard)
 - [Revision snapshots, Compare & Policy (TUF009 / TUF010)](#revision-snapshots-compare--policy-tuf009--tuf010)
 - [Discover — the unified device profile](#discover--the-unified-device-profile)
+- [Access Impact — what a member inherits](#access-impact--what-a-member-inherits)
 - [Authorization — ticket reconciliation](#authorization--ticket-reconciliation)
 - [HTTP API reference](#http-api-reference)
 - [Environment variables](#environment-variables)
@@ -65,6 +66,7 @@ reconciliation treat them uniformly.
 | `config/tufin_registry.yaml` | the resources (TUF001–010) and feeds |
 | `assetflow/db.py` | persistence — fetch snapshots, the deduped change log, tickets; SQLite migrations |
 | `assetflow/tufin_profile.py` | folds all saved fetches into one device-keyed **Discover** profile |
+| `assetflow/impact.py` | which rules apply to an object / a member added to it (Access Impact) |
 | `assetflow/reconcile.py` | matches changes against tickets → authorization verdicts |
 | `assetflow/service.py` | run-and-save, run-all (fetch all), change-log dedup wiring |
 | `assetflow/scheduler.py` | periodic fetches |
@@ -234,6 +236,11 @@ For object changes (`entity = object`) two extra columns quantify risk:
 > across devices (referenced by rules on *other* devices) are under-counted; an
 > estate-wide blast radius is a possible enhancement.
 
+When a modified object gains or loses members, the change **summary** names them
+— e.g. `Modified object 'Web-Servers' — value: … [members +10.1.1.9]` — so a
+reviewer sees exactly *which* IP was added. To see what that member now
+*inherits*, use **Access Impact** (below).
+
 ### Modes (the `range` control)
 
 - **All time / latest** → diffs the latest two revisions per device.
@@ -293,6 +300,56 @@ the latest saved fetches + the change log into one **device-keyed profile**
 
 `GET …/tufin/profile` rebuilds instantly from saved data; `POST …/tufin/discover`
 fetches everything first, then builds.
+
+---
+
+## Access Impact — what a member inherits
+
+`assetflow/impact.py` answers, in plain language a non-firewall admin can read:
+**which rules apply to an object — and therefore to any IP added to it — who can
+reach it, and what it can reach.**
+
+### Why it exists
+
+A common workflow: instead of writing a new rule for a requested "A → B" flow,
+an admin adds the requestor's IP to an **object** already used by an existing
+"A → B" rule. Two things follow that are easy to miss:
+
+1. **The new member silently inherits every rule that references the object.**
+   Access Impact lists them: *"App-Tier → 10.9.9.9 : tcp/443 (accept)"* — the
+   member is now reachable exactly as the object is.
+2. **Unintended reachability.** If the rule's *source* holds several addresses,
+   they can **all** now reach the newly added destination member. Because the
+   impact line carries the rule's *full* source, that exposure is explicit:
+   *"Admin-Jump, 10.0.0.7 → 10.9.9.9 : tcp/22 (accept)"* — both `Admin-Jump` and
+   `10.0.0.7` can now reach it, even if only one was intended.
+
+### How it works
+
+It reads the saved **effective rulebase** (TUF003) and matches the object by
+name in each rule's flattened `source` / `destination` cell (token match, so
+`DB` never matches `DB-Servers`; disabled rules are skipped). No live call and
+no group-membership expansion is needed — a member inherits exactly the rules
+that reference the object. Results split by side:
+
+- **as_source** — the object's members are a *source* → they *can reach* the
+  rule's destination.
+- **as_destination** — the object's members are a *destination* → they are
+  *reachable by* the rule's source (the exposure to watch).
+
+### Using it (UI)
+
+**🎯 Access Impact** (Tufin) — pick an optional device, type the object name
+(and optionally the member IP being added) → two tables: **Can reach** (member
+as source) and **Reachable by** (member as destination, with the *reachable by /
+exposure* column listing every source that can now reach it).
+
+`GET …/tufin/object-impact?object=&device=&member=` returns the same data
+(`as_source`, `as_destination`, and framed `sentences`).
+
+> Matching is by object **name** as it appears in the rulebase; if a rule
+> references the member's address directly (not via the object) that is a
+> separate rule and shows under the address, not the object.
 
 ---
 
@@ -391,6 +448,7 @@ All under `/api/adapters/{adapter_id}`:
 | `GET /tufin/revision-index` | devices + revisions from the saved snapshot |
 | `GET /tufin/revision-compare` | compare two revisions (`device_id`, `old_rev`, `new_rev`) |
 | `GET /tufin/revision-policy` | one revision's full rulebase |
+| `GET /tufin/object-impact` | rules applying to an object / a member added to it (`object`, `device`, `member`) |
 | `POST /tickets/import` · `GET`/`DELETE /tickets` | change-request tickets |
 | `GET /reconcile` | changes annotated with authorization verdicts |
 
