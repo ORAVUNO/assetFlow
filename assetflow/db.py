@@ -101,6 +101,63 @@ class Connection(Base):
         }
 
 
+class Ticket(Base):
+    """An imported firewall change-request ticket, used to authorize changes.
+
+    Populated from the enterprise's own ticketing system (CSV/JSON import). Each
+    row is one approved requested access line item — device + source +
+    destination + service + action + change window — which the reconciliation
+    engine matches detected changes against. Replaced wholesale on each import.
+    """
+
+    __tablename__ = "tickets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(64), index=True)
+    ticket_id: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(32), default="")
+    change_type: Mapped[str] = mapped_column(String(32), default="")
+    device: Mapped[str] = mapped_column(String(256), default="")
+    source: Mapped[str] = mapped_column(Text, default="")
+    destination: Mapped[str] = mapped_column(Text, default="")
+    service: Mapped[str] = mapped_column(String(128), default="")
+    action: Mapped[str] = mapped_column(String(32), default="")
+    window_start: Mapped[str] = mapped_column(String(64), default="")
+    window_end: Mapped[str] = mapped_column(String(64), default="")
+    requester: Mapped[str] = mapped_column(String(256), default="")
+    approver: Mapped[str] = mapped_column(String(256), default="")
+    expiry: Mapped[str] = mapped_column(String(64), default="")
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def to_record(self) -> dict:
+        return {
+            "ticket_id": self.ticket_id, "status": self.status,
+            "change_type": self.change_type, "device": self.device,
+            "source": self.source, "destination": self.destination,
+            "service": self.service, "action": self.action,
+            "window_start": self.window_start, "window_end": self.window_end,
+            "requester": self.requester, "approver": self.approver, "expiry": self.expiry,
+        }
+
+
+# Ticket field name → the aliases an ITSM export might use (case-insensitive).
+_TICKET_ALIASES = {
+    "ticket_id": ("ticket_id", "ticket", "id", "number", "cr", "change", "ref"),
+    "status": ("status", "state", "approval", "approval_status"),
+    "change_type": ("change_type", "type", "operation", "action_type"),
+    "device": ("device", "firewall", "host", "target", "ci", "device_name"),
+    "source": ("source", "src", "source_ip", "src_ip", "from"),
+    "destination": ("destination", "dst", "dest", "dest_ip", "dst_ip", "to"),
+    "service": ("service", "port", "ports", "service_port", "protocol_port"),
+    "action": ("action", "rule_action", "permit", "allow_deny"),
+    "window_start": ("window_start", "start", "planned_start", "implementation_start", "approved_at"),
+    "window_end": ("window_end", "end", "planned_end", "implementation_end", "expiry"),
+    "requester": ("requester", "requested_by", "requestor"),
+    "approver": ("approver", "approved_by", "authorizer"),
+    "expiry": ("expiry", "expires", "expiry_date", "valid_until"),
+}
+
+
 class ChangeWatermark(Base):
     """Last revision id already processed per (adapter, device).
 
@@ -763,6 +820,74 @@ def change_dashboard(adapter: str, recent: int = 25, top: int = 10) -> dict:
             "rows": [[rec[c] for c in _CHANGE_COLUMNS] for rec in recent_rows],
         },
     }
+
+
+# -- change-request tickets (authorization source of truth) -----------------
+
+
+def parse_tickets_csv(text: str) -> List[dict]:
+    """Parse a CSV export into normalized ticket dicts (header aliases honored)."""
+    import csv
+    import io
+
+    reader = csv.DictReader(io.StringIO(text))
+    header_map = {}
+    for raw in (reader.fieldnames or []):
+        key = (raw or "").strip().lower().replace(" ", "_")
+        for field, aliases in _TICKET_ALIASES.items():
+            if key in aliases and field not in header_map.values():
+                header_map[raw] = field
+                break
+    out: List[dict] = []
+    for row in reader:
+        rec = {field: "" for field in _TICKET_ALIASES}
+        for raw, value in row.items():
+            field = header_map.get(raw)
+            if field:
+                rec[field] = str(value or "").strip()
+        if any(rec.values()):
+            out.append(rec)
+    return out
+
+
+def replace_tickets(adapter: str, tickets: List[dict]) -> int:
+    """Replace all tickets for an adapter with the given set; return the count."""
+    now = datetime.now(timezone.utc)
+    with _session() as s:
+        s.query(Ticket).filter(Ticket.adapter == adapter).delete()
+        for t in tickets:
+            s.add(Ticket(
+                adapter=adapter,
+                ticket_id=str(t.get("ticket_id", "")),
+                status=str(t.get("status", "")),
+                change_type=str(t.get("change_type", "")),
+                device=str(t.get("device", "")),
+                source=str(t.get("source", "")),
+                destination=str(t.get("destination", "")),
+                service=str(t.get("service", "")),
+                action=str(t.get("action", "")),
+                window_start=str(t.get("window_start", "")),
+                window_end=str(t.get("window_end", "")),
+                requester=str(t.get("requester", "")),
+                approver=str(t.get("approver", "")),
+                expiry=str(t.get("expiry", "")),
+                imported_at=now,
+            ))
+        s.commit()
+        return len(tickets)
+
+
+def list_tickets(adapter: str) -> List[dict]:
+    with _session() as s:
+        stmt = select(Ticket).where(Ticket.adapter == adapter).order_by(Ticket.id)
+        return [t.to_record() for t in s.scalars(stmt)]
+
+
+def clear_tickets(adapter: str) -> int:
+    with _session() as s:
+        n = s.query(Ticket).filter(Ticket.adapter == adapter).delete()
+        s.commit()
+        return n
 
 
 def get_change_watermark(adapter: str, device_id: str) -> Optional[str]:

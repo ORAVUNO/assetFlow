@@ -22,6 +22,7 @@ from . import export as export_mod
 from . import merge as merge_mod
 from . import scheduler as scheduler_mod
 from . import service as service_mod
+from . import reconcile as reconcile_mod
 from . import snapshotdiff as snapshotdiff_mod
 from . import tufin_profile as tufin_profile_mod
 from . import tufin_runner as tufin_runner_mod
@@ -60,6 +61,10 @@ class ScheduleRequest(BaseModel):
     time_range: str = ""
     limit: Optional[int] = None
     enabled: bool = True
+
+
+class TicketImportRequest(BaseModel):
+    csv: str = ""             # raw CSV text of the change-request export
 
 
 def _manager() -> adapters_mod.AdapterManager:
@@ -348,6 +353,57 @@ def create_app(
     def api_changelog(adapter_id: str) -> dict:
         _get_adapter(adapter_id)
         return db.change_log(adapter_id)
+
+    # --- change-request tickets + authorization reconciliation -------------- #
+    @app.post("/api/adapters/{adapter_id}/tickets/import")
+    def api_tickets_import(adapter_id: str, req: TicketImportRequest) -> dict:
+        _get_adapter(adapter_id)
+        try:
+            tickets = db.parse_tickets_csv(req.csv or "")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"could not parse CSV: {exc}")
+        count = db.replace_tickets(adapter_id, tickets)
+        return {"imported": count}
+
+    @app.get("/api/adapters/{adapter_id}/tickets")
+    def api_tickets_list(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        tickets = db.list_tickets(adapter_id)
+        return {"count": len(tickets), "tickets": tickets}
+
+    @app.delete("/api/adapters/{adapter_id}/tickets")
+    def api_tickets_clear(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        return {"cleared": db.clear_tickets(adapter_id)}
+
+    def _object_index(adapter_id: str) -> dict:
+        """object name → address, from the latest saved network-object fetch, so
+        named sources/destinations in a change resolve for CIDR matching."""
+        index: dict = {}
+        for qid in ("TUF004",):
+            rec = db.latest_fetch(adapter_id, qid)
+            if not rec:
+                continue
+            names = [c["name"] for c in rec["columns"]]
+            try:
+                ni, vi = names.index("object.name"), names.index("object.ip")
+            except ValueError:
+                continue
+            for row in rec["rows"]:
+                nm = str(row[ni]) if ni < len(row) else ""
+                val = str(row[vi]) if vi < len(row) else ""
+                if nm and val and nm not in index:
+                    index[nm] = val
+        return index
+
+    @app.get("/api/adapters/{adapter_id}/reconcile")
+    def api_reconcile(adapter_id: str) -> dict:
+        _get_adapter(adapter_id)
+        changes = db.change_log(adapter_id)
+        tickets = db.list_tickets(adapter_id)
+        result = reconcile_mod.reconcile_changes(changes, tickets, _object_index(adapter_id))
+        result["ticket_count"] = len(tickets)
+        return result
 
     @app.get("/api/adapters/{adapter_id}/change-dashboard")
     def api_change_dashboard(adapter_id: str) -> dict:
@@ -773,6 +829,16 @@ INDEX_HTML = r"""<!doctype html>
   .dtab{background:var(--code);color:var(--text);border:1px solid var(--border);border-radius:7px;
         padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer}
   .dtab.active{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+  /* authorization verdicts */
+  .vtag{display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;
+        padding:1px 7px;border-radius:5px;white-space:nowrap}
+  .v-authorized{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .v-over_provisioned{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}
+  .v-unauthorized{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+  .v-not_applicable{background:var(--code);color:var(--muted)}
+  .authbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+  .authbar textarea{width:100%;min-height:90px;font:12px ui-monospace,Menlo,monospace;
+    border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--text);padding:8px}
   /* unified inventory */
   tr.multi td{background:color-mix(in srgb,var(--accent) 12%,transparent) !important;font-weight:600}
   .invbtn{background:var(--accent);color:var(--accent-fg);border:0;border-radius:7px;
@@ -889,6 +955,7 @@ INDEX_HTML = r"""<!doctype html>
 let ADAPTER=null, DETAIL=null, CURRENT=null, LASTROWS=null, SORT={col:null,dir:1};
 let RCDEVS=[], RPDEVS=[];   // devices (+embedded revisions) from the saved TUF009 snapshot
 let PROFILE=null;           // unified Tufin device-profile (Discover view)
+let AUTHDATA=null;          // last reconciliation result (Authorization view)
 
 async function j(url,opts){const r=await fetch(url,opts);const d=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(d.detail||('HTTP '+r.status)); return d;}
@@ -1497,6 +1564,106 @@ async function openChangeDashboard(){
   else document.getElementById('cdRecent').innerHTML='<p class="hint">No changes recorded yet. Run TUF008 (Change Detail).</p>';
 }
 
+// ----- Authorization: reconcile changes against change-request tickets -----
+async function openAuthorization(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovAuth'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading authorization view…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/reconcile'); }
+  catch(e){ m.innerHTML='<h2>Authorization</h2><div class="err">'+esc(e.message)+'</div>'; return; }
+  AUTHDATA=d; renderAuth();
+}
+
+function authTemplate(){
+  const hdr='ticket_id,status,change_type,device,source,destination,service,action,window_start,window_end,requester,approver,expiry';
+  const ex='CR-1001,approved,add,MBEZI-VPN-ASA-FW,10.1.1.0/24,10.2.0.0/16,tcp/443,allow,2026-08-01,2026-08-31,jdoe,asmith,';
+  const blob=new Blob([hdr+'\n'+ex+'\n'],{type:'text/csv'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='ticket-template.csv'; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+
+function authFile(inp){
+  const f=inp.files&&inp.files[0]; if(!f) return;
+  const r=new FileReader();
+  r.onload=()=>{ const ta=document.getElementById('authCsv'); if(ta) ta.value=r.result; };
+  r.readAsText(f);
+}
+
+async function authImport(){
+  const ta=document.getElementById('authCsv'); const csv=ta?ta.value:'';
+  if(!csv.trim()){ alert('Paste CSV or choose a file first.'); return; }
+  const btn=document.getElementById('authImp'); if(btn){ btn.disabled=true; btn.textContent='Importing…'; }
+  try{
+    const r=await j('/api/adapters/'+ADAPTER+'/tickets/import',{method:'POST',
+      headers:{'content-type':'application/json'}, body:JSON.stringify({csv:csv})});
+    AUTHDATA=await j('/api/adapters/'+ADAPTER+'/reconcile');
+    renderAuth(); alert('Imported '+r.imported+' ticket(s) and re-reconciled.');
+  }catch(e){ alert('Import failed: '+e.message); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent='Import tickets'; } }
+}
+
+async function authClear(){
+  if(!confirm('Remove all imported tickets for this adapter?')) return;
+  try{ await j('/api/adapters/'+ADAPTER+'/tickets',{method:'DELETE'});
+    AUTHDATA=await j('/api/adapters/'+ADAPTER+'/reconcile'); renderAuth();
+  }catch(e){ alert(e.message); }
+}
+
+// focused columns for the reconciled change table
+const AUTH_COLS=['authorization','host.name','change_type','entity','rule.uid',
+  'source','destination','service','rule.action','matched_ticket','auth_confidence','auth_reason'];
+
+function renderAuth(){
+  const m=document.getElementById('main'); const d=AUTHDATA||{summary:{},rows:[],columns:[]};
+  const s=d.summary||{}; const tile=dtile;
+  const names=(d.columns||[]).map(c=>c.name);
+  let h='<h2>Authorization — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Every change reconciled against imported change-request tickets. '+
+    'A change with no approved ticket covering it is <b>unauthorized</b>; one implemented broader '+
+    'than requested is <b>over-provisioned</b>. Matching is by device + source + destination + service + action.</div>'+
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0">'+
+      tile('Authorized', s.authorized||0)+ tile('Over-provisioned', s.over_provisioned||0)+
+      tile('Unauthorized', s.unauthorized||0)+ tile('N/A', s.not_applicable||0)+
+      tile('Tickets', d.ticket_count||0,'imported')+
+    '</div>'+
+    '<div class="sheethdr">Import change-request tickets</div>'+
+    '<div class="authbar"><textarea id="authCsv" placeholder="Paste CSV export here, or choose a file…"></textarea></div>'+
+    '<div class="authbar">'+
+      '<input type="file" accept=".csv,text/csv" onchange="authFile(this)">'+
+      '<button id="authImp" onclick="authImport()">Import tickets</button>'+
+      '<button class="ghostbtn" onclick="authTemplate()">⬇ CSV template</button>'+
+      '<button class="ghostbtn" onclick="authClear()">Clear tickets</button>'+
+    '</div>'+
+    '<div class="sheethdr">Reconciled changes</div>'+
+    '<div class="authbar"><label class="hint">show <select id="authFilter" onchange="renderAuth()">'+
+      '<option value="">all</option><option value="unauthorized">unauthorized</option>'+
+      '<option value="over_provisioned">over-provisioned</option>'+
+      '<option value="authorized">authorized</option></select></label></div>'+
+    '<div id="authTable"></div>';
+  m.innerHTML=h;
+  if(!d.ticket_count){
+    document.getElementById('authTable').innerHTML='<p class="hint">No tickets imported yet. '+
+      'Import a CSV above (download the template for the columns) — every change will then be marked '+
+      'authorized / over-provisioned / unauthorized.</p>';
+    return;
+  }
+  const idx={}; names.forEach((n,i)=>idx[n]=i);
+  const filt=(document.getElementById('authFilter')||{}).value||'';
+  const rows=(d.rows||[]).map(r=>{ const o={}; names.forEach((n,i)=>o[n]=r[i]); return o; })
+    .filter(o=> !filt || o.authorization===filt);
+  const t=document.getElementById('authTable');
+  if(!rows.length){ t.innerHTML='<p class="hint">No changes'+(filt?(' with verdict '+filt):'')+'.</p>'; return; }
+  let ht='<div class="tablewrap"><table><thead><tr>'+AUTH_COLS.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr></thead><tbody>';
+  rows.forEach(o=>{ ht+='<tr>'+AUTH_COLS.map(c=>{
+      if(c==='authorization'){ const v=o[c]||''; return '<td><span class="vtag v-'+esc(v)+'">'+esc(v.replace(/_/g,' '))+'</span></td>'; }
+      return '<td class="rcfld">'+esc(o[c]==null?'':o[c])+'</td>';
+    }).join('')+'</tr>'; });
+  ht+='</tbody></table></div>';
+  t.innerHTML=ht;
+}
+
 // ----- Tufin revision comparison (SecureTrack-style compare report) -----
 // Reads the saved "Revision Rulebases" (TUF009) snapshot — fetch once, then
 // compare the fetched data offline.
@@ -1873,6 +2040,9 @@ function renderSidebar(){
     const cd=document.createElement('div'); cd.className='q ov'; cd.id='ovChangeDash';
     cd.innerHTML='<span class="qid">📊 Changes Dashboard</span>';
     cd.onclick=openChangeDashboard; side.appendChild(cd);
+    const az=document.createElement('div'); az.className='q ov'; az.id='ovAuth';
+    az.innerHTML='<span class="qid">🔐 Authorization</span>';
+    az.onclick=openAuthorization; side.appendChild(az);
   }
   // Revision comparison is Tufin-specific (needs live per-revision rulebases).
   if(DETAIL.kind==='tufin'){
