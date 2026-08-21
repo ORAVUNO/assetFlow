@@ -969,9 +969,9 @@ def _collect_change_detail(
     Rules for a given revision are fetched once and reused across adjacent pairs.
     """
     columns = [
-        "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
+        "host.name", "revision.id", "@timestamp", "changed_by", "revision.action", "policy_package",
         "change_type", "entity", "rule.uid", "summary", "changed_fields", "risk", "blast_radius",
-        "src_zone", "source", "dst_zone", "destination", "service",
+        "src_zone", "source", "dst_zone", "destination", "service", "rule.action",
         "before", "after", "authorized", "requester",
     ]
     incremental = (time_range or "").lower() in INCREMENTAL_TOKENS and watermark_store is not None
@@ -1044,7 +1044,7 @@ def _collect_change_detail(
                     _change_summary(change_type, before, after), changed_fields, "", "",
                     textish(_rule_src_zone(ctx)), _rule_any(_rule_src(ctx)),
                     textish(_rule_dst_zone(ctx)), _rule_any(_rule_dst(ctx)),
-                    _rule_any(_rule_svc(ctx)),
+                    _rule_any(_rule_svc(ctx)), textish(_first(ctx, "action")),
                     _rule_compact(before) if before else "",
                     _rule_compact(after) if after else "",
                     status, requester,
@@ -1071,7 +1071,7 @@ def _collect_change_detail(
                     name, new_id, when, admin, action, policy_package, change_type, "object", uid,
                     _object_summary(change_type, nm, before, after), changed_fields,
                     risk, (str(blast) if blast else ""),
-                    "", "", "", "", "",  # zone/source/dest/service are rule-only
+                    "", "", "", "", "", "",  # zone/source/dest/service/rule.action are rule-only
                     _object_disp(before) if before else "",
                     _object_disp(after) if after else "",
                     status, requester,

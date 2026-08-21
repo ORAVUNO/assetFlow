@@ -150,16 +150,17 @@ def test_change_log_enriched_columns_and_migration(tmp_path):
     # init_engine must migrate the missing columns in without error.
     db.init_engine(url)
     cols = [{"name": n} for n in [
-        "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
-        "change_type", "rule.uid", "src_zone", "source", "dst_zone", "destination", "service",
-        "before", "after", "authorized", "requester",
+        "host.name", "revision.id", "@timestamp", "changed_by", "revision.action", "policy_package",
+        "change_type", "entity", "rule.uid", "src_zone", "source", "dst_zone", "destination",
+        "service", "rule.action", "before", "after", "authorized", "requester",
     ]]
-    rows = [["FW-A", "101", "t", "(automatic)", "automatic", "PKG", "added", "r1",
-             "z1", "10.0.0.1", "z2", "web", "tcp/443", "", "x", "", ""]]
+    rows = [["FW-A", "101", "t", "(automatic)", "automatic", "PKG", "added", "rule", "r1",
+             "z1", "10.0.0.1", "z2", "web", "tcp/443", "accept", "", "x", "", ""]]
     assert db.record_changes("tufin", QueryResult(columns=cols, rows=rows)) == 1
     log = db.change_log("tufin")
     rec = dict(zip([c["name"] for c in log["columns"]], log["rows"][0]))
-    assert rec["action"] == "automatic" and rec["policy_package"] == "PKG"
+    assert rec["revision.action"] == "automatic" and rec["policy_package"] == "PKG"
     assert rec["source"] == "10.0.0.1" and rec["service"] == "tcp/443"
+    assert rec["rule.action"] == "accept"
     d = db.change_dashboard("tufin")
     assert d["by_action"]["automatic"] == 1
