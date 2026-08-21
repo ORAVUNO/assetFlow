@@ -301,9 +301,10 @@ queries:
     resource: change_detail
     purpose: >-
       Compute per-change detail by diffing each device's most recent revisions:
-      what rule changed (added/modified/removed) with before → after, who made
-      the change and when, and — when SecureChange ticket authorization is
-      enabled — whether the change was authorized and who requested it.
+      what changed (rule added/modified/removed/moved AND network-object
+      added/modified/removed) with a plain-language summary and before → after,
+      who made the change and when, and — when SecureChange ticket authorization
+      is enabled — whether the change was authorized and who requested it.
     expected_output_fields:
       - host.name              # device
       - revision.id            # the new revision
@@ -312,7 +313,8 @@ queries:
       - action                 # RevisionDTO.action (automatic / installed …)
       - policy_package         # RevisionDTO.policyPackage
       - change_type            # added / modified / removed / moved
-      - rule.uid
+      - entity                 # rule | object (network-object edits share this stream)
+      - rule.uid               # rule uid, or the network-object uid when entity=object
       - summary                # plain-language "what happened" for this unit change
       - changed_fields         # for a modification: which fields changed
       - src_zone               # the changed rule's zones/source/dest/service
@@ -341,11 +343,15 @@ queries:
       of pairs per device is capped for safety. The authorized/requester columns
       come from GET /change_authorization?old_version=&new_version=,
       which requires "Authorize Revisions with Tickets" enabled in SecureTrack;
-      when it is off those columns are blank. Heavier than the other resources
-      (several REST calls per device); it covers the whole estate by default,
-      fetched in bounded parallel. Set TUFIN_DEVICE_SCAN to cap the device count
-      and TUFIN_CONCURRENCY to tune parallelism. This is the change-intelligence
-      headline — pair it with TUF002 (raw revision history).
+      when it is off those columns are blank. Network-object edits are folded
+      into the same stream (entity=object): each revision's network objects are
+      pulled and diffed alongside its rules, so an object change that alters what
+      a rule permits without touching the rule text still shows up. Heavier than
+      the other resources (rules + objects per revision per device); it covers
+      the whole estate by default, fetched in bounded parallel. Set
+      TUFIN_DEVICE_SCAN to cap the device count and TUFIN_CONCURRENCY to tune
+      parallelism. This is the change-intelligence headline — pair it with TUF002
+      (raw revision history).
     recommended_refresh_frequency: Every 5-15 minutes
 
   - id: TUF009
