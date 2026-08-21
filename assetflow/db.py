@@ -143,6 +143,8 @@ class TufinChange(Base):
     device_name: Mapped[str] = mapped_column(String(256), default="")
     changed_by: Mapped[str] = mapped_column(String(256), default="")
     changed_at: Mapped[str] = mapped_column(String(64), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    changed_fields: Mapped[str] = mapped_column(String(256), default="")
     action: Mapped[str] = mapped_column(String(64), default="")
     policy_package: Mapped[str] = mapped_column(String(256), default="")
     src_zone: Mapped[str] = mapped_column(String(256), default="")
@@ -166,6 +168,8 @@ class TufinChange(Base):
             "policy_package": self.policy_package,
             "change_type": self.change_type,
             "rule.uid": self.rule_uid,
+            "summary": self.summary,
+            "changed_fields": self.changed_fields,
             "src_zone": self.src_zone,
             "source": self.source,
             "dst_zone": self.dst_zone,
@@ -181,7 +185,8 @@ class TufinChange(Base):
 # Column order for the change-log view (matches the change_detail result shape).
 _CHANGE_COLUMNS = [
     "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
-    "change_type", "rule.uid", "src_zone", "source", "dst_zone", "destination", "service",
+    "change_type", "rule.uid", "summary", "changed_fields",
+    "src_zone", "source", "dst_zone", "destination", "service",
     "before", "after", "authorized", "requester",
 ]
 
@@ -292,8 +297,8 @@ def init_engine(url: Optional[str] = None):
 # SQLite database needs these added by hand (all nullable text, default '').
 _ADDED_COLUMNS = {
     "tufin_changes": [
-        "action", "policy_package", "src_zone", "source", "dst_zone",
-        "destination", "service",
+        "summary", "changed_fields", "action", "policy_package", "src_zone",
+        "source", "dst_zone", "destination", "service",
     ],
 }
 
@@ -659,6 +664,8 @@ def record_changes(adapter: str, result) -> int:
                     device_name=str(r.get("host.name", "")),
                     changed_by=str(r.get("changed_by", "")),
                     changed_at=str(r.get("@timestamp", "")),
+                    summary=str(r.get("summary", "")),
+                    changed_fields=str(r.get("changed_fields", "")),
                     action=str(r.get("action", "")),
                     policy_package=str(r.get("policy_package", "")),
                     src_zone=str(r.get("src_zone", "")),

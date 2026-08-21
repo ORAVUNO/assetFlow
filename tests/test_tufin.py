@@ -316,6 +316,53 @@ def test_change_detail_automatic_action_labels_the_actor():
     assert row["changed_by"] == "(automatic)"      # blank actor labelled from the action
     assert row["policy_package"] == "KWL_DCN_INTERNET_ACP"
     assert row["source"] == "10.1.1.1" and row["destination"] == "web"
+    assert row["summary"].startswith("Added rule —")
+
+
+def test_change_detail_summary_names_the_changed_fields():
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {"revisions": [
+        {"id": "1", "date": "2026-01-01", "time": "00:00:00", "admin": "a"},
+        {"id": "2", "date": "2026-01-02", "time": "00:00:00", "admin": "a"},
+    ]}
+    mapping["revisions/1/rules.json"] = {"rules": [
+        {"uid": "r1", "src_network": "a", "dst_network": "b", "dst_service": "tcp/80", "action": "accept"},
+    ]}
+    mapping["revisions/2/rules.json"] = {"rules": [
+        {"uid": "r1", "src_network": "a", "dst_network": "b", "dst_service": "tcp/443", "action": "drop"},
+    ]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    row = dict(zip(result.column_names, result.rows[0]))
+    assert row["change_type"] == "modified"
+    assert set(row["changed_fields"].split(", ")) == {"service", "action"}
+    assert "service: tcp/80 → tcp/443" in row["summary"]
+    assert "action: accept → drop" in row["summary"]
+
+
+def test_change_detail_detects_disable_and_move():
+    mapping = dict(DEVICES)
+    mapping["devices/1/revisions.json"] = {"revisions": [
+        {"id": "1", "date": "2026-01-01", "time": "00:00:00", "admin": "a"},
+        {"id": "2", "date": "2026-01-02", "time": "00:00:00", "admin": "a"},
+    ]}
+    # rev1: [r1, r2, r3]; rev2: r1 disabled, r3 jumps to the top (a clean move)
+    # while r1/r2 keep their relative order.
+    mapping["revisions/1/rules.json"] = {"rules": [
+        {"uid": "r1", "src_network": "a", "dst_network": "b", "dst_service": "tcp/80", "action": "accept", "disabled": False},
+        {"uid": "r2", "src_network": "c", "dst_network": "d", "dst_service": "tcp/22", "action": "accept"},
+        {"uid": "r3", "src_network": "e", "dst_network": "f", "dst_service": "tcp/53", "action": "accept"},
+    ]}
+    mapping["revisions/2/rules.json"] = {"rules": [
+        {"uid": "r3", "src_network": "e", "dst_network": "f", "dst_service": "tcp/53", "action": "accept"},
+        {"uid": "r1", "src_network": "a", "dst_network": "b", "dst_service": "tcp/80", "action": "accept", "disabled": True},
+        {"uid": "r2", "src_network": "c", "dst_network": "d", "dst_service": "tcp/22", "action": "accept"},
+    ]}
+    result = tufin_runner_mod.run_query(FakeClient(mapping), _q("change_detail"))
+    by = {r[result.column_names.index("rule.uid")]:
+          dict(zip(result.column_names, r)) for r in result.rows}
+    assert by["r1"]["change_type"] == "modified" and by["r1"]["summary"] == "Disabled rule"
+    assert by["r3"]["change_type"] == "moved"
+    assert "Moved" in by["r3"]["summary"] and by["r3"]["changed_fields"] == "position"
 
 
 def test_change_detail_ignores_pure_rename():
