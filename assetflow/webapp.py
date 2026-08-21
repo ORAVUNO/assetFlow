@@ -1465,7 +1465,7 @@ async function openChangeDashboard(){
     '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">'+
       tile('Total changes', d.total_changes)+ tile('Added', t.added||0)+
       tile('Modified', t.modified||0)+ tile('Removed', t.removed||0)+
-      tile('Unauthorized', au.unauthorized||0)+
+      tile('Moved', t.moved||0)+ tile('Unauthorized', au.unauthorized||0)+
     '</div>'+
     '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px">'+
       tile('Automatic', automatic, 'system / auto-install')+

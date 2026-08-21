@@ -41,8 +41,8 @@ _DEVICE_ATTRS = [
 
 # change-log columns copied into each device's recent-changes list
 _CHANGE_KEYS = ("revision.id", "@timestamp", "changed_by", "action", "policy_package",
-                "change_type", "rule.uid", "src_zone", "source", "dst_zone", "destination",
-                "service", "before", "after", "authorized", "requester")
+                "change_type", "rule.uid", "summary", "changed_fields", "src_zone", "source",
+                "dst_zone", "destination", "service", "before", "after", "authorized", "requester")
 _MAX_RECENT = 25
 
 
@@ -86,7 +86,7 @@ def build_profile(
                 "revisions": [], "rules": [], "objects": [], "services": [],
                 "zones": [], "cleanups": [],
                 "changes": {"total": 0, "added": 0, "removed": 0, "modified": 0,
-                            "unauthorized": 0, "recent": []},
+                            "moved": 0, "unauthorized": 0, "recent": []},
             }
         return d
 
@@ -109,7 +109,7 @@ def build_profile(
             device(name)[key].append({k: v for k, v in row.items() if k != "host.name"})
 
     # 3) change log -> per-device rollup + estate totals
-    estate = {"total": 0, "added": 0, "removed": 0, "modified": 0, "unauthorized": 0}
+    estate = {"total": 0, "added": 0, "removed": 0, "modified": 0, "moved": 0, "unauthorized": 0}
     for row in _rowdicts(changes):
         name = _host(row)
         if not name:
@@ -118,7 +118,7 @@ def build_profile(
         ctype = str(row.get("change_type") or "").lower()
         ch["total"] += 1
         estate["total"] += 1
-        if ctype in ("added", "removed", "modified"):
+        if ctype in ("added", "removed", "modified", "moved"):
             ch[ctype] += 1
             estate[ctype] += 1
         if str(row.get("authorized") or "").lower() == "unauthorized":

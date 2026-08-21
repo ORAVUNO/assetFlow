@@ -795,6 +795,33 @@ def _authorization(client, old_id: str, new_id: str) -> Tuple[str, str]:
     return status, requester
 
 
+def _rule_field_delta(before: dict, after: dict) -> List[Tuple[str, str, str]]:
+    """Per-field (label, before, after) for every rule field that changed."""
+    bf = _rule_fields(before) if before else {}
+    af = _rule_fields(after) if after else {}
+    return [(label, bf.get(label, ""), af.get(label, ""))
+            for label, _ in _RULE_FIELD_ORDER if bf.get(label) != af.get(label)]
+
+
+def _is_on(value: str) -> bool:
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _change_summary(change_type: str, before: dict, after: dict) -> str:
+    """A plain-language "what happened" line for one unit change."""
+    if change_type == "added":
+        return f"Added rule — {_rule_compact(after)}"
+    if change_type == "removed":
+        return f"Removed rule — {_rule_compact(before)}"
+    if change_type == "moved":
+        return "Moved — reordered within the rulebase (content unchanged)"
+    deltas = _rule_field_delta(before, after)
+    if len(deltas) == 1 and deltas[0][0] == "disabled":
+        return "Disabled rule" if _is_on(deltas[0][2]) else "Re-enabled rule"
+    parts = [f"{f}: {(b or '∅')} → {(a or '∅')}" for f, b, a in deltas]
+    return "Modified — " + "; ".join(parts) if parts else "Modified rule"
+
+
 def _collect_change_detail(
     client, scan: int, time_range: Optional[str] = None, watermark_store=None
 ) -> Tuple[List[str], List[List[Any]]]:
@@ -816,7 +843,8 @@ def _collect_change_detail(
     """
     columns = [
         "host.name", "revision.id", "@timestamp", "changed_by", "action", "policy_package",
-        "change_type", "rule.uid", "src_zone", "source", "dst_zone", "destination", "service",
+        "change_type", "rule.uid", "summary", "changed_fields",
+        "src_zone", "source", "dst_zone", "destination", "service",
         "before", "after", "authorized", "requester",
     ]
     incremental = (time_range or "").lower() in INCREMENTAL_TOKENS and watermark_store is not None
@@ -870,8 +898,15 @@ def _collect_change_detail(
                 # after the change, or the pre-change state for a removed rule) so
                 # a reader has full context without decoding the compact summary.
                 ctx = after or before
+                if change_type == "modified":
+                    changed_fields = ", ".join(f for f, _, _ in _rule_field_delta(before, after))
+                elif change_type == "moved":
+                    changed_fields = "position"
+                else:
+                    changed_fields = ""
                 dev_rows.append([
                     name, new_id, when, admin, action, policy_package, change_type, uid,
+                    _change_summary(change_type, before, after), changed_fields,
                     textish(_rule_src_zone(ctx)), _rule_any(_rule_src(ctx)),
                     textish(_rule_dst_zone(ctx)), _rule_any(_rule_dst(ctx)),
                     _rule_any(_rule_svc(ctx)),
@@ -880,12 +915,19 @@ def _collect_change_detail(
                     status, requester,
                 ])
 
+            # Position tracking so a pure reorder reads as "moved", not modified.
+            on_lcs = _lcs_keep(
+                [u for u in before_rules if u in after_rules],
+                [u for u in after_rules if u in before_rules],
+            )
             for uid, after in after_rules.items():
                 before = before_rules.get(uid)
                 if before is None:
                     emit("added", uid, {}, after)
                 elif _rule_fingerprint(before) != _rule_fingerprint(after):
                     emit("modified", uid, before, after)
+                elif uid not in on_lcs:
+                    emit("moved", uid, before, after)
             for uid, before in before_rules.items():
                 if uid not in after_rules:
                     emit("removed", uid, before, {})

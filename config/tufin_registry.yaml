@@ -311,8 +311,10 @@ queries:
       - changed_by             # RevisionDTO.admin ((automatic)/(unattributed) when blank)
       - action                 # RevisionDTO.action (automatic / installed …)
       - policy_package         # RevisionDTO.policyPackage
-      - change_type            # added / modified / removed
+      - change_type            # added / modified / removed / moved
       - rule.uid
+      - summary                # plain-language "what happened" for this unit change
+      - changed_fields         # for a modification: which fields changed
       - src_zone               # the changed rule's zones/source/dest/service
       - source
       - dst_zone
