@@ -198,6 +198,32 @@ def test_hosts_plain_list_shape():
     assert result.rows[0][result.column_names.index("host.name")] == "db01"
 
 
+def test_hosts_drop_bare_ping_only():
+    # A bare IP (only ip + timestamps, no name/OS/MAC/repo) is dropped by default;
+    # a host with real data is kept.
+    resp = {"results": [
+        {"id": "1", "ipAddress": "10.3.3.5", "systemType": "N/A",
+         "firstSeen": "1600000000", "lastSeen": "1600000500"},         # bare -> dropped
+        {"id": "2", "ipAddress": "10.0.0.9", "dnsName": "app.corp",
+         "os": "Linux", "lastSeen": "1600000500"},                     # real -> kept
+    ]}
+    client = FakeClient(get_rules={"hosts": resp})
+    result = tsc_runner_mod.run_query(client, _q("hosts", "TSC009", "Device Inventory"))
+    names = [r[result.column_names.index("host.name")] for r in result.rows]
+    assert names == ["app.corp"]
+
+
+def test_hosts_include_bare_when_opted_in(monkeypatch):
+    monkeypatch.setenv("TENABLE_SC_HOSTS_INCLUDE_BARE", "true")
+    resp = {"results": [
+        {"id": "1", "ipAddress": "10.3.3.5", "systemType": "N/A"},
+        {"id": "2", "ipAddress": "10.0.0.9", "dnsName": "app.corp", "os": "Linux"},
+    ]}
+    client = FakeClient(get_rules={"hosts": resp})
+    result = tsc_runner_mod.run_query(client, _q("hosts", "TSC009", "Device Inventory"))
+    assert len(result.rows) == 2
+
+
 # --------------------------------------------------------------------------- #
 # Findings (vulndetails)
 # --------------------------------------------------------------------------- #
@@ -212,6 +238,20 @@ VULNDETAILS = [
      "solution": "Patch it.", "firstSeen": "1600000000", "lastSeen": "1600000500",
      "pluginText": "<plugin_output>huge blob that must NOT become a column</plugin_output>"},
 ]
+
+
+def test_findings_exclude_info_severity_by_default():
+    # By default a severity filter (1-4, excluding Info) is applied.
+    captured = {}
+
+    class Cap(FakeClient):
+        def analysis(self, tool, *, filters=None, **kw):
+            captured["filters"] = filters or []
+            return VULNDETAILS
+
+    tsc_runner_mod.run_query(Cap(), _q("findings", "TSC002", "Security Findings"))
+    sev = [f for f in captured["filters"] if f.get("filterName") == "severity"]
+    assert sev and sev[0]["value"] == "1,2,3,4"
 
 
 def test_findings_flatten_objects_and_skip_plugintext():
@@ -233,39 +273,61 @@ def test_findings_flatten_objects_and_skip_plugintext():
 # --------------------------------------------------------------------------- #
 
 def test_software_split_and_host_linked():
-    # Software now comes from the enumeration plugins (vulndetails), one row per
-    # (host, package), with name/version split out and linked to the host.
+    # Software comes from the enumeration plugins (vulndetails), one row per
+    # (host, package), with name/version split out and linked to the host. The
+    # real box returns Debian dpkg -l output wrapped in <plugin_output> tags.
     plugin_text = (
-        "The following software are installed on the remote host :\n\n"
-        "  Google Chrome  [version 100.0.4896.75]\n"
-        "  cpe:/a:openbsd:openssh:8.0\n"
-        "  bind-libs-9.11.4-26.P2.el8  (rpm)\n"
+        "<plugin_output>\n"
+        "Here is the list of packages installed on the remote Debian host :\n\n"
+        "ii   apache2  2.4.58-1ubuntu8.8  amd64  Apache HTTP Server\n"
+        "ii   adduser  3.137ubuntu1  all  add and remove users and groups\n"
+        "ii   binutils  2.42-4ubuntu2.5  amd64  GNU assembler, linker\n"
+        "</plugin_output>\n"
     )
-    records = [{"ip": "10.0.0.1", "dnsName": "web01.corp", "pluginID": "20811",
+    records = [{"ip": "10.0.0.1", "dnsName": "web01.corp", "pluginID": "22869",
                 "lastSeen": "1600000000", "pluginText": plugin_text}]
     client = FakeClient(analysis_rules={"vulndetails": records})
     result = tsc_runner_mod.run_query(client, _q("software", "TSC003", "Software"))
     cols = result.column_names
     assert cols[0] == "host.name"                       # software links to the host
-    rows = {r[cols.index("software.raw")]: r for r in result.rows}
+    # The <plugin_output> tag lines and header prose are dropped.
     assert len(result.rows) == 3
-    chrome = next(r for r in result.rows if "Chrome" in r[cols.index("software.name")])
-    assert chrome[cols.index("host.name")] == "web01.corp"
-    assert chrome[cols.index("host.ip")] == "10.0.0.1"
-    assert chrome[cols.index("software.version")] == "100.0.4896.75"
-    ssh = next(r for r in result.rows if r[cols.index("software.name")] == "openbsd openssh")
-    assert ssh[cols.index("software.version")] == "8.0"
-    rpm = next(r for r in result.rows if r[cols.index("software.name")] == "bind-libs")
-    assert rpm[cols.index("software.version")].startswith("9.11.4")
+    by_name = {r[cols.index("software.name")]: r for r in result.rows}
+    assert "apache2" in by_name and "adduser" in by_name and "binutils" in by_name
+    assert by_name["apache2"][cols.index("software.version")] == "2.4.58-1ubuntu8.8"
+    assert by_name["apache2"][cols.index("host.name")] == "web01.corp"
+    assert by_name["adduser"][cols.index("software.version")] == "3.137ubuntu1"
+    # No <plugin_output> tag leaked into a name.
+    assert not any("<" in r[cols.index("software.name")] for r in result.rows)
 
 
 def test_split_software_helper():
+    # dpkg -l columns.
+    assert tsc_runner_mod._split_software(
+        "ii   apache2  2.4.58-1ubuntu8.8  amd64  Apache HTTP Server")[:2] == (
+        "apache2", "2.4.58-1ubuntu8.8")
+    assert tsc_runner_mod._split_software(
+        "ii   adduser  3.137ubuntu1  all  add and remove users")[:2] == (
+        "adduser", "3.137ubuntu1")
+    # CPE, Windows [version X], rpm, generic.
     assert tsc_runner_mod._split_software("cpe:/a:openbsd:openssh:8.0") == (
         "openbsd openssh", "8.0", "cpe:/a:openbsd:openssh:8.0")
     assert tsc_runner_mod._split_software("Google Chrome  [version 100.0.1]")[:2] == (
         "Google Chrome", "100.0.1")
+    assert tsc_runner_mod._split_software("bind-libs-9.11.4-26.P2.el8")[:2] == (
+        "bind-libs", "9.11.4-26.P2.el8")
     assert tsc_runner_mod._split_software("nginx 1.20.2")[:2] == ("nginx", "1.20.2")
     assert tsc_runner_mod._split_software("SomeToolNoVersion")[:2] == ("SomeToolNoVersion", "")
+    # A leaked bare XML tag yields nothing.
+    assert tsc_runner_mod._split_software("<plugin_output>")[:2] == ("", "")
+
+
+def test_db_product_labels():
+    assert tsc_runner_mod._db_product("MariaDB Client/Server Installed (Linux)") == "MariaDB"
+    assert tsc_runner_mod._db_product("MySQL Server Detection") == "MySQL"
+    assert tsc_runner_mod._db_product("Microsoft SQL Server Detection (credentialed check)") == "Microsoft SQL Server"
+    assert tsc_runner_mod._db_product("Oracle Database tnslsnr Service Remote Version Disclosure") == "Oracle Database"
+    assert tsc_runner_mod._db_product("Some Unknown Thing") == ""
 
 
 def test_databases_linked_to_host():

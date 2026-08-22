@@ -197,9 +197,12 @@ queries:
       - "custom.*"         # any extra field Tenable.sc returns for the finding
     notes: >-
       POST /rest/analysis with type=vuln, sourceType=cumulative, tool=vulndetails,
-      paged by startOffset/endOffset. Large text fields (pluginText, description,
-      xref, …) are intentionally excluded from the custom.* sweep so the table
-      stays legible. The time-range control adds a lastSeen filter.
+      paged by startOffset/endOffset. Informational plugins (severity Info — "Ping
+      the remote host", scan info, OS fingerprints) are excluded by default via a
+      severity filter (1-4), matching the Tenable vulnerabilities GUI; set
+      TENABLE_SC_FINDINGS_SEVERITIES=all (or include 0) to keep them. Large text
+      fields (pluginText, description, xref, …) are excluded from the custom.*
+      sweep so the table stays legible. The time-range control adds a lastSeen filter.
     recommended_refresh_frequency: Daily
 
   - id: TSC003
@@ -225,12 +228,13 @@ queries:
     notes: >-
       POST /rest/analysis with tool=vulndetails filtered to the software-
       enumeration plugins (pluginID = 20811,22869), then each plugin's pluginText
-      is split into individual package lines and each line into name + version
-      (CPE, "[version X]", and trailing dotted-number forms are handled; the raw
-      line is preserved). This replaces the previous estate-wide listsoftware view
-      so software links to hosts. Marked investigation_required until the exact
-      pluginText format is confirmed against a live box, since parsing is
-      format-dependent (the raw line always survives, so nothing is lost).
+      is split into individual package lines and each line into name + version.
+      Formats handled (confirmed against a live 6.8 box): Debian/Ubuntu `dpkg -l`
+      output (status flag + columns split on 2+ spaces), Windows "[version X]"
+      lines, CPEs, and rpm-style name-version; <plugin_output> wrapper lines are
+      dropped. This replaces the previous estate-wide listsoftware view so software
+      links to hosts. Still investigation_required until the Windows (20811) format
+      is also confirmed; the raw line always survives, so nothing is lost.
     recommended_refresh_frequency: Daily
 
   - id: TSC004
@@ -398,7 +402,9 @@ queries:
       investigation_required until the exact response shape is confirmed against a
       live 6.x box (the endpoint is new in the 6.x line). Requires Tenable Security
       Center 6.x; older releases won't expose /rest/hosts (the resource returns no
-      rows there — use TSC001 instead).
+      rows there — use TSC001 instead). Bare "ping-only" hosts (known IPs with no
+      name / OS / MAC / repository) are dropped by default so the view isn't
+      flooded with empty rows; set TENABLE_SC_HOSTS_INCLUDE_BARE=true to keep them.
     recommended_refresh_frequency: Daily
 
   - id: TSC010
@@ -425,9 +431,11 @@ queries:
     notes: >-
       Resolves the "Databases" plugin family id via GET /rest/pluginFamily, then
       POST /rest/analysis with tool=vulndetails filtered to that family; the
-      database product is taken from the plugin name and the version parsed from
-      the plugin name/output. Marked investigation_required until confirmed against
-      a live box: the family-filter shape and plugin-name formats vary, so version
-      parsing is best-effort (the full plugin name is always kept). Returns no rows
-      if the Databases family can't be resolved.
+      database product is normalized to a clean label (MySQL / MariaDB / Oracle
+      Database / Microsoft SQL Server / PostgreSQL / …) via keyword match on the
+      plugin name, and the version is taken from the plugin output's "Version : X"
+      line (falling back to the record version / plugin name). The full plugin name
+      is always kept in plugin.name. Confirmed working against a live 6.8 box; still
+      investigation_required because the family includes some vulnerability plugins
+      (not only detections), so filter plugin.name if you want detections only.
     recommended_refresh_frequency: Daily

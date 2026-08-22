@@ -87,14 +87,58 @@ DEVICE_TAGS_ENABLED = _bool_env("TENABLE_SC_DEVICE_TAGS", True)
 # ``lastSeen`` filter on the vuln analysis resources (devices / findings).
 RANGE_DAYS = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}
 
+# Severities included in the aggregated-findings view. Tenable severity ids are
+# 0=Info, 1=Low, 2=Medium, 3=High, 4=Critical. Informational plugins (e.g. "Ping
+# the remote host", "Nessus Scan Information") are excluded by default so findings
+# read as real security issues, matching the Tenable vulnerabilities GUI. Override
+# with TENABLE_SC_FINDINGS_SEVERITIES (e.g. "0,1,2,3,4" or "all" to include Info).
+FINDINGS_SEVERITIES = (os.getenv("TENABLE_SC_FINDINGS_SEVERITIES") or "1,2,3,4").strip()
+
 # Plugin IDs whose output enumerates installed software per host, used by the
 # host-linked ``software`` view so software correlates to a host/IP.
 SOFTWARE_ENUM_PLUGINS = ("20811", "22869")  # Windows installed software, SSH software
 
-# A version-looking token (2+ dotted numbers, optional trailing build/rev), used
-# to split a software string into name + version.
-_VERSION_RE = re.compile(r"\b\d+(?:\.\d+)+(?:[-_.][0-9A-Za-z]+)*\b")
+# Plugin IDs whose output enumerates installed software per host, used by the
+# host-linked ``software`` view so software correlates to a host/IP.
+SOFTWARE_ENUM_PLUGINS = ("20811", "22869")  # Windows installed software, SSH software
+
+# Clean database product labels derived from a detection plugin's name, so the
+# ``database`` column reads "MySQL" / "Oracle Database" rather than the full plugin
+# title. Checked in order — MariaDB before MySQL, and specific before generic.
+_DB_PRODUCTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("MariaDB", ("mariadb",)),
+    ("MySQL", ("mysql",)),
+    ("Microsoft SQL Server", ("sql server", "mssql")),
+    ("PostgreSQL", ("postgresql", "postgres", "pgadmin")),
+    ("Oracle Database", ("oracle database", "oracle tns", "tnslsnr",
+                         "oracle mysql", "oracle ")),
+    ("MongoDB", ("mongodb", "mongo")),
+    ("Apache Cassandra", ("cassandra",)),
+    ("Redis", ("redis",)),
+    ("IBM Db2", ("db2",)),
+    ("Sybase", ("sybase", "adaptive server")),
+    ("Elasticsearch", ("elasticsearch",)),
+    ("Memcached", ("memcached",)),
+    ("CouchDB", ("couchdb",)),
+)
+
+
+def _db_product(plugin_name: str) -> str:
+    """Map a detection plugin name to a clean database product label (or ''); the
+    full plugin name is kept separately in the plugin.name column."""
+    low = (plugin_name or "").lower()
+    for label, keys in _DB_PRODUCTS:
+        if any(k in low for k in keys):
+            return label
+    return ""
+
+# A version-looking token (2+ dotted numbers, plus any trailing build/rev chars),
+# used to split a software string into name + version.
+_VERSION_RE = re.compile(r"\d+(?:\.\d+)+[0-9A-Za-z.\-+~:_]*")
 _CPE_RE = re.compile(r"cpe:/[aoh]:(?P<vendor>[^:]*):(?P<product>[^:]*):(?P<version>[^:]*)")
+# A dpkg ``-l`` status flag (desired+status, sometimes a 3rd error char), e.g.
+# "ii", "iU", "rc", "iF" — used to detect Debian/Ubuntu package-list output.
+_DPKG_FLAG_RE = re.compile(r"^[uirph][ncHUFWtiR]F?$")
 
 
 # --------------------------------------------------------------------------- #
@@ -181,6 +225,10 @@ def _split_software(raw: str) -> Tuple[str, str, str]:
     Tenable software strings come in a few shapes; this normalizes the common ones
     and always preserves the original elsewhere (the caller keeps a raw column):
 
+    * a Debian/Ubuntu ``dpkg -l`` line (plugin 22869) —
+      ``ii   apache2  2.4.58-1ubuntu8.8  amd64  Apache HTTP Server`` → name
+      ``apache2``, version ``2.4.58-1ubuntu8.8`` (columns are split on runs of 2+
+      spaces after the leading status flag);
     * a CPE — ``cpe:/a:openbsd:openssh:8.0`` → name ``openbsd openssh``, version ``8.0``;
     * a Windows enumeration line — ``Google Chrome  [version 100.0.4896.75]`` →
       name ``Google Chrome``, version ``100.0.4896.75``;
@@ -190,10 +238,23 @@ def _split_software(raw: str) -> Tuple[str, str, str]:
       and the text before it the name.
     """
     text = (raw or "").strip()
+    # Strip Nessus plugin-output XML wrappers that can bleed into a line.
+    text = text.replace("<plugin_output>", "").replace("</plugin_output>", "").strip()
     if not text:
         return "", "", ""
 
-    # 1) CPE form.
+    # 1) dpkg -l columns: "<flag>  <name>  <version>  <arch>  <description>".
+    cols = re.split(r"\s{2,}", text)
+    if len(cols) >= 3 and _DPKG_FLAG_RE.match(cols[0]):
+        name = cols[1].strip()
+        version = cols[2].strip()
+        # Guard: the version column should look like a version (contains a digit).
+        if name and any(ch.isdigit() for ch in version):
+            return name, version, ""
+        if name:
+            return name, "", ""
+
+    # 2) CPE form.
     m = _CPE_RE.search(text)
     if m:
         vendor = (m.group("vendor") or "").replace("_", " ").strip()
@@ -202,20 +263,24 @@ def _split_software(raw: str) -> Tuple[str, str, str]:
         name = " ".join(p for p in (vendor, product) if p) or text
         return name, version, m.group(0)
 
-    # 2) Explicit "[version X]" / "(version X)" annotation.
+    # 3) Explicit "[version X]" / "(version X)" annotation (Windows plugin 20811).
     ver_annot = re.search(r"[\[(]\s*version\s+([^\])]+)[\])]", text, re.IGNORECASE)
     if ver_annot:
         version = ver_annot.group(1).strip()
         name = text[: ver_annot.start()].strip(" -\t")
         return name or text, version, ""
 
-    # 3) Trailing dotted-number version token anywhere in the string.
+    # 4) rpm-ish "name-<version>" (first dash immediately followed by a digit).
+    rpm = re.search(r"^(.*?)-(\d[0-9A-Za-z.\-+~:_]*)$", text)
+    if rpm and rpm.group(1):
+        return rpm.group(1).strip(), rpm.group(2).strip(), ""
+
+    # 5) Trailing dotted-number version token anywhere in the string.
     matches = list(_VERSION_RE.finditer(text))
     if matches:
         last = matches[-1]
         version = last.group(0)
         name = text[: last.start()].strip(" -_\t")
-        # A leading "name-<version>" (rpm/deb) leaves a trailing dash — already stripped.
         return name or text, version, ""
 
     return text, "", ""
@@ -512,8 +577,17 @@ def _collect_devices(client, time_range: Optional[str]) -> Tuple[List[str], List
 
 
 def _collect_findings(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
-    """Aggregated security findings via the ``vulndetails`` analysis tool."""
-    records = client.analysis("vulndetails", filters=_range_filters(time_range))
+    """Aggregated security findings via the ``vulndetails`` analysis tool.
+
+    Informational plugins (severity Info — "Ping the remote host", scan-info, OS
+    fingerprints, …) are excluded by default so this reads as a real vulnerability
+    view; set ``TENABLE_SC_FINDINGS_SEVERITIES=all`` (or include ``0``) to keep them.
+    """
+    filters = list(_range_filters(time_range))
+    sev = FINDINGS_SEVERITIES.lower()
+    if sev and sev not in ("all", "*"):
+        filters.append({"filterName": "severity", "operator": "=", "value": FINDINGS_SEVERITIES})
+    records = client.analysis("vulndetails", filters=filters)
     return _flatten_analysis(records, _FINDING_SPEC, skip_custom=_FINDING_SKIP)
 
 
@@ -526,10 +600,13 @@ def _software_lines(plugin_text: str) -> List[str]:
         if not line:
             continue
         low = line.lower()
-        # Skip the plugin's framing sentences and section headers.
-        if line.endswith(":") or low.startswith("the following") \
+        # Skip the plugin's framing sentences, section headers, and XML wrappers.
+        if line.startswith("<") or line.endswith(":") \
+                or low.startswith("the following") \
                 or "installed on the remote" in low \
-                or low.startswith("nessus") or low.startswith("note"):
+                or "list of packages" in low \
+                or low.startswith("nessus") or low.startswith("note") \
+                or low.startswith("here is") or low.startswith("desired="):
             continue
         lines.append(line)
     return lines
@@ -606,17 +683,21 @@ def _collect_databases(client, time_range: Optional[str]) -> Tuple[List[str], Li
         if not fam_id and _obj_name(rec.get("family")).lower() != "databases":
             continue
         plugin_name = textish(rec.get("pluginName"))
-        # Parse a product name (plugin name up to the first version token) and a
-        # version (from the plugin name, else the plugin output).
-        product = plugin_name
+        product = _db_product(plugin_name) or plugin_name
+        # Version: prefer an explicit "Version : X" line in the plugin output (what
+        # Nessus detection plugins emit — reliable), then the record's own version
+        # field, then a version token in the plugin name. Avoids parsing a bogus
+        # number out of a vulnerability plugin's prose.
         version = ""
-        m = _VERSION_RE.search(plugin_name)
-        if m:
-            product = plugin_name[: m.start()].strip(" -")
-            version = m.group(0)
+        vm = re.search(r"[Vv]ersion\s*:\s*([0-9][0-9A-Za-z.\-+~:_]*)",
+                       str(rec.get("pluginText") or ""))
+        if vm:
+            version = vm.group(1)
         if not version:
-            mt = _VERSION_RE.search(str(rec.get("pluginText") or ""))
-            version = mt.group(0) if mt else ""
+            version = textish(rec.get("version"))
+        if not version:
+            mn = _VERSION_RE.search(plugin_name)
+            version = mn.group(0) if mn else ""
         rows.append([
             _host_name(rec), textish(rec.get("ip")), textish(rec.get("dnsName")),
             product, version, textish(rec.get("port")), textish(rec.get("protocol")),
@@ -871,6 +952,27 @@ def _fetch_hosts(client) -> List[Dict[str, Any]]:
     return out[:ANALYSIS_MAX_RECORDS]
 
 
+# Fields whose presence means a /rest/hosts row is a real asset, not a bare IP
+# that merely answered a ping. A record with any of these is kept.
+_HOST_DATA_KEYS = (
+    "name", "dnsName", "netbiosName", "netBios", "os", "osCPE", "macAddress",
+    "repositories", "repository", "acrScore", "assetCriticalityRating",
+    "assetExposureScore",
+)
+
+
+def _host_has_data(rec: Dict[str, Any]) -> bool:
+    """True if a /rest/hosts record carries real data beyond a bare IP.
+
+    A meaningful ``systemType`` (not blank / "N/A") also counts.
+    """
+    for key in _HOST_DATA_KEYS:
+        if textish(rec.get(key)).strip():
+            return True
+    st = textish(rec.get("systemType")).strip()
+    return bool(st) and st.upper() != "N/A"
+
+
 def _collect_hosts(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Unified host inventory via the 6.x Explore Assets endpoint (``/rest/hosts``).
 
@@ -878,11 +980,19 @@ def _collect_hosts(client, time_range: Optional[str]) -> Tuple[List[str], List[L
     the 6.x asset model, carrying ACR / AES, repositories, and system type. Field
     names are read with per-release fallbacks and any extra field the release
     returns rides along under ``custom.*``.
+
+    By default, **bare "ping-only" hosts are dropped** — /rest/hosts lists every
+    known repository IP, including addresses that only answered a ping and carry
+    no name / OS / MAC / repository. Those flood the view with empty rows, so a
+    host is kept only when it has some real data beyond a bare IP. Set
+    ``TENABLE_SC_HOSTS_INCLUDE_BARE=true`` to keep every listed IP.
     """
     records = _fetch_hosts(client)
+    if not _bool_env("TENABLE_SC_HOSTS_INCLUDE_BARE", False):
+        records = [r for r in records if _host_has_data(r)]
     named = [
         ("host.name", lambda r: textish(_pick(r, "name", "dnsName", "netbiosName", "netBios", "ipAddress", "ip"))),
-        ("asset.type", lambda r: textish(_pick(r, "systemType")) or "Host"),
+        ("asset.type", lambda r: (lambda st: st if st and st.upper() != "N/A" else "Host")(textish(_pick(r, "systemType")))),
         ("host.ip", lambda r: textish(_pick(r, "ipAddress", "ip"))),
         ("host.dns", lambda r: textish(_pick(r, "dnsName"))),
         ("host.netbios", lambda r: textish(_pick(r, "netbiosName", "netBios"))),
