@@ -952,6 +952,27 @@ def _fetch_hosts(client) -> List[Dict[str, Any]]:
     return out[:ANALYSIS_MAX_RECORDS]
 
 
+# Fields whose presence means a /rest/hosts row is a real asset, not a bare IP
+# that merely answered a ping. A record with any of these is kept.
+_HOST_DATA_KEYS = (
+    "name", "dnsName", "netbiosName", "netBios", "os", "osCPE", "macAddress",
+    "repositories", "repository", "acrScore", "assetCriticalityRating",
+    "assetExposureScore",
+)
+
+
+def _host_has_data(rec: Dict[str, Any]) -> bool:
+    """True if a /rest/hosts record carries real data beyond a bare IP.
+
+    A meaningful ``systemType`` (not blank / "N/A") also counts.
+    """
+    for key in _HOST_DATA_KEYS:
+        if textish(rec.get(key)).strip():
+            return True
+    st = textish(rec.get("systemType")).strip()
+    return bool(st) and st.upper() != "N/A"
+
+
 def _collect_hosts(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Unified host inventory via the 6.x Explore Assets endpoint (``/rest/hosts``).
 
@@ -959,8 +980,16 @@ def _collect_hosts(client, time_range: Optional[str]) -> Tuple[List[str], List[L
     the 6.x asset model, carrying ACR / AES, repositories, and system type. Field
     names are read with per-release fallbacks and any extra field the release
     returns rides along under ``custom.*``.
+
+    By default, **bare "ping-only" hosts are dropped** — /rest/hosts lists every
+    known repository IP, including addresses that only answered a ping and carry
+    no name / OS / MAC / repository. Those flood the view with empty rows, so a
+    host is kept only when it has some real data beyond a bare IP. Set
+    ``TENABLE_SC_HOSTS_INCLUDE_BARE=true`` to keep every listed IP.
     """
     records = _fetch_hosts(client)
+    if not _bool_env("TENABLE_SC_HOSTS_INCLUDE_BARE", False):
+        records = [r for r in records if _host_has_data(r)]
     named = [
         ("host.name", lambda r: textish(_pick(r, "name", "dnsName", "netbiosName", "netBios", "ipAddress", "ip"))),
         ("asset.type", lambda r: (lambda st: st if st and st.upper() != "N/A" else "Host")(textish(_pick(r, "systemType")))),

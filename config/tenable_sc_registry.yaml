@@ -402,7 +402,9 @@ queries:
       investigation_required until the exact response shape is confirmed against a
       live 6.x box (the endpoint is new in the 6.x line). Requires Tenable Security
       Center 6.x; older releases won't expose /rest/hosts (the resource returns no
-      rows there — use TSC001 instead).
+      rows there — use TSC001 instead). Bare "ping-only" hosts (known IPs with no
+      name / OS / MAC / repository) are dropped by default so the view isn't
+      flooded with empty rows; set TENABLE_SC_HOSTS_INCLUDE_BARE=true to keep them.
     recommended_refresh_frequency: Daily
 
   - id: TSC010

@@ -198,6 +198,32 @@ def test_hosts_plain_list_shape():
     assert result.rows[0][result.column_names.index("host.name")] == "db01"
 
 
+def test_hosts_drop_bare_ping_only():
+    # A bare IP (only ip + timestamps, no name/OS/MAC/repo) is dropped by default;
+    # a host with real data is kept.
+    resp = {"results": [
+        {"id": "1", "ipAddress": "10.3.3.5", "systemType": "N/A",
+         "firstSeen": "1600000000", "lastSeen": "1600000500"},         # bare -> dropped
+        {"id": "2", "ipAddress": "10.0.0.9", "dnsName": "app.corp",
+         "os": "Linux", "lastSeen": "1600000500"},                     # real -> kept
+    ]}
+    client = FakeClient(get_rules={"hosts": resp})
+    result = tsc_runner_mod.run_query(client, _q("hosts", "TSC009", "Device Inventory"))
+    names = [r[result.column_names.index("host.name")] for r in result.rows]
+    assert names == ["app.corp"]
+
+
+def test_hosts_include_bare_when_opted_in(monkeypatch):
+    monkeypatch.setenv("TENABLE_SC_HOSTS_INCLUDE_BARE", "true")
+    resp = {"results": [
+        {"id": "1", "ipAddress": "10.3.3.5", "systemType": "N/A"},
+        {"id": "2", "ipAddress": "10.0.0.9", "dnsName": "app.corp", "os": "Linux"},
+    ]}
+    client = FakeClient(get_rules={"hosts": resp})
+    result = tsc_runner_mod.run_query(client, _q("hosts", "TSC009", "Device Inventory"))
+    assert len(result.rows) == 2
+
+
 # --------------------------------------------------------------------------- #
 # Findings (vulndetails)
 # --------------------------------------------------------------------------- #
