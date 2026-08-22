@@ -604,9 +604,14 @@ you tick **Remember**.
 
 > **Validation status.** Endpoints, analysis tools, and field mappings follow
 > Tenable's Security Center API documentation and the official
-> [pyTenable](https://github.com/tenable/pyTenable) SDK; resources stay marked
-> `partially_validated` (SaaS is `not_validated`) until run against a live
-> Tenable.sc box — the same honest labeling the other registries use.
+> [pyTenable](https://github.com/tenable/pyTenable) SDK, targeting **Tenable
+> Security Center 6.x** (a **6.8.0 "Plus"** deployment — "Plus" is a licensing
+> tier of the same product, not a separate one). 6.x adds `acrScore` (Asset
+> Criticality Rating, editable in Plus) and `assetExposureScore` (Asset Exposure
+> Score) to the device `sumip` view, surfaced as the `acr` / `aes` columns; any
+> other field a release returns still rides along under `custom.*`. Resources stay
+> marked `partially_validated` (SaaS is `not_validated`) until run against a live
+> box — the same honest labeling the other registries use.
 
 ## CLI reference
 

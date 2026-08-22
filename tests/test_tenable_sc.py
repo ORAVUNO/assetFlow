@@ -88,6 +88,7 @@ SUMIP_ALL = [
     {"ip": "10.0.0.1", "dnsName": "web01.corp", "netbiosName": "WEB01",
      "macAddress": "aa:bb:cc:00:00:01", "osCPE": "cpe:/o:linux:linux_kernel",
      "repository": {"id": 1, "name": "Main"}, "score": "420", "total": "12",
+     "acrScore": "7", "assetExposureScore": "812",
      "severityCritical": "1", "severityHigh": "3", "severityMedium": "5",
      "severityLow": "2", "severityInfo": "1", "lastAuthRun": "1600000000",
      "lastUnauthRun": "0", "uuid": "u-1", "hasPassive": "Yes"},
@@ -136,6 +137,10 @@ def test_devices_flatten_custom_and_type():
     assert web[cols.index("asset.type")] == "Host"
     assert web[cols.index("host.ip")] == "10.0.0.1"
     assert web[cols.index("repository")] == "Main"          # nested object -> name
+    # ACR / AES (Tenable Security Center 6.x sumip fields) get named columns.
+    assert web[cols.index("acr")] == "7"
+    assert web[cols.index("aes")] == "812"
+    assert "custom.acrScore" not in cols                     # promoted, not swept
     assert web[cols.index("vuln.critical")] == "1"
     # Epoch -> ISO; the "never" (0) unauth scan is blank, not "1970".
     assert web[cols.index("last.auth.scan")].startswith("2020-09-13")

@@ -183,6 +183,26 @@ Tenable.sc models tags / groupings as **asset lists**. Two places surface them:
    **best-effort** — on any failure the affected host simply contributes no tags,
    and the device inventory is unaffected.
 
+## Version notes (Tenable Security Center 6.x / "Plus")
+
+Targeted and field-checked against **Tenable Security Center 6.x** (a **6.8.0
+"Plus"** deployment). "Plus" is a licensing tier of the same product — it adds
+the *Explore Assets* experience and **editable ACR** — not a different product, so
+the REST surface is identical and the adapter is unchanged by it.
+
+6.x surfaces two extra host scores on the `sumip` device analysis, promoted to
+named columns in `_DEVICE_SPEC`:
+
+- `acrScore` → **`acr`** — Asset Criticality Rating (editable in the Plus tier).
+- `assetExposureScore` → **`aes`** — Asset Exposure Score.
+
+Because the runner sweeps unmapped fields into `custom.*`, the adapter is
+forward/backward compatible across releases: a field a given version doesn't
+return simply yields a blank column, and any field a newer version adds shows up
+automatically under `custom.*` without a code change. (6.x also adds a dedicated
+`/rest/hosts` "Explore Assets" endpoint; `sumip` remains the portable device view
+used here, and `/rest/hosts` is a natural follow-up resource.)
+
 ## SaaS applications
 
 `saas_applications` (TSC008) is an honest placeholder that returns no rows. The

@@ -139,6 +139,8 @@ queries:
       - host.mac           # macAddress
       - os                 # osCPE
       - repository         # repository.name
+      - acr                # acrScore (Asset Criticality Rating; editable in the Plus tier)
+      - aes                # assetExposureScore (Asset Exposure Score)
       - vuln.score         # score
       - vuln.total         # total
       - vuln.critical      # severityCritical
@@ -156,7 +158,9 @@ queries:
       asset-list-name map from GET /rest/asset (bounded to the first 150 asset
       lists, each expanded via a sumip analysis filtered by assetID); it is
       best-effort and degrades to no tags on error. The time-range control adds a
-      lastSeen filter (24h/7d/30d/90d).
+      lastSeen filter (24h/7d/30d/90d). Field names target Tenable Security Center
+      6.x (a 6.8.0 "Plus" deployment): 6.x adds acrScore / assetExposureScore to
+      sumip. Any other field the release returns still rides along under custom.*.
     recommended_refresh_frequency: Daily
 
   - id: TSC002

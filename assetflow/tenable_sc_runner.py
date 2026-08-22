@@ -235,6 +235,11 @@ _DEVICE_SPEC: Tuple[Tuple[str, str, Any], ...] = (
     ("host.mac", "macAddress", textish),
     ("os", "osCPE", textish),
     ("repository", "repository", _obj_name),
+    # ACR (Asset Criticality Rating) and AES (Asset Exposure Score) are surfaced by
+    # the sumip analysis in Tenable Security Center 6.x; ACR is editable in the
+    # "Plus" licensing tier. Named here so they aren't buried in custom.*.
+    ("acr", "acrScore", textish),
+    ("aes", "assetExposureScore", textish),
     ("vuln.score", "score", textish),
     ("vuln.total", "total", textish),
     ("vuln.critical", "severityCritical", textish),
