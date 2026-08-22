@@ -67,8 +67,8 @@ def test_registry_loads_and_validates():
     assert reg.metadata.version == 1
     resources = {q.resource for q in reg.queries}
     assert {
-        "devices", "hosts", "findings", "software", "users", "asset_lists",
-        "alerts", "incidents", "saas_applications",
+        "devices", "hosts", "findings", "software", "databases", "users",
+        "asset_lists", "alerts", "incidents", "saas_applications",
     } <= resources
 
 
@@ -101,17 +101,6 @@ SUMIP_ALL = [
 ]
 
 
-def _sumip_rule(filters):
-    """Full list with no filter; per-asset IPs when an asset filter is present."""
-    for f in filters:
-        if f.get("filterName") == "asset":
-            asset_id = str(f.get("value", {}).get("id"))
-            if asset_id == "100":  # "Web Servers" contains 10.0.0.1
-                return [{"ip": "10.0.0.1"}]
-            return []
-    return SUMIP_ALL
-
-
 ASSET_LISTS = [
     {"id": 100, "name": "Web Servers", "type": "static", "tags": "prod,web",
      "description": "front-end", "ipCount": 1, "owner": {"username": "admin"},
@@ -119,11 +108,19 @@ ASSET_LISTS = [
      "createdTime": "1600000000", "modifiedTime": "1600000000"},
 ]
 
+# Asset detail (GET /rest/asset/100) carrying the resolved member IPs used for
+# device tag stamping — 10.0.0.1 is in "Web Servers", 10.0.0.2 is in none.
+ASSET_DETAIL_100 = {
+    "id": 100, "name": "Web Servers",
+    "viewableIPs": [{"repository": {"id": 1, "name": "Main"}, "ipList": "10.0.0.1"}],
+}
+
 
 def _device_client():
+    # "asset/100" must precede "asset" so the detail GET isn't shadowed by the list.
     return FakeClient(
-        analysis_rules={"sumip": _sumip_rule},
-        get_rules={"asset": ASSET_LISTS},
+        analysis_rules={"sumip": lambda filters: SUMIP_ALL},
+        get_rules={"asset/100": ASSET_DETAIL_100, "asset": ASSET_LISTS},
     )
 
 
@@ -161,7 +158,7 @@ def test_devices_stamped_with_asset_tags():
 
 def test_devices_tags_degrade_when_asset_lookup_fails():
     # No asset get-rule -> enrichment fails silently, devices still returned.
-    client = FakeClient(analysis_rules={"sumip": _sumip_rule})
+    client = FakeClient(analysis_rules={"sumip": lambda filters: SUMIP_ALL})
     result = tsc_runner_mod.run_query(client, _q("devices"))
     cols = result.column_names
     assert "tags" in cols
@@ -235,16 +232,58 @@ def test_findings_flatten_objects_and_skip_plugintext():
 # Software (listsoftware)
 # --------------------------------------------------------------------------- #
 
-def test_software_listing():
-    records = [{"name": "OpenSSH 8.0", "count": "42"},
-               {"name": "nginx 1.20", "count": "7"}]
-    client = FakeClient(analysis_rules={"listsoftware": records})
+def test_software_split_and_host_linked():
+    # Software now comes from the enumeration plugins (vulndetails), one row per
+    # (host, package), with name/version split out and linked to the host.
+    plugin_text = (
+        "The following software are installed on the remote host :\n\n"
+        "  Google Chrome  [version 100.0.4896.75]\n"
+        "  cpe:/a:openbsd:openssh:8.0\n"
+        "  bind-libs-9.11.4-26.P2.el8  (rpm)\n"
+    )
+    records = [{"ip": "10.0.0.1", "dnsName": "web01.corp", "pluginID": "20811",
+                "lastSeen": "1600000000", "pluginText": plugin_text}]
+    client = FakeClient(analysis_rules={"vulndetails": records})
     result = tsc_runner_mod.run_query(client, _q("software", "TSC003", "Software"))
     cols = result.column_names
-    assert cols[0] == "software.name"
-    assert "host.name" not in cols  # software rows are not host-keyed
-    rows = {r[0]: r for r in result.rows}
-    assert rows["OpenSSH 8.0"][cols.index("host.count")] == "42"
+    assert cols[0] == "host.name"                       # software links to the host
+    rows = {r[cols.index("software.raw")]: r for r in result.rows}
+    assert len(result.rows) == 3
+    chrome = next(r for r in result.rows if "Chrome" in r[cols.index("software.name")])
+    assert chrome[cols.index("host.name")] == "web01.corp"
+    assert chrome[cols.index("host.ip")] == "10.0.0.1"
+    assert chrome[cols.index("software.version")] == "100.0.4896.75"
+    ssh = next(r for r in result.rows if r[cols.index("software.name")] == "openbsd openssh")
+    assert ssh[cols.index("software.version")] == "8.0"
+    rpm = next(r for r in result.rows if r[cols.index("software.name")] == "bind-libs")
+    assert rpm[cols.index("software.version")].startswith("9.11.4")
+
+
+def test_split_software_helper():
+    assert tsc_runner_mod._split_software("cpe:/a:openbsd:openssh:8.0") == (
+        "openbsd openssh", "8.0", "cpe:/a:openbsd:openssh:8.0")
+    assert tsc_runner_mod._split_software("Google Chrome  [version 100.0.1]")[:2] == (
+        "Google Chrome", "100.0.1")
+    assert tsc_runner_mod._split_software("nginx 1.20.2")[:2] == ("nginx", "1.20.2")
+    assert tsc_runner_mod._split_software("SomeToolNoVersion")[:2] == ("SomeToolNoVersion", "")
+
+
+def test_databases_linked_to_host():
+    # Family lookup resolves "Databases"; vulndetails rows are DB detections.
+    fam = [{"id": "10", "name": "Databases"}, {"id": "11", "name": "Web Servers"}]
+    dbrows = [{"ip": "10.0.0.2", "dnsName": "db01.corp", "pluginID": "1234",
+               "pluginName": "MySQL 8.0.32 Detection", "port": "3306",
+               "protocol": "TCP", "family": {"name": "Databases"},
+               "lastSeen": "1600000000", "pluginText": "Version : 8.0.32"}]
+    client = FakeClient(analysis_rules={"vulndetails": dbrows},
+                        get_rules={"pluginFamily": fam})
+    result = tsc_runner_mod.run_query(client, _q("databases", "TSC010", "Software"))
+    cols = result.column_names
+    row = result.rows[0]
+    assert row[cols.index("host.name")] == "db01.corp"
+    assert row[cols.index("database")] == "MySQL"
+    assert row[cols.index("version")] == "8.0.32"
+    assert row[cols.index("port")] == "3306"
 
 
 # --------------------------------------------------------------------------- #

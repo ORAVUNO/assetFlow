@@ -82,8 +82,8 @@ feeds:
   - id: FEED-TSC-SOFTWARE
     name: Software
     category: Software
-    description: Installed-software enumeration across the estate (listsoftware).
-    query_ids: [TSC003]
+    description: Installed software linked to each host, with name and version split into their own columns, plus running databases and their versions.
+    query_ids: [TSC003, TSC010]
     recommended_refresh_frequency: Daily
 
   - id: FEED-TSC-USERS
@@ -204,24 +204,33 @@ queries:
 
   - id: TSC003
     category: Software
-    name: Installed Software
-    status: partially_validated
+    name: Installed Software (per host)
+    status: investigation_required
     validated: false
     resource: software
     purpose: >-
-      Enumerate installed software across the estate, one row per distinct
-      software string with the number of hosts it appears on (and a CPE where the
-      release provides one).
+      Enumerate installed software linked to each host, one row per (host,
+      package), with the software name and version split into their own columns
+      (the original enumeration line is kept in software.raw). This lets software
+      correlate to hosts/IPs in the unified inventory.
     expected_output_fields:
-      - software.name      # name
-      - host.count         # count
-      - cpe                # cpe (when present)
-      - "custom.*"         # any extra field Tenable.sc returns
+      - host.name          # dnsName / netbiosName / ip (folds into unified host view)
+      - host.ip            # ip
+      - host.dns           # dnsName
+      - software.name      # product name parsed from the enumeration line
+      - software.version   # version parsed from the enumeration line
+      - software.raw       # the original, unparsed software line
+      - plugin.id          # the enumeration plugin (20811 Windows / 22869 SSH)
+      - last.seen          # lastSeen (epoch -> ISO)
     notes: >-
-      POST /rest/analysis with type=vuln, sourceType=cumulative, tool=listsoftware.
-      This is the estate-wide software list (the "Installed Software" table). Per-
-      host software can be obtained by filtering the analysis by IP/asset — a
-      natural follow-up resource.
+      POST /rest/analysis with tool=vulndetails filtered to the software-
+      enumeration plugins (pluginID = 20811,22869), then each plugin's pluginText
+      is split into individual package lines and each line into name + version
+      (CPE, "[version X]", and trailing dotted-number forms are handled; the raw
+      line is preserved). This replaces the previous estate-wide listsoftware view
+      so software links to hosts. Marked investigation_required until the exact
+      pluginText format is confirmed against a live box, since parsing is
+      format-dependent (the raw line always survives, so nothing is lost).
     recommended_refresh_frequency: Daily
 
   - id: TSC004
@@ -390,4 +399,35 @@ queries:
       live 6.x box (the endpoint is new in the 6.x line). Requires Tenable Security
       Center 6.x; older releases won't expose /rest/hosts (the resource returns no
       rows there — use TSC001 instead).
+    recommended_refresh_frequency: Daily
+
+  - id: TSC010
+    category: Software
+    name: Databases (per host)
+    status: investigation_required
+    validated: false
+    resource: databases
+    purpose: >-
+      Inventory the running databases and their versions, linked to each host —
+      which database products (MySQL, Microsoft SQL Server, Oracle, PostgreSQL,
+      MongoDB, …) are running where, on which port, with a parsed version.
+    expected_output_fields:
+      - host.name          # dnsName / netbiosName / ip
+      - host.ip            # ip
+      - host.dns           # dnsName
+      - database           # product parsed from the detection plugin name
+      - version            # version parsed from the plugin name / output
+      - port               # service port
+      - protocol           # protocol
+      - plugin.id          # detection pluginID
+      - plugin.name        # detection plugin name (kept for reference)
+      - last.seen          # lastSeen (epoch -> ISO)
+    notes: >-
+      Resolves the "Databases" plugin family id via GET /rest/pluginFamily, then
+      POST /rest/analysis with tool=vulndetails filtered to that family; the
+      database product is taken from the plugin name and the version parsed from
+      the plugin name/output. Marked investigation_required until confirmed against
+      a live box: the family-filter shape and plugin-name formats vary, so version
+      parsing is best-effort (the full plugin name is always kept). Returns no rows
+      if the Databases family can't be resolved.
     recommended_refresh_frequency: Daily

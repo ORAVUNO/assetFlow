@@ -15,7 +15,10 @@ The resources cover the asset types the integration asked for:
 * ``findings`` — aggregated security findings, from the ``vulndetails`` analysis
   tool: one row per (host, plugin) detection with severity, port/protocol,
   synopsis, solution, CVEs, CVSS/VPR scores, and first/last seen.
-* ``software`` — installed software, from the ``listsoftware`` analysis tool.
+* ``software`` — installed software **linked to each host** (name / version split
+  out), from the software-enumeration plugins (20811 / 22869) via ``vulndetails``.
+* ``databases`` — running databases and their versions, **linked to each host**,
+  from the "Databases" plugin family via ``vulndetails``.
 * ``users`` — the Tenable.sc user accounts (``GET /rest/user``).
 * ``asset_lists`` — the asset lists that model **asset tags / groupings** in
   Tenable.sc (``GET /rest/asset``), each with its ``tags`` field, type, owner,
@@ -43,6 +46,8 @@ The resources cover the asset types the integration asked for:
 
 from __future__ import annotations
 
+import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,15 +58,43 @@ from .runner import QueryResult
 # confused with the standard system columns.
 CUSTOM_PREFIX = "custom."
 
-# How many asset lists to expand into member IPs when stamping device tags, so a
-# site with hundreds of asset lists cannot explode into hundreds of analysis
-# calls. Asset-list metadata itself (the ``asset_lists`` resource) is never
-# capped — only the per-device tag enrichment.
-MAX_ASSET_LISTS_FOR_TAGS = 150
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("false", "0", "no", "off")
+
+
+# How many asset lists to resolve into member IPs when stamping device tags. Each
+# is now a single lightweight ``GET /rest/asset/{id}`` (its resolved viewableIPs),
+# not a paginated analysis, so this is cheap — but still capped so a site with
+# thousands of asset lists stays bounded. Override with TENABLE_SC_TAG_ASSET_CAP;
+# disable device tag stamping entirely with TENABLE_SC_DEVICE_TAGS=false (the
+# asset_lists resource still lists every tag). Asset-list metadata itself is never
+# capped — only this per-device enrichment.
+MAX_ASSET_LISTS_FOR_TAGS = _int_env("TENABLE_SC_TAG_ASSET_CAP", 200)
+DEVICE_TAGS_ENABLED = _bool_env("TENABLE_SC_DEVICE_TAGS", True)
 
 # Time-range tokens (from the UI) → number of days back, applied as a
 # ``lastSeen`` filter on the vuln analysis resources (devices / findings).
 RANGE_DAYS = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}
+
+# Plugin IDs whose output enumerates installed software per host, used by the
+# host-linked ``software`` view so software correlates to a host/IP.
+SOFTWARE_ENUM_PLUGINS = ("20811", "22869")  # Windows installed software, SSH software
+
+# A version-looking token (2+ dotted numbers, optional trailing build/rev), used
+# to split a software string into name + version.
+_VERSION_RE = re.compile(r"\b\d+(?:\.\d+)+(?:[-_.][0-9A-Za-z]+)*\b")
+_CPE_RE = re.compile(r"cpe:/[aoh]:(?P<vendor>[^:]*):(?P<product>[^:]*):(?P<version>[^:]*)")
 
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +175,52 @@ def _result(columns: List[str], rows: List[List[Any]], limit: Optional[int]) -> 
     return QueryResult(columns=[{"name": c} for c in columns], rows=rows)
 
 
+def _split_software(raw: str) -> Tuple[str, str, str]:
+    """Split a software string into ``(name, version, cpe)``.
+
+    Tenable software strings come in a few shapes; this normalizes the common ones
+    and always preserves the original elsewhere (the caller keeps a raw column):
+
+    * a CPE — ``cpe:/a:openbsd:openssh:8.0`` → name ``openbsd openssh``, version ``8.0``;
+    * a Windows enumeration line — ``Google Chrome  [version 100.0.4896.75]`` →
+      name ``Google Chrome``, version ``100.0.4896.75``;
+    * an rpm/deb-ish token — ``openssh-server-8.0p1-13.el8`` → name ``openssh-server``,
+      version ``8.0p1-13.el8``;
+    * anything else — the trailing dotted-number token (if any) becomes the version
+      and the text before it the name.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "", "", ""
+
+    # 1) CPE form.
+    m = _CPE_RE.search(text)
+    if m:
+        vendor = (m.group("vendor") or "").replace("_", " ").strip()
+        product = (m.group("product") or "").replace("_", " ").strip()
+        version = (m.group("version") or "").strip()
+        name = " ".join(p for p in (vendor, product) if p) or text
+        return name, version, m.group(0)
+
+    # 2) Explicit "[version X]" / "(version X)" annotation.
+    ver_annot = re.search(r"[\[(]\s*version\s+([^\])]+)[\])]", text, re.IGNORECASE)
+    if ver_annot:
+        version = ver_annot.group(1).strip()
+        name = text[: ver_annot.start()].strip(" -\t")
+        return name or text, version, ""
+
+    # 3) Trailing dotted-number version token anywhere in the string.
+    matches = list(_VERSION_RE.finditer(text))
+    if matches:
+        last = matches[-1]
+        version = last.group(0)
+        name = text[: last.start()].strip(" -_\t")
+        # A leading "name-<version>" (rpm/deb) leaves a trailing dash — already stripped.
+        return name or text, version, ""
+
+    return text, "", ""
+
+
 def _listing(response: Any) -> List[Dict[str, Any]]:
     """Normalize a Tenable.sc list endpoint's ``response`` into a flat record list.
 
@@ -205,28 +284,61 @@ def _asset_records(client) -> List[Dict[str, Any]]:
     return _listing(response)
 
 
+_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+
+
 def _ips_for_asset(client, asset_id: str) -> List[str]:
-    """Member IPs of one asset list, via a ``sumip`` analysis filtered to it."""
-    filters = [{"filterName": "asset", "operator": "=", "value": {"id": str(asset_id)}}]
+    """Resolved member IPs of one asset list.
+
+    Uses a single lightweight ``GET /rest/asset/{id}`` and reads the resolved
+    ``viewableIPs`` (which covers static *and* dynamic/DNS/combination lists —
+    Tenable resolves membership for us), falling back to the static
+    ``typeFields.definedIPs``. This replaces the previous per-asset ``sumip``
+    analysis, which paginated and made the device fetch hang on real estates.
+    """
+    safe_id = str(asset_id)
     try:
-        records = client.analysis("sumip", filters=filters)
+        detail = client.get(f"asset/{safe_id}?fields=id,name,viewableIPs,typeFields")
     except Exception:  # pragma: no cover - network dependent
         return []
-    ips = []
-    for r in records:
-        ip = textish(r.get("ip"))
-        if ip:
-            ips.append(ip)
-    return ips
+    if not isinstance(detail, dict):
+        return []
+    ips: List[str] = []
+
+    def _harvest(blob: Any) -> None:
+        if isinstance(blob, str):
+            ips.extend(_IP_RE.findall(blob))
+        elif isinstance(blob, list):
+            for item in blob:
+                _harvest(item)
+        elif isinstance(blob, dict):
+            for value in blob.values():
+                _harvest(value)
+
+    _harvest(detail.get("viewableIPs"))
+    type_fields = detail.get("typeFields")
+    if isinstance(type_fields, dict):
+        _harvest(type_fields.get("definedIPs"))
+    # De-duplicate, preserve order.
+    seen = set()
+    out = []
+    for ip in ips:
+        if ip not in seen:
+            seen.add(ip)
+            out.append(ip)
+    return out
 
 
 def _ip_tag_map(client, assets: List[Dict[str, Any]]) -> Dict[str, List[str]]:
-    """Build ``ip -> [asset-list names]`` for device tag stamping (bounded).
+    """Build ``ip -> [asset-list names]`` for device tag stamping (bounded, cheap).
 
-    Best-effort: each asset list is expanded into its member IPs via ``sumip``.
-    Capped at :data:`MAX_ASSET_LISTS_FOR_TAGS` asset lists so a large estate stays
-    bounded; on any failure the affected asset simply contributes no tags.
+    Best-effort: each asset list is resolved to its member IPs via one lightweight
+    ``GET /rest/asset/{id}``. Capped at :data:`MAX_ASSET_LISTS_FOR_TAGS`; on any
+    failure the affected asset simply contributes no tags. Disabled entirely when
+    ``TENABLE_SC_DEVICE_TAGS=false``.
     """
+    if not DEVICE_TAGS_ENABLED:
+        return {}
     mapping: Dict[str, List[str]] = {}
     for asset in assets[:MAX_ASSET_LISTS_FOR_TAGS]:
         name = textish(asset.get("name"))
@@ -405,19 +517,112 @@ def _collect_findings(client, time_range: Optional[str]) -> Tuple[List[str], Lis
     return _flatten_analysis(records, _FINDING_SPEC, skip_custom=_FINDING_SKIP)
 
 
-def _collect_software(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
-    """Installed-software enumeration via the ``listsoftware`` analysis tool.
+def _software_lines(plugin_text: str) -> List[str]:
+    """Extract the individual software lines from a software-enumeration plugin's
+    output (plugins 20811 / 22869), dropping the header/footer prose."""
+    lines: List[str] = []
+    for raw in str(plugin_text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        # Skip the plugin's framing sentences and section headers.
+        if line.endswith(":") or low.startswith("the following") \
+                or "installed on the remote" in low \
+                or low.startswith("nessus") or low.startswith("note"):
+            continue
+        lines.append(line)
+    return lines
 
-    ``listsoftware`` returns one row per distinct software string with a host
-    count; some releases also carry a CPE. Extra fields ride along as ``custom.*``.
+
+def _collect_software(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Installed software, **linked to each host**, with name / version split out.
+
+    Uses the software-enumeration plugins (20811 Windows, 22869 SSH) via the
+    ``vulndetails`` analysis tool, so each row carries the host it was found on
+    (``host.name`` / ``host.ip``) and one installed package — its ``software.name``
+    and ``software.version`` parsed out of the long enumeration line (the original
+    line is kept in ``software.raw``). This replaces the old estate-wide
+    ``listsoftware`` view so software correlates to hosts in the unified inventory.
     """
-    records = client.analysis("listsoftware", filters=_range_filters(time_range))
-    spec: Tuple[Tuple[str, str, Any], ...] = (
-        ("software.name", "name", textish),
-        ("host.count", "count", textish),
-        ("cpe", "cpe", textish),
-    )
-    return _flatten_analysis(records, spec, lead_host_name=False)
+    filters = list(_range_filters(time_range))
+    filters.append({
+        "filterName": "pluginID", "operator": "=",
+        "value": ",".join(SOFTWARE_ENUM_PLUGINS),
+    })
+    records = client.analysis("vulndetails", filters=filters)
+    columns = [
+        "host.name", "host.ip", "host.dns", "software.name", "software.version",
+        "software.raw", "plugin.id", "last.seen",
+    ]
+    rows: List[List[Any]] = []
+    for rec in records:
+        host = _host_name(rec)
+        ip = textish(rec.get("ip"))
+        dns = textish(rec.get("dnsName"))
+        plugin_id = textish(rec.get("pluginID"))
+        last_seen = _epoch(rec.get("lastSeen"))
+        for line in _software_lines(rec.get("pluginText")):
+            name, version, _cpe = _split_software(line)
+            rows.append([host, ip, dns, name, version, line, plugin_id, last_seen])
+    return columns, rows
+
+
+def _plugin_family_id(client, name: str) -> str:
+    """Resolve a plugin family name (e.g. "Databases") to its id; '' if not found."""
+    try:
+        response = client.get("pluginFamily?fields=id,name")
+    except Exception:  # pragma: no cover - permission dependent
+        return ""
+    for rec in _listing(response) or (response if isinstance(response, list) else []):
+        if isinstance(rec, dict) and textish(rec.get("name")).lower() == name.lower():
+            return textish(rec.get("id"))
+    return ""
+
+
+def _collect_databases(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Running databases and their versions, **linked to each host**.
+
+    Databases are detected by plugins in the "Databases" family; this fetches those
+    detections via ``vulndetails`` (filtered to that family) so each row carries the
+    host, the database product (from the plugin name), a parsed version, and the
+    service port. Version parsing is best-effort and the plugin synopsis is kept.
+    Returns no rows if the Databases family can't be resolved on this box.
+    """
+    fam_id = _plugin_family_id(client, "Databases")
+    filters = list(_range_filters(time_range))
+    if fam_id:
+        filters.append({
+            "filterName": "family", "operator": "=", "value": [{"id": fam_id}],
+        })
+    records = client.analysis("vulndetails", filters=filters)
+    columns = [
+        "host.name", "host.ip", "host.dns", "database", "version", "port",
+        "protocol", "plugin.id", "plugin.name", "last.seen",
+    ]
+    rows: List[List[Any]] = []
+    for rec in records:
+        # When the family filter wasn't applied, keep only Databases-family rows.
+        if not fam_id and _obj_name(rec.get("family")).lower() != "databases":
+            continue
+        plugin_name = textish(rec.get("pluginName"))
+        # Parse a product name (plugin name up to the first version token) and a
+        # version (from the plugin name, else the plugin output).
+        product = plugin_name
+        version = ""
+        m = _VERSION_RE.search(plugin_name)
+        if m:
+            product = plugin_name[: m.start()].strip(" -")
+            version = m.group(0)
+        if not version:
+            mt = _VERSION_RE.search(str(rec.get("pluginText") or ""))
+            version = mt.group(0) if mt else ""
+        rows.append([
+            _host_name(rec), textish(rec.get("ip")), textish(rec.get("dnsName")),
+            product, version, textish(rec.get("port")), textish(rec.get("protocol")),
+            textish(rec.get("pluginID")), plugin_name, _epoch(rec.get("lastSeen")),
+        ])
+    return columns, rows
 
 
 def _collect_users(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
@@ -713,6 +918,7 @@ def _collect_hosts(client, time_range: Optional[str]) -> Tuple[List[str], List[L
 
 _COLLECTORS = {
     "devices": _collect_devices,
+    "databases": _collect_databases,
     "hosts": _collect_hosts,
     "findings": _collect_findings,
     "software": _collect_software,

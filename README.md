@@ -542,7 +542,8 @@ rest are plain object listings:
 |---|---|---|---|
 | TSC001 | **Devices** (`devices`) | Device Inventory | `/rest/analysis` tool `sumip` — one row per host: IP/DNS/NetBIOS/MAC, OS, repository, vuln score + per-severity counts, last scan times, **asset-list tags**, `custom.*` |
 | TSC002 | **Aggregated Security Findings** (`findings`) | Security Findings | `/rest/analysis` tool `vulndetails` — one row per (host, plugin): severity, family, port/protocol, CVEs, CVSS/VPR, synopsis, solution, first/last seen, `custom.*` |
-| TSC003 | Installed Software (`software`) | Software | `/rest/analysis` tool `listsoftware` |
+| TSC003 | **Installed Software** (per host) (`software`) | Software | `/rest/analysis` `vulndetails` on the software-enumeration plugins (20811/22869) — one row per (host, package) with **name/version split out**, linked to the host |
+| TSC010 | **Databases** (per host) (`databases`) | Software | `/rest/analysis` `vulndetails` on the "Databases" plugin family — running databases + versions per host |
 | TSC004 | Users (`users`) | Users | `GET /rest/user` |
 | TSC005 | **Asset Lists (Tags)** (`asset_lists`) | Asset Tags | `GET /rest/asset` |
 | TSC006 | Alerts (`alerts`) | Alerts & Incidents | `GET /rest/alert` |
@@ -550,9 +551,13 @@ rest are plain object listings:
 | TSC008 | SaaS Applications (`saas_applications`) | SaaS Applications | *placeholder — not a Tenable.sc core capability* |
 | TSC009 | Explore Assets (`hosts`) | Device Inventory | `GET /rest/hosts` — the 6.x unified asset model (ACR/AES, repositories, system type); the modern companion to TSC001 |
 
-Device rows emit a `host.name` column (DNS/NetBIOS/IP), so they fold into the
-*All Fetched Results* golden records and the cross-adapter unified inventory
-alongside the other adapters; findings key on the same host identifiers.
+**Everything links to the host.** Device, host, finding, software, and database
+rows all emit `host.name` (DNS/NetBIOS/IP) plus `host.ip`, so they fold into the
+*All Fetched Results* golden records and the cross-adapter unified inventory on
+the same host identifiers — vulnerabilities, installed software, running
+databases, and asset-list tags all correlate to the host they were found on.
+(Software and databases are fetched from the per-host enumeration/detection
+plugins for exactly this reason, rather than the estate-wide aggregate.)
 
 ### Custom fields and asset tags
 
