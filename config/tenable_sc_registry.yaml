@@ -197,9 +197,12 @@ queries:
       - "custom.*"         # any extra field Tenable.sc returns for the finding
     notes: >-
       POST /rest/analysis with type=vuln, sourceType=cumulative, tool=vulndetails,
-      paged by startOffset/endOffset. Large text fields (pluginText, description,
-      xref, …) are intentionally excluded from the custom.* sweep so the table
-      stays legible. The time-range control adds a lastSeen filter.
+      paged by startOffset/endOffset. Informational plugins (severity Info — "Ping
+      the remote host", scan info, OS fingerprints) are excluded by default via a
+      severity filter (1-4), matching the Tenable vulnerabilities GUI; set
+      TENABLE_SC_FINDINGS_SEVERITIES=all (or include 0) to keep them. Large text
+      fields (pluginText, description, xref, …) are excluded from the custom.*
+      sweep so the table stays legible. The time-range control adds a lastSeen filter.
     recommended_refresh_frequency: Daily
 
   - id: TSC003

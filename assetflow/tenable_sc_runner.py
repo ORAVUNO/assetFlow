@@ -87,6 +87,17 @@ DEVICE_TAGS_ENABLED = _bool_env("TENABLE_SC_DEVICE_TAGS", True)
 # ``lastSeen`` filter on the vuln analysis resources (devices / findings).
 RANGE_DAYS = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}
 
+# Severities included in the aggregated-findings view. Tenable severity ids are
+# 0=Info, 1=Low, 2=Medium, 3=High, 4=Critical. Informational plugins (e.g. "Ping
+# the remote host", "Nessus Scan Information") are excluded by default so findings
+# read as real security issues, matching the Tenable vulnerabilities GUI. Override
+# with TENABLE_SC_FINDINGS_SEVERITIES (e.g. "0,1,2,3,4" or "all" to include Info).
+FINDINGS_SEVERITIES = (os.getenv("TENABLE_SC_FINDINGS_SEVERITIES") or "1,2,3,4").strip()
+
+# Plugin IDs whose output enumerates installed software per host, used by the
+# host-linked ``software`` view so software correlates to a host/IP.
+SOFTWARE_ENUM_PLUGINS = ("20811", "22869")  # Windows installed software, SSH software
+
 # Plugin IDs whose output enumerates installed software per host, used by the
 # host-linked ``software`` view so software correlates to a host/IP.
 SOFTWARE_ENUM_PLUGINS = ("20811", "22869")  # Windows installed software, SSH software
@@ -566,8 +577,17 @@ def _collect_devices(client, time_range: Optional[str]) -> Tuple[List[str], List
 
 
 def _collect_findings(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
-    """Aggregated security findings via the ``vulndetails`` analysis tool."""
-    records = client.analysis("vulndetails", filters=_range_filters(time_range))
+    """Aggregated security findings via the ``vulndetails`` analysis tool.
+
+    Informational plugins (severity Info — "Ping the remote host", scan-info, OS
+    fingerprints, …) are excluded by default so this reads as a real vulnerability
+    view; set ``TENABLE_SC_FINDINGS_SEVERITIES=all`` (or include ``0``) to keep them.
+    """
+    filters = list(_range_filters(time_range))
+    sev = FINDINGS_SEVERITIES.lower()
+    if sev and sev not in ("all", "*"):
+        filters.append({"filterName": "severity", "operator": "=", "value": FINDINGS_SEVERITIES})
+    records = client.analysis("vulndetails", filters=filters)
     return _flatten_analysis(records, _FINDING_SPEC, skip_custom=_FINDING_SKIP)
 
 

@@ -214,6 +214,20 @@ VULNDETAILS = [
 ]
 
 
+def test_findings_exclude_info_severity_by_default():
+    # By default a severity filter (1-4, excluding Info) is applied.
+    captured = {}
+
+    class Cap(FakeClient):
+        def analysis(self, tool, *, filters=None, **kw):
+            captured["filters"] = filters or []
+            return VULNDETAILS
+
+    tsc_runner_mod.run_query(Cap(), _q("findings", "TSC002", "Security Findings"))
+    sev = [f for f in captured["filters"] if f.get("filterName") == "severity"]
+    assert sev and sev[0]["value"] == "1,2,3,4"
+
+
 def test_findings_flatten_objects_and_skip_plugintext():
     client = FakeClient(analysis_rules={"vulndetails": VULNDETAILS})
     result = tsc_runner_mod.run_query(client, _q("findings", "TSC002", "Security Findings"))
