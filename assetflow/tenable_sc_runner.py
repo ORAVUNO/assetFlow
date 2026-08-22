@@ -17,6 +17,9 @@ The resources cover the asset types the integration asked for:
   synopsis, solution, CVEs, CVSS/VPR scores, and first/last seen.
 * ``software`` — installed software **linked to each host** (name / version split
   out), from the software-enumeration plugins (20811 / 22869) via ``vulndetails``.
+* ``applications`` — the notable applications among that software (all Windows
+  installed apps + allowlisted Linux server/app/desktop packages), emitting
+  ``application.name`` so it folds into the unified Applications inventory.
 * ``databases`` — running databases and their versions, **linked to each host**,
   from the "Databases" plugin family via ``vulndetails``.
 * ``users`` — the Tenable.sc user accounts (``GET /rest/user``).
@@ -612,28 +615,17 @@ def _software_lines(plugin_text: str) -> List[str]:
     return lines
 
 
-def _collect_software(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
-    """Installed software, **linked to each host**, with name / version split out.
-
-    Uses the software-enumeration plugins (20811 Windows, 22869 SSH) via the
-    ``vulndetails`` analysis tool, so each row carries the host it was found on
-    (``host.name`` / ``host.ip``) and one installed package — its ``software.name``
-    and ``software.version`` parsed out of the long enumeration line (the original
-    line is kept in ``software.raw``). This replaces the old estate-wide
-    ``listsoftware`` view so software correlates to hosts in the unified inventory.
-    """
+def _iter_software(client, time_range: Optional[str]):
+    """Yield ``(host, ip, dns, name, version, raw_line, plugin_id, last_seen)`` for
+    every enumerated package on every host, from the software-enumeration plugins
+    (20811 Windows, 22869 SSH) via ``vulndetails``. Shared by the software and
+    applications collectors."""
     filters = list(_range_filters(time_range))
     filters.append({
         "filterName": "pluginID", "operator": "=",
         "value": ",".join(SOFTWARE_ENUM_PLUGINS),
     })
-    records = client.analysis("vulndetails", filters=filters)
-    columns = [
-        "host.name", "host.ip", "host.dns", "software.name", "software.version",
-        "software.raw", "plugin.id", "last.seen",
-    ]
-    rows: List[List[Any]] = []
-    for rec in records:
+    for rec in client.analysis("vulndetails", filters=filters):
         host = _host_name(rec)
         ip = textish(rec.get("ip"))
         dns = textish(rec.get("dnsName"))
@@ -641,7 +633,100 @@ def _collect_software(client, time_range: Optional[str]) -> Tuple[List[str], Lis
         last_seen = _epoch(rec.get("lastSeen"))
         for line in _software_lines(rec.get("pluginText")):
             name, version, _cpe = _split_software(line)
-            rows.append([host, ip, dns, name, version, line, plugin_id, last_seen])
+            if name:
+                yield host, ip, dns, name, version, line, plugin_id, last_seen
+
+
+def _collect_software(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Installed software, **linked to each host**, with name / version split out.
+
+    One row per (host, package): its ``software.name`` and ``software.version``
+    parsed out of the enumeration line (the original line kept in ``software.raw``),
+    so software correlates to hosts in the unified inventory. This is the full
+    package inventory (every OS package/library); for just notable applications see
+    the ``applications`` resource.
+    """
+    columns = [
+        "host.name", "host.ip", "host.dns", "software.name", "software.version",
+        "software.raw", "plugin.id", "last.seen",
+    ]
+    rows = [[h, ip, dns, name, ver, raw, pid, seen]
+            for h, ip, dns, name, ver, raw, pid, seen in _iter_software(client, time_range)]
+    return columns, rows
+
+
+# --- application classification (notable apps vs OS packages/libraries) ------ #
+
+# A package is a notable application if its name contains one of these keywords.
+# Windows installed-software entries (plugin 20811) are always treated as
+# applications regardless. Override / extend via TENABLE_SC_APP_KEYWORDS (a
+# comma-separated list, appended to these).
+_APP_KEYWORDS: Tuple[str, ...] = (
+    # web / app servers
+    "apache2", "httpd", "apache-tomcat", "tomcat", "nginx", "jboss", "wildfly",
+    "jetty", "lighttpd", "haproxy", "caddy", "gunicorn", "uwsgi", "weblogic",
+    "websphere", "glassfish", "iis",
+    # databases (server-side)
+    "mysql-server", "mariadb-server", "postgresql", "mongodb", "redis-server",
+    "memcached", "cassandra", "oracle", "db2", "elasticsearch", "influxdb",
+    "couchdb", "mysql-community", "mssql",
+    # runtimes / languages (interpreters, not the -dev/-lib packages)
+    "openjdk", "java", "jdk", "jre", "nodejs", "node.js", "dotnet", "mono-runtime",
+    "php", "ruby", "golang-go", "perl-base",
+    # containers / orchestration
+    "docker", "containerd", "podman", "kubelet", "kubeadm", "kubectl", "cri-o",
+    # infra / tooling / services
+    "jenkins", "gitlab", "git", "samba", "bind9", "named", "postfix", "sendmail",
+    "dovecot", "squid", "vsftpd", "proftpd", "openssh-server", "rabbitmq",
+    "kafka", "zookeeper", "grafana", "prometheus", "zabbix", "nagios", "splunk",
+    "ansible", "puppet", "chef", "terraform", "nextcloud", "wordpress", "drupal",
+    "joomla", "keycloak", "consul", "vault", "openvpn", "wireguard", "snort",
+    # desktop / endpoint apps (mostly Windows / mac)
+    "chrome", "firefox", "microsoft edge", "internet explorer", "office",
+    "acrobat", "reader", "zoom", "teams", "slack", "vlc", "7-zip", "winrar",
+    "notepad++", "putty", "winscp", "wireshark", "filezilla", "thunderbird",
+    "libreoffice", "onedrive", "dropbox", "citrix", "vmware", "virtualbox",
+    "anydesk", "teamviewer", "tableau", "power bi", "sql server management",
+)
+
+# Extra keywords from the environment (comma-separated), lower-cased.
+_APP_KEYWORDS_EXTRA = tuple(
+    k.strip().lower() for k in (os.getenv("TENABLE_SC_APP_KEYWORDS") or "").split(",")
+    if k.strip()
+)
+
+
+def _is_application(name: str, plugin_id: str) -> bool:
+    """True if a package should be treated as a notable application.
+
+    Windows installed-software (plugin 20811) rows are always applications; for
+    Linux packages, a name-keyword allowlist keeps notable server/app/desktop
+    software and drops the OS libraries and dev/support packages that dominate a
+    ``dpkg -l`` / rpm listing.
+    """
+    if plugin_id == "20811":  # Windows installed software — already applications
+        return True
+    low = (name or "").lower()
+    return any(k in low for k in _APP_KEYWORDS) or any(k in low for k in _APP_KEYWORDS_EXTRA)
+
+
+def _collect_applications(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Notable applications per host, extracted from the software enumeration.
+
+    A curated view of ``software``: all Windows installed-software entries plus the
+    Linux packages whose name matches an application keyword (web/app servers,
+    databases, runtimes, containers, infra tools, desktop apps), dropping the OS
+    libraries and dev packages. Emits ``application.name`` so it folds into the
+    unified **Applications** inventory as real apps, host-linked.
+    """
+    columns = [
+        "host.name", "host.ip", "host.dns", "application.name",
+        "application.version", "software.raw", "plugin.id", "last.seen",
+    ]
+    rows: List[List[Any]] = []
+    for h, ip, dns, name, ver, raw, pid, seen in _iter_software(client, time_range):
+        if _is_application(name, pid):
+            rows.append([h, ip, dns, name, ver, raw, pid, seen])
     return columns, rows
 
 
@@ -1037,6 +1122,7 @@ def _collect_hosts(client, time_range: Optional[str]) -> Tuple[List[str], List[L
 _COLLECTORS = {
     "devices": _collect_devices,
     "databases": _collect_databases,
+    "applications": _collect_applications,
     "hosts": _collect_hosts,
     "findings": _collect_findings,
     "software": _collect_software,

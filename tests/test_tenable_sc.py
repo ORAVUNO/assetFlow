@@ -67,8 +67,8 @@ def test_registry_loads_and_validates():
     assert reg.metadata.version == 1
     resources = {q.resource for q in reg.queries}
     assert {
-        "devices", "hosts", "findings", "software", "databases", "users",
-        "asset_lists", "alerts", "incidents", "saas_applications",
+        "devices", "hosts", "findings", "software", "applications", "databases",
+        "users", "asset_lists", "alerts", "incidents", "saas_applications",
     } <= resources
 
 
@@ -300,6 +300,41 @@ def test_software_split_and_host_linked():
     assert by_name["adduser"][cols.index("software.version")] == "3.137ubuntu1"
     # No <plugin_output> tag leaked into a name.
     assert not any("<" in r[cols.index("software.name")] for r in result.rows)
+
+
+def test_applications_filters_libs_keeps_apps():
+    # Linux dpkg output: apps (apache2, mysql-server) kept; OS libs dropped.
+    linux = (
+        "<plugin_output>\n"
+        "ii   apache2  2.4.58-1ubuntu8.8  amd64  Apache HTTP Server\n"
+        "ii   mysql-server  8.0.43  amd64  MySQL database server\n"
+        "ii   libssl3  3.0.13  amd64  Secure Sockets Layer toolkit\n"
+        "ii   libc6  2.39  amd64  GNU C Library\n"
+        "ii   fonts-dejavu-core  2.37  all  Vera font family\n"
+        "ii   coreutils  9.4  amd64  GNU core utilities\n"
+        "</plugin_output>\n"
+    )
+    # Windows software (plugin 20811): everything kept as an application.
+    win = "  Google Chrome  [version 100.0.4896.75]\n  Some Internal Tool  [version 1.2]\n"
+    records = [
+        {"ip": "10.0.0.1", "dnsName": "web01", "pluginID": "22869", "pluginText": linux},
+        {"ip": "10.0.0.2", "dnsName": "pc01", "pluginID": "20811", "pluginText": win},
+    ]
+    client = FakeClient(analysis_rules={"vulndetails": records})
+    result = tsc_runner_mod.run_query(client, _q("applications", "TSC011", "Applications"))
+    cols = result.column_names
+    assert cols[3] == "application.name"
+    apps = {r[cols.index("application.name")] for r in result.rows}
+    assert "apache2" in apps and "mysql-server" in apps          # Linux apps kept
+    assert "libssl3" not in apps and "libc6" not in apps          # OS libs dropped
+    assert "fonts-dejavu-core" not in apps and "coreutils" not in apps
+    assert "Google Chrome" in apps and "Some Internal Tool" in apps  # all Windows kept
+
+
+def test_is_application_classifier():
+    assert tsc_runner_mod._is_application("apache2", "22869") is True
+    assert tsc_runner_mod._is_application("libssl3", "22869") is False
+    assert tsc_runner_mod._is_application("anything-at-all", "20811") is True  # Windows
 
 
 def test_split_software_helper():

@@ -56,6 +56,7 @@ metadata:
     - Device Inventory
     - Security Findings
     - Software
+    - Applications
     - Users
     - Asset Tags
     - Alerts & Incidents
@@ -84,6 +85,13 @@ feeds:
     category: Software
     description: Installed software linked to each host, with name and version split into their own columns, plus running databases and their versions.
     query_ids: [TSC003, TSC010]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TSC-APPS
+    name: Applications
+    category: Applications
+    description: Notable applications per host, extracted from the software enumeration (web/app servers, databases, runtimes, containers, infra tools, desktop apps) — the OS libraries filtered out.
+    query_ids: [TSC011]
     recommended_refresh_frequency: Daily
 
   - id: FEED-TSC-USERS
@@ -440,4 +448,36 @@ queries:
       is always kept in plugin.name. Confirmed working against a live 6.8 box; still
       investigation_required because the family includes some vulnerability plugins
       (not only detections), so filter plugin.name if you want detections only.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC011
+    category: Applications
+    name: Applications (per host)
+    status: investigation_required
+    validated: false
+    resource: applications
+    purpose: >-
+      Extract the notable applications from the per-host software enumeration —
+      web/app servers, databases, runtimes, containers, infra tooling and desktop
+      apps — dropping the OS libraries and dev/support packages that dominate a
+      raw package list. Emits application.name so it folds into the unified
+      Applications inventory as real apps, linked to the host.
+    expected_output_fields:
+      - host.name          # dnsName / netbiosName / ip
+      - host.ip            # ip
+      - host.dns           # dnsName
+      - application.name   # the application package name (keys the Applications inventory)
+      - application.version
+      - software.raw       # the original enumeration line
+      - plugin.id          # 20811 Windows / 22869 SSH
+      - last.seen          # lastSeen (epoch -> ISO)
+    notes: >-
+      Same enumeration as TSC003 (plugins 20811 / 22869 via vulndetails), then
+      filtered: every Windows installed-software entry is kept (they are already
+      applications), and Linux packages are kept when the name matches an
+      application keyword (apache, nginx, mysql, postgresql, docker, tomcat,
+      openjdk, php, chrome, office, …). Extend the keyword list with
+      TENABLE_SC_APP_KEYWORDS (comma-separated). Marked investigation_required
+      because the allowlist is necessarily curated — widen it for your estate as
+      needed; TSC003 remains the complete package inventory.
     recommended_refresh_frequency: Daily
