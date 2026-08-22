@@ -69,11 +69,20 @@ except ImportError:  # pragma: no cover
 
 
 # Tenable.sc analysis pagination page size (records per POST /rest/analysis).
-ANALYSIS_PAGE_SIZE = 1000
+ANALYSIS_PAGE_SIZE = int(os.getenv("TENABLE_SC_PAGE_SIZE") or 1000)
 
-# Hard cap on records pulled from one analysis fetch, so a huge estate cannot
-# fan out into an unbounded number of pages / rows.
-ANALYSIS_MAX_RECORDS = 200000
+# Safety cap on records pulled from one analysis fetch, so a runaway paging loop
+# cannot grow without bound. "Fetch all" wants everything, so this is set high;
+# override with TENABLE_SC_MAX_RECORDS (0 or negative = truly unlimited).
+def _max_records() -> int:
+    try:
+        val = int(os.getenv("TENABLE_SC_MAX_RECORDS") or 1000000)
+    except (TypeError, ValueError):
+        val = 1000000
+    return val if val > 0 else 10**12  # effectively unlimited
+
+
+ANALYSIS_MAX_RECORDS = _max_records()
 
 
 class TenableScConfigError(RuntimeError):
@@ -322,6 +331,12 @@ class TenableScClient:
         no more records (``returnedRecords`` < page size, or ``totalRecords``
         reached), or ``max_records`` is hit. Works for any vuln analysis tool
         (``sumip``, ``vulndetails``, ``listsoftware``, …).
+
+        Resilience: a failure on the **first** page is raised (a real error — bad
+        credentials, wrong tool, unreachable host). A failure on a **later** page
+        (e.g. a timeout deep into a very large ``vulndetails`` fetch) returns the
+        records gathered so far instead of losing the whole fetch, so a big estate
+        yields partial data rather than nothing.
         """
         records: List[Dict[str, Any]] = []
         start = 0
@@ -336,7 +351,12 @@ class TenableScClient:
                 "filters": filters or [],
             }
             body = {"type": analysis_type, "sourceType": source_type, "query": query}
-            response = self.post("analysis", body)
+            try:
+                response = self.post("analysis", body)
+            except Exception:
+                if start == 0:
+                    raise  # first page failing is a genuine error — surface it
+                break      # later page failed — keep what we already have
             if not isinstance(response, dict):
                 break
             page = response.get("results")
