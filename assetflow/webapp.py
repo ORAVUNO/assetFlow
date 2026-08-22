@@ -1477,9 +1477,18 @@ function mountTable(container, cols, rows, opts){
       return String(x).localeCompare(String(y))*sort.dir;});}
     const pinHead=pinFn?'<th class="pin">Connection</th>':'';
     const span=cols.length+(pinFn?1:0);
-    tw.innerHTML='<table><thead><tr>'+pinHead+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
+    // Cap how many rows we paint into the DOM. Filtering/sorting above run on the
+    // full set; the browser just can't render tens of thousands of rows at once
+    // (a 69k-row estate froze the tab). Filter to narrow, or download for all.
+    const total=rs.length; const CAP=(opts.renderCap||2000);
+    const view=(total>CAP)?rs.slice(0,CAP):rs;
+    const capNote=(total>CAP)?('<div class="rowcap" style="padding:6px 8px;margin-bottom:6px;'+
+      'background:var(--accent);color:var(--accent-fg);border-radius:6px;font-size:12px">'+
+      'Showing first '+CAP.toLocaleString()+' of '+total.toLocaleString()+' rows. '+
+      'Type in the filter box to narrow, or use Download CSV/JSON for the full set.</div>'):'';
+    tw.innerHTML=capNote+'<table><thead><tr>'+pinHead+cols.map((c,i)=>'<th data-i="'+i+'">'+esc(c)+
       (sort.col===i?(sort.dir>0?' ▲':' ▼'):'')+'</th>').join('')+'</tr></thead><tbody>'+
-      rs.map(r=>{ let pc='';
+      view.map(r=>{ let pc='';
         if(pinFn){const pi=pinInfo(r);
           pc='<td class="pin"><span class="srcwrap" title="'+esc(pi.label)+'">'+
              (opts.expand?'<span class="exptog">▸</span>':'')+
@@ -1501,11 +1510,11 @@ function mountTable(container, cols, rows, opts){
           det.style.display=wasOpen?'none':''; const tog=tr.querySelector('.exptog');
           if(tog) tog.textContent=wasOpen?'▸':'▾';
           if(!wasOpen && !det.dataset.filled){det.dataset.filled='1';
-            opts.expand(rs[idx], det.querySelector('.expbody'));}};
+            opts.expand(view[idx], det.querySelector('.expbody'));}};
       });
     }else if(opts.onRow){
       tw.querySelectorAll('tbody tr.datarow').forEach((tr,idx)=>{
-        tr.style.cursor='pointer'; tr.onclick=()=>opts.onRow(rs[idx]);});
+        tr.style.cursor='pointer'; tr.onclick=()=>opts.onRow(view[idx]);});
     }
   }
   if(fin) fin.oninput=draw;
