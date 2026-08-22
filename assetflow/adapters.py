@@ -20,6 +20,8 @@ from . import db as db_mod
 from . import runner as runner_mod
 from . import solarwinds_client as solarwinds_client_mod
 from . import solarwinds_runner as solarwinds_runner_mod
+from . import tenable_sc_client as tenable_sc_client_mod
+from . import tenable_sc_runner as tenable_sc_runner_mod
 from . import tufin_client as tufin_client_mod
 from . import tufin_runner as tufin_runner_mod
 from . import vmware_client as vmware_client_mod
@@ -429,6 +431,102 @@ class SolarWindsAdapter(Adapter):
         )
 
 
+class TenableScAdapter(Adapter):
+    """Tenable.sc (SecurityCenter) source: fetches the device inventory, aggregated
+    security findings, installed software, users, asset lists (asset tags),
+    alerts, and tickets (incidents) over the Tenable.sc REST API. Device and
+    finding rows carry any unmapped Tenable field under a ``custom.`` prefix and
+    each device is stamped with the asset-list tags it belongs to."""
+
+    def connect(
+        self,
+        *,
+        host: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        access_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        api_prefix: str = "",
+        verify_certs: bool = True,
+        request_timeout: int = 60,
+    ) -> dict:
+        candidate = tenable_sc_client_mod.build_client(
+            host=host or "",
+            username=username or "",
+            password=password or "",
+            access_key=access_key or "",
+            secret_key=secret_key or "",
+            api_prefix=api_prefix or "",
+            verify_certs=verify_certs,
+            request_timeout=request_timeout,
+        )
+        info = tenable_sc_client_mod.ping(candidate)  # raises on failure
+        self._client = candidate
+        self._conn_info = info
+        return info
+
+    def connect_form(self, form: dict) -> dict:
+        return self.connect(
+            host=(form.get("host") or form.get("url") or None),
+            username=(form.get("username") or None),
+            password=(form.get("password") or None),
+            access_key=(form.get("access_key") or None),
+            secret_key=(form.get("secret_key") or None),
+            api_prefix=(form.get("base_path") or form.get("api_prefix") or ""),
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 60)),
+        )
+
+    def try_auto_connect(self) -> bool:
+        try:
+            candidate = tenable_sc_client_mod.build_client_from_env()
+            info = tenable_sc_client_mod.ping(candidate)
+        except Exception:
+            return False
+        self._client = candidate
+        self._conn_info = info
+        return True
+
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "TENABLE_SC_HOST", "TENABLE_SC_USERNAME", "TENABLE_SC_PASSWORD",
+            "TENABLE_SC_ACCESS_KEY", "TENABLE_SC_SECRET_KEY",
+            "TENABLE_SC_API_PREFIX", "TENABLE_SC_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        host = (form.get("host") or form.get("url") or "").strip()
+        env: Dict[str, str] = {
+            "TENABLE_SC_HOST": tenable_sc_client_mod.clean_host(host),
+            "TENABLE_SC_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
+        }
+        # Persist whichever credential style was supplied.
+        if form.get("access_key") and form.get("secret_key"):
+            env["TENABLE_SC_ACCESS_KEY"] = str(form.get("access_key") or "")
+            env["TENABLE_SC_SECRET_KEY"] = str(form.get("secret_key") or "")
+        else:
+            env["TENABLE_SC_USERNAME"] = str(form.get("username") or "")
+            env["TENABLE_SC_PASSWORD"] = str(form.get("password") or "")
+        prefix = (form.get("base_path") or form.get("api_prefix") or "").strip()
+        if prefix:
+            env["TENABLE_SC_API_PREFIX"] = prefix
+        return env
+
+    def ping(self) -> dict:
+        if self._client is None:
+            raise tenable_sc_client_mod.TenableScConfigError("adapter is not connected")
+        info = tenable_sc_client_mod.ping(self._client)
+        self._conn_info = info
+        return info
+
+    def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
+        if self._client is None:
+            raise tenable_sc_client_mod.TenableScConfigError("adapter is not connected")
+        return tenable_sc_runner_mod.run_query(
+            self._client, query, limit=limit, time_range=time_range
+        )
+
+
 @dataclass
 class AdapterKind:
     """A *type* of data source (Elasticsearch, Tufin, …) — the template from
@@ -607,6 +705,25 @@ def available_kinds(registry_path: Optional[str] = None) -> Dict[str, AdapterKin
             ),
             registry=load_registry(solarwinds_path),
             adapter_cls=SolarWindsAdapter,
+        )
+
+    tenable_sc_path = _find_registry(
+        "config/tenable_sc_registry.yaml", "tenable_sc_registry.yaml"
+    )
+    if tenable_sc_path:
+        kinds["tenable_sc"] = AdapterKind(
+            kind="tenable_sc",
+            name="Tenable.sc (SecurityCenter)",
+            category="Vulnerability Management",
+            description=(
+                "Tenable.sc (SecurityCenter) — device inventory, aggregated "
+                "security findings, installed software, users, asset lists (asset "
+                "tags), alerts, and tickets (incidents) via the Tenable.sc REST "
+                "API. Device and finding rows carry extra fields under 'custom.' "
+                "and devices are stamped with their asset-list tags."
+            ),
+            registry=load_registry(tenable_sc_path),
+            adapter_cls=TenableScAdapter,
         )
     return kinds
 
