@@ -69,7 +69,7 @@ feeds:
     name: Device Inventory
     category: Device Inventory
     description: Every host Tenable.sc has seen, with IP/DNS/MAC, OS, repository, vulnerability score and per-severity counts, last scan times, and asset-list tags.
-    query_ids: [TSC001]
+    query_ids: [TSC001, TSC009]
     recommended_refresh_frequency: Daily
 
   - id: FEED-TSC-FINDINGS
@@ -352,4 +352,42 @@ queries:
       No Tenable.sc endpoint provides SaaS application discovery. If the estate
       also runs Tenable.io / Tenable One, that data would come from a separate
       adapter against the Tenable Vulnerability Management API.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC009
+    category: Device Inventory
+    name: Explore Assets (Hosts)
+    status: investigation_required
+    validated: false
+    resource: hosts
+    purpose: >-
+      Unified host inventory from the Tenable Security Center 6.x "Explore Assets"
+      endpoint (/rest/hosts) — one row per asset in the 6.x asset model, with ACR
+      (Asset Criticality Rating), AES (Asset Exposure Score), repositories, system
+      type, and first/last seen. The modern companion to the sumip-based Devices
+      resource (TSC001).
+    expected_output_fields:
+      - host.name        # name / dnsName / netbiosName / ipAddress
+      - asset.type       # systemType (falls back to "Host")
+      - host.ip          # ipAddress
+      - host.dns         # dnsName
+      - host.netbios     # netbiosName / netBios
+      - host.mac         # macAddress
+      - os               # os / osCPE
+      - acr              # acrScore / assetCriticalityRating
+      - aes              # assetExposureScore
+      - repositories     # repositories[].name
+      - first.seen       # firstSeen (epoch -> ISO)
+      - last.seen        # lastSeen (epoch -> ISO)
+      - uuid             # uuid / hostUUID / tenableUUID
+      - "custom.*"       # any extra field the release returns
+    notes: >-
+      GET /rest/hosts?startOffset=&endOffset=&fields=..., paged like the analysis
+      endpoint (falls back to an unfielded request if the fields selector is
+      rejected, and to a plain list response shape). Field names are read with
+      per-release fallbacks because 6.x renamed a few across point releases; marked
+      investigation_required until the exact response shape is confirmed against a
+      live 6.x box (the endpoint is new in the 6.x line). Requires Tenable Security
+      Center 6.x; older releases won't expose /rest/hosts (the resource returns no
+      rows there — use TSC001 instead).
     recommended_refresh_frequency: Daily

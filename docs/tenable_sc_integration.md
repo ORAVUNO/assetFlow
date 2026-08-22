@@ -199,9 +199,17 @@ named columns in `_DEVICE_SPEC`:
 Because the runner sweeps unmapped fields into `custom.*`, the adapter is
 forward/backward compatible across releases: a field a given version doesn't
 return simply yields a blank column, and any field a newer version adds shows up
-automatically under `custom.*` without a code change. (6.x also adds a dedicated
-`/rest/hosts` "Explore Assets" endpoint; `sumip` remains the portable device view
-used here, and `/rest/hosts` is a natural follow-up resource.)
+automatically under `custom.*` without a code change.
+
+6.x also adds the dedicated `/rest/hosts` **Explore Assets** endpoint, exposed as
+the **`hosts`** resource (TSC009) — one row per asset in the 6.x asset model, with
+ACR / AES, repositories, and system type, the modern companion to `sumip`-based
+`devices`. `_fetch_hosts` pages it like the analysis endpoint and tolerates both
+the paged `{"results": [...]}` and plain-list response shapes; `_collect_hosts`
+reads each field with per-release fallbacks (`netbiosName`/`netBios`,
+`acrScore`/`assetCriticalityRating`, …) and sweeps the rest into `custom.*`. It's
+marked `investigation_required` until its exact shape is confirmed on a live 6.x
+box, and returns no rows on pre-6.x releases (use `devices`/TSC001 there).
 
 ## SaaS applications
 

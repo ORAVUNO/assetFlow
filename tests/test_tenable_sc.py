@@ -67,7 +67,7 @@ def test_registry_loads_and_validates():
     assert reg.metadata.version == 1
     resources = {q.resource for q in reg.queries}
     assert {
-        "devices", "findings", "software", "users", "asset_lists",
+        "devices", "hosts", "findings", "software", "users", "asset_lists",
         "alerts", "incidents", "saas_applications",
     } <= resources
 
@@ -167,6 +167,38 @@ def test_devices_tags_degrade_when_asset_lookup_fails():
     assert "tags" in cols
     assert all(r[cols.index("tags")] == "" for r in result.rows)
     assert len(result.rows) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Hosts (Explore Assets, /rest/hosts — Security Center 6.x)
+# --------------------------------------------------------------------------- #
+
+def test_hosts_explore_assets_flatten():
+    resp = {"totalRecords": 1, "results": [
+        {"id": "1", "uuid": "h-1", "name": "web01.corp", "ipAddress": "10.0.0.1",
+         "dnsName": "web01.corp", "netBios": "WEB01", "macAddress": "aa:bb:cc:00:00:01",
+         "os": "Linux", "acrScore": "7", "assetExposureScore": "812",
+         "repositories": [{"id": 1, "name": "Main"}], "systemType": "General Purpose",
+         "firstSeen": "1600000000", "lastSeen": "1600000500", "source": "SCAN"}]}
+    client = FakeClient(get_rules={"hosts": resp})
+    result = tsc_runner_mod.run_query(client, _q("hosts", "TSC009", "Device Inventory"))
+    cols = result.column_names
+    row = result.rows[0]
+    assert row[cols.index("host.name")] == "web01.corp"
+    assert row[cols.index("asset.type")] == "General Purpose"
+    assert row[cols.index("acr")] == "7"
+    assert row[cols.index("aes")] == "812"
+    assert row[cols.index("repositories")] == "Main"        # list of objects -> names
+    assert row[cols.index("host.netbios")] == "WEB01"       # netBios fallback key
+    assert row[cols.index("last.seen")].startswith("2020-09-13")
+    assert row[cols.index("custom.source")] == "SCAN"       # unmapped field swept
+
+
+def test_hosts_plain_list_shape():
+    # Some releases return a plain list rather than {results:[...]}.
+    client = FakeClient(get_rules={"hosts": [{"name": "db01", "ipAddress": "10.0.0.2"}]})
+    result = tsc_runner_mod.run_query(client, _q("hosts", "TSC009", "Device Inventory"))
+    assert result.rows[0][result.column_names.index("host.name")] == "db01"
 
 
 # --------------------------------------------------------------------------- #

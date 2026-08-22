@@ -548,6 +548,7 @@ rest are plain object listings:
 | TSC006 | Alerts (`alerts`) | Alerts & Incidents | `GET /rest/alert` |
 | TSC007 | Incidents / Tickets (`incidents`) | Alerts & Incidents | `GET /rest/ticket` |
 | TSC008 | SaaS Applications (`saas_applications`) | SaaS Applications | *placeholder — not a Tenable.sc core capability* |
+| TSC009 | Explore Assets (`hosts`) | Device Inventory | `GET /rest/hosts` — the 6.x unified asset model (ACR/AES, repositories, system type); the modern companion to TSC001 |
 
 Device rows emit a `host.name` column (DNS/NetBIOS/IP), so they fold into the
 *All Fetched Results* golden records and the cross-adapter unified inventory

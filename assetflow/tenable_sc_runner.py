@@ -25,6 +25,10 @@ The resources cover the asset types the integration asked for:
 * ``saas_applications`` — a placeholder: Tenable.sc core does not enumerate SaaS
   applications (that is a Tenable One / Tenable.io capability), so this returns no
   rows and is marked accordingly in the registry.
+* ``hosts`` — the unified host inventory from the Tenable Security Center 6.x
+  *Explore Assets* endpoint (``GET /rest/hosts``): one row per asset in the 6.x
+  asset model, carrying ACR / AES, repositories, and system type. The modern
+  companion to ``devices`` (``sumip``).
 
 **Custom fields & asset tags.** Two things the integration explicitly asked for:
 
@@ -93,6 +97,22 @@ def _obj_name(value: Any) -> str:
     if isinstance(value, dict):
         return textish(value.get("name") or value.get("username") or "")
     return textish(value)
+
+
+def _pick(record: Dict[str, Any], *keys: str) -> Any:
+    """First non-empty value among ``keys`` (for fields Tenable renames by release)."""
+    for key in keys:
+        val = record.get(key)
+        if val not in (None, ""):
+            return val
+    return ""
+
+
+def _repos(value: Any) -> str:
+    """Summarize a repositories field (list of ``{id,name}`` or a single object)."""
+    if isinstance(value, list):
+        return ", ".join(_obj_name(v) for v in value if _obj_name(v))
+    return _obj_name(value)
 
 
 def _epoch(value: Any) -> str:
@@ -577,8 +597,123 @@ def _collect_saas_applications(client, time_range: Optional[str]) -> Tuple[List[
     return columns, []
 
 
+# -- Explore Assets (/rest/hosts, Tenable Security Center 6.x) --------------- #
+
+# Fields requested from /rest/hosts. Tenable Security Center 6.x renamed a few
+# keys across point releases, so the collector reads each with fallbacks and the
+# unmapped-field sweep captures whatever else the release returns.
+_HOSTS_FIELDS = (
+    "id,uuid,name,ipAddress,os,osCPE,dnsName,netbiosName,netBios,macAddress,"
+    "firstSeen,lastSeen,repositories,repository,acrScore,assetCriticalityRating,"
+    "assetExposureScore,systemType,source,pluginSet,policyName,tenableUUID,hostUUID"
+)
+
+# Keys consumed by the named host columns — excluded from the custom.* sweep.
+_HOSTS_CONSUMED = {
+    "name", "dnsName", "netbiosName", "netBios", "ipAddress", "ip", "systemType",
+    "macAddress", "os", "osCPE", "acrScore", "assetCriticalityRating",
+    "assetExposureScore", "repositories", "repository", "firstSeen", "lastSeen",
+    "uuid", "hostUUID", "tenableUUID",
+}
+
+
+def _fetch_hosts(client) -> List[Dict[str, Any]]:
+    """Page ``GET /rest/hosts`` (the 6.x Explore Assets endpoint).
+
+    Handles both response shapes seen across releases — a paged
+    ``{"totalRecords", "results": [...]}`` and a plain list — and falls back to an
+    unfielded request if the ``fields`` selector is rejected. Bounded by
+    :data:`~assetflow.tenable_sc_client.ANALYSIS_MAX_RECORDS` via the page loop.
+    """
+    from .tenable_sc_client import ANALYSIS_MAX_RECORDS, ANALYSIS_PAGE_SIZE
+
+    def _page(start: int, use_fields: bool):
+        end = start + ANALYSIS_PAGE_SIZE
+        suffix = f"&fields={_HOSTS_FIELDS}" if use_fields else ""
+        return client.get(f"hosts?startOffset={start}&endOffset={end}{suffix}")
+
+    out: List[Dict[str, Any]] = []
+    start = 0
+    use_fields = True
+    while True:
+        try:
+            resp = _page(start, use_fields)
+        except Exception:
+            if use_fields:  # retry once without the fields selector
+                use_fields = False
+                continue
+            break
+        if isinstance(resp, dict):
+            rows = resp.get("results")
+            total = resp.get("totalRecords")
+        elif isinstance(resp, list):
+            rows, total = resp, None
+        else:
+            rows, total = None, None
+        rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        out.extend(rows)
+        if len(rows) < ANALYSIS_PAGE_SIZE:
+            break
+        try:
+            total_n = int(total or 0)
+        except (TypeError, ValueError):
+            total_n = 0
+        if total_n and len(out) >= total_n:
+            break
+        if len(out) >= ANALYSIS_MAX_RECORDS:
+            break
+        start += ANALYSIS_PAGE_SIZE
+    return out[:ANALYSIS_MAX_RECORDS]
+
+
+def _collect_hosts(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Unified host inventory via the 6.x Explore Assets endpoint (``/rest/hosts``).
+
+    This is the modern companion to ``devices`` (``sumip``): one row per asset in
+    the 6.x asset model, carrying ACR / AES, repositories, and system type. Field
+    names are read with per-release fallbacks and any extra field the release
+    returns rides along under ``custom.*``.
+    """
+    records = _fetch_hosts(client)
+    named = [
+        ("host.name", lambda r: textish(_pick(r, "name", "dnsName", "netbiosName", "netBios", "ipAddress", "ip"))),
+        ("asset.type", lambda r: textish(_pick(r, "systemType")) or "Host"),
+        ("host.ip", lambda r: textish(_pick(r, "ipAddress", "ip"))),
+        ("host.dns", lambda r: textish(_pick(r, "dnsName"))),
+        ("host.netbios", lambda r: textish(_pick(r, "netbiosName", "netBios"))),
+        ("host.mac", lambda r: textish(_pick(r, "macAddress"))),
+        ("os", lambda r: textish(_pick(r, "os", "osCPE"))),
+        ("acr", lambda r: textish(_pick(r, "acrScore", "assetCriticalityRating"))),
+        ("aes", lambda r: textish(_pick(r, "assetExposureScore"))),
+        ("repositories", lambda r: _repos(_pick(r, "repositories", "repository"))),
+        ("first.seen", lambda r: _epoch(_pick(r, "firstSeen"))),
+        ("last.seen", lambda r: _epoch(_pick(r, "lastSeen"))),
+        ("uuid", lambda r: textish(_pick(r, "uuid", "hostUUID", "tenableUUID"))),
+    ]
+    # Discover extra scalar keys (union across records) for the custom.* sweep.
+    custom_keys: List[str] = []
+    seen = set()
+    for rec in records:
+        for key in rec.keys():
+            if key in _HOSTS_CONSUMED or key in seen:
+                continue
+            if isinstance(rec.get(key), (list, dict)):
+                continue
+            seen.add(key)
+            custom_keys.append(key)
+
+    columns = [name for name, _ in named] + [f"{CUSTOM_PREFIX}{k}" for k in custom_keys]
+    rows: List[List[Any]] = []
+    for rec in records:
+        row = [fn(rec) for _, fn in named]
+        row.extend(textish(rec.get(k)) for k in custom_keys)
+        rows.append(row)
+    return columns, rows
+
+
 _COLLECTORS = {
     "devices": _collect_devices,
+    "hosts": _collect_hosts,
     "findings": _collect_findings,
     "software": _collect_software,
     "users": _collect_users,
