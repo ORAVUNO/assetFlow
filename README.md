@@ -3,9 +3,9 @@
 Asset-intelligence tool that fetches assets from pluggable **adapters** (data
 sources), shows them in a local web UI, and persists every fetch to a local
 database. Elasticsearch is the first adapter, Tufin SecureTrack is the second,
-VMware vCenter is the third, and SolarWinds Orion is the fourth; more sources
-plug in beside them, grouped by category, so results from many sources can later
-be merged.
+VMware vCenter is the third, SolarWinds Orion is the fourth, and Tenable.sc
+(SecurityCenter) is the fifth; more sources plug in beside them, grouped by
+category, so results from many sources can later be merged.
 
 - **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, VMware,
   SolarWinds, …) is a template with its own metadata and query registry. You can
@@ -46,7 +46,8 @@ correlation design, decisions & flow ·
 [`docs/tufin_integration.md`](docs/tufin_integration.md) ·
 [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md) ·
 [`docs/vmware_integration.md`](docs/vmware_integration.md) ·
-[`docs/solarwinds_integration.md`](docs/solarwinds_integration.md).
+[`docs/solarwinds_integration.md`](docs/solarwinds_integration.md) ·
+[`docs/tenable_sc_integration.md`](docs/tenable_sc_integration.md).
 
 ## Requirements
 
@@ -521,6 +522,97 @@ only unless you tick **Remember**.
 > (the modern `NCM.*` namespace with legacy `Cirrus.*` fallbacks); resources stay
 > marked `partially_validated` / `investigation_required` until run against a live
 > SolarWinds/NCM box (the same honest labeling the other registries use).
+
+## Tenable.sc (SecurityCenter) adapter
+
+The **Tenable.sc (SecurityCenter)** adapter (category *Vulnerability Management*)
+fetches rich asset intelligence from [Tenable.sc](https://www.tenable.com/products/security-center)
+over its REST API (`https://<host>/rest/`) and folds it into the same host-keyed
+views as the other adapters. It answers the asset types the integration asked
+for: **devices, aggregated security findings, software, users, asset lists (asset
+tags), alerts, and incidents (tickets)**.
+
+### What it fetches
+
+Eight resources (`TSC001`–`TSC008`). The device and finding resources run over
+the workhorse `POST /rest/analysis` endpoint (a *tool* selects the view); the
+rest are plain object listings:
+
+| ID | Resource | Feed | Tenable.sc endpoint |
+|---|---|---|---|
+| TSC001 | **Devices** (`devices`) | Device Inventory | `/rest/analysis` tool `sumip` — one row per host: IP/DNS/NetBIOS/MAC, OS, repository, vuln score + per-severity counts, last scan times, **asset-list tags**, `custom.*` |
+| TSC002 | **Aggregated Security Findings** (`findings`) | Security Findings | `/rest/analysis` tool `vulndetails` — one row per (host, plugin): severity, family, port/protocol, CVEs, CVSS/VPR, synopsis, solution, first/last seen, `custom.*` |
+| TSC003 | Installed Software (`software`) | Software | `/rest/analysis` tool `listsoftware` |
+| TSC004 | Users (`users`) | Users | `GET /rest/user` |
+| TSC005 | **Asset Lists (Tags)** (`asset_lists`) | Asset Tags | `GET /rest/asset` |
+| TSC006 | Alerts (`alerts`) | Alerts & Incidents | `GET /rest/alert` |
+| TSC007 | Incidents / Tickets (`incidents`) | Alerts & Incidents | `GET /rest/ticket` |
+| TSC008 | SaaS Applications (`saas_applications`) | SaaS Applications | *placeholder — not a Tenable.sc core capability* |
+| TSC009 | Explore Assets (`hosts`) | Device Inventory | `GET /rest/hosts` — the 6.x unified asset model (ACR/AES, repositories, system type); the modern companion to TSC001 |
+
+Device rows emit a `host.name` column (DNS/NetBIOS/IP), so they fold into the
+*All Fetched Results* golden records and the cross-adapter unified inventory
+alongside the other adapters; findings key on the same host identifiers.
+
+### Custom fields and asset tags
+
+Two things the integration explicitly asked for:
+
+- **Custom fields.** Any field Tenable.sc returns for a device or finding that
+  the adapter doesn't map to a named column is still emitted — under a column
+  prefixed `custom.`, the same convention the SolarWinds and VMware adapters use
+  — so nothing is silently dropped and system fields are never confused with
+  extra/site-specific ones.
+- **Asset tags.** Tenable.sc models tags/groupings as **asset lists**. The
+  `asset_lists` resource (TSC005) is the catalog of them — each with its `tags`
+  field, type (static / dynamic / DNS / LDAP / combination), owner, and member-IP
+  count. On top of that, every **device** row (TSC001) is stamped with the asset
+  lists its IP belongs to, in a `tags` column, by building an IP → asset-name map
+  from the asset lists (bounded and best-effort, so it degrades to no tags rather
+  than failing on a large estate).
+
+### SaaS applications
+
+TSC008 is an honest placeholder: the Tenable.sc *core* REST API does not
+enumerate SaaS applications — that is a Tenable One / Tenable.io (Vulnerability
+Management) capability. The resource is present so the asset type is visible in
+the UI with an empty result rather than silently missing; add a separate adapter
+against the Tenable VM API if the estate runs Tenable.io.
+
+### Connecting
+
+In the web UI, open the **Tenable.sc (SecurityCenter)** card and click
+**Connection**: enter the **host** (or IP), **username**, and **password**, and
+toggle **Verify TLS certificate** (disable only for a lab/self-signed
+environment). Username + password establishes a Tenable.sc **session token**
+(`POST /rest/token`, sent thereafter in the `X-SecurityCenter` header). Or set
+`TENABLE_SC_HOST` / `TENABLE_SC_USERNAME` / `TENABLE_SC_PASSWORD` in `.env` (see
+`.env.example`) to auto-connect on startup.
+
+The adapter also supports Tenable's **preferred** session-less style — an
+**access key + secret key** pair (`TENABLE_SC_ACCESS_KEY` /
+`TENABLE_SC_SECRET_KEY`, sent as the `x-apikey` header) — settable via `.env`.
+
+The connecting account must have the **Security Manager** role with access to the
+required repositories (see [Tenable's User Roles](https://docs.tenable.com/tenablesc/Content/UserRoles.htm)).
+Credentials entered in the form are held in the local server's memory only unless
+you tick **Remember**.
+
+> **Developer guide.** For a full walkthrough — architecture, module map, data
+> flow, the analysis-tool choices, custom-field and asset-tag handling, and how
+> to add a resource — see
+> [`docs/tenable_sc_integration.md`](docs/tenable_sc_integration.md).
+
+> **Validation status.** Endpoints, analysis tools, and field mappings follow
+> Tenable's Security Center API documentation and the official
+> [pyTenable](https://github.com/tenable/pyTenable) SDK, targeting **Tenable
+> Security Center 6.x** (a **6.8.0 "Plus"** deployment — "Plus" is a licensing
+> tier of the same product, not a separate one). 6.x adds `acrScore` (Asset
+> Criticality Rating, editable in Plus) and `assetExposureScore` (Asset Exposure
+> Score) to the device `sumip` view, surfaced as the `acr` / `aes` columns; any
+> other field a release returns still rides along under `custom.*`. Resources stay
+> marked `partially_validated` (SaaS is `not_validated`) until run against a live
+> box — the same honest labeling the other registries use.
 
 ## CLI reference
 

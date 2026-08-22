@@ -1003,7 +1003,8 @@ const KIND_LOGO={
   elasticsearch:{bg:'#FEC514',fg:'#1c1e24',txt:'es'},
   tufin:{bg:'#12b886',fg:'#ffffff',txt:'T'},
   vmware:{bg:'#607d8b',fg:'#ffffff',txt:'vm'},
-  solarwinds:{bg:'#f7941e',fg:'#1c1e24',txt:'SW'}
+  solarwinds:{bg:'#f7941e',fg:'#1c1e24',txt:'SW'},
+  tenable_sc:{bg:'#00447c',fg:'#ffffff',txt:'sc'}
 };
 function kindMeta(kind){return KIND_LOGO[kind]||{bg:'#8a8f98',fg:'#ffffff',txt:String(kind||'?').slice(0,2)};}
 function kindName(kind){const k=(KINDS||[]).find(x=>x.kind===kind);return k?k.name:(kind||'');}
@@ -1388,10 +1389,27 @@ function applyKind(kind){
   const tufin = (kind==='tufin');
   const vmware = (kind==='vmware');
   const solarwinds = (kind==='solarwinds');
-  // Tufin uses an API base path; Elasticsearch, VMware, and SolarWinds use a port.
-  document.getElementById('f_port').classList.toggle('hidden', tufin);
+  const tenable_sc = (kind==='tenable_sc');
+  // Tufin uses an API base path; Elasticsearch, VMware, and SolarWinds use a
+  // port; Tenable.sc uses neither (fixed https://host/rest).
+  document.getElementById('f_port').classList.toggle('hidden', tufin||tenable_sc);
   document.getElementById('f_basepath').classList.toggle('hidden', !tufin);
+  // The (hidden) base-path field defaults to Tufin's value; clear it for kinds
+  // that don't use it so it isn't sent as a stray API prefix.
+  if(!tufin) document.getElementById('c_basepath').value='';
   const remember='Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). ';
+  if(tenable_sc){
+    document.getElementById('c_host').placeholder = 'tenable-sc.example.com  ·  10.0.0.30';
+    document.getElementById('c_user').placeholder = 'security-manager';
+    document.getElementById('c_timeout').value = '60';
+    document.getElementById('c_hint').innerHTML = remember+
+      'Connects to the Tenable.sc (SecurityCenter) REST API at <code>https://host/rest</code> '+
+      '(username + password establishes a session token). Fetches the device inventory, '+
+      'aggregated security findings, software, users, asset lists (asset tags), alerts, and '+
+      'incidents. Extra fields ride along as <code>custom.</code> columns and devices are '+
+      'stamped with their asset-list tags. The account needs the Security Manager role.';
+    return;
+  }
   if(solarwinds){
     document.getElementById('c_host').placeholder = 'solarwinds.example.com  ·  10.0.0.20';
     document.getElementById('c_user').placeholder = 'orion-read-user';

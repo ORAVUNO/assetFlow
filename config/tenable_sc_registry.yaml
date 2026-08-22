@@ -1,0 +1,393 @@
+# =============================================================================
+# Tenable.sc (SecurityCenter) Asset Intelligence Registry
+# =============================================================================
+# Resource registry for the Tenable.sc adapter. Where the Elasticsearch registry
+# carries ES|QL query bodies, each entry here names a `resource` that the
+# Tenable.sc runner maps to one or more REST calls and normalizes into the same
+# column/row shape (see assetflow/tenable_sc_runner.py).
+#
+# Two request shapes cover everything (see assetflow/tenable_sc_client.py):
+#   - POST /rest/analysis with a *tool* — the workhorse for vulnerability / device
+#     / software data:
+#       * sumip        -> device inventory (one row per host)
+#       * vulndetails  -> aggregated security findings (one row per detection)
+#       * listsoftware -> installed-software enumeration
+#     paged with startOffset / endOffset.
+#   - GET /rest/{user,asset,alert,ticket} — the object listings for users, asset
+#     lists (tags), alerts, and tickets (incidents).
+#
+# Authentication is a Tenable.sc session (username + password -> /rest/token,
+# X-SecurityCenter header) or an access-key/secret-key pair. The account needs the
+# Security Manager role with access to the required repositories.
+#
+# Custom fields & asset tags (asked for by the integration):
+#   - Any device / finding field Tenable.sc returns that the runner does not map
+#     to a named column is emitted under a `custom.` prefix, so extra fields are
+#     captured, never dropped, and never confused with system fields.
+#   - Each device row is stamped with the asset lists (tags) its IP belongs to in
+#     a `tags` column; the asset_lists resource is the catalog of those tags.
+#
+# Status meanings match the other registries:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Endpoint/tool + field names follow Tenable's API
+#                              docs / pyTenable; mapping is best-effort and needs
+#                              confirming against a live Tenable.sc release.
+#   - investigation_required : Endpoint exists but response shape / availability
+#                              varies by Tenable.sc version or licensing.
+#   - not_validated          : Not exercised against live data (placeholders).
+# =============================================================================
+
+metadata:
+  version: 1
+  description: >-
+    Tenable.sc (SecurityCenter) asset intelligence — the device inventory
+    (sumip), aggregated security findings (vulndetails), installed software
+    (listsoftware), user accounts, asset lists (asset tags / groupings), alerts,
+    and tickets (incidents) — over the Tenable.sc REST API. Device and finding
+    rows carry any unmapped Tenable field under a `custom.` prefix and devices are
+    stamped with their asset-list tags.
+  query_language: Tenable.sc REST API (/rest/analysis + resource endpoints)
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Device Inventory
+    - Security Findings
+    - Software
+    - Users
+    - Asset Tags
+    - Alerts & Incidents
+    - SaaS Applications
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+feeds:
+  - id: FEED-TSC-DEVICES
+    name: Device Inventory
+    category: Device Inventory
+    description: Every host Tenable.sc has seen, with IP/DNS/MAC, OS, repository, vulnerability score and per-severity counts, last scan times, and asset-list tags.
+    query_ids: [TSC001, TSC009]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TSC-FINDINGS
+    name: Security Findings
+    category: Security Findings
+    description: Aggregated security findings — one row per (host, plugin) detection with severity, port/protocol, CVEs, CVSS/VPR, synopsis, solution, and first/last seen.
+    query_ids: [TSC002]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TSC-SOFTWARE
+    name: Software
+    category: Software
+    description: Installed-software enumeration across the estate (listsoftware).
+    query_ids: [TSC003]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TSC-USERS
+    name: Users
+    category: Users
+    description: Tenable.sc user accounts — role, group, org, auth type, status, and last login.
+    query_ids: [TSC004]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-TSC-ASSETS
+    name: Asset Tags
+    category: Asset Tags
+    description: Asset lists — the asset tags / groupings defined in Tenable.sc, each with its tags, type, owner, and member-IP count.
+    query_ids: [TSC005]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-TSC-ALERTS
+    name: Alerts & Incidents
+    category: Alerts & Incidents
+    description: Configured alerts and tickets (Tenable.sc's incident objects), with status, trigger/classification, assignee, and timestamps.
+    query_ids: [TSC006, TSC007]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TSC-SAAS
+    name: SaaS Applications
+    category: SaaS Applications
+    description: SaaS application inventory (placeholder — not exposed by the Tenable.sc core API; a Tenable One / Tenable.io capability).
+    query_ids: [TSC008]
+    recommended_refresh_frequency: Daily
+
+# =============================================================================
+# QUERIES (resources)
+# =============================================================================
+queries:
+  - id: TSC001
+    category: Device Inventory
+    name: Devices (Host Inventory)
+    status: partially_validated
+    validated: false
+    resource: devices
+    purpose: >-
+      Inventory every host Tenable.sc has data for, one row per IP, with DNS /
+      NetBIOS / MAC, OS (CPE), repository, overall vulnerability score and
+      per-severity counts, last authenticated / unauthenticated scan times, the
+      asset lists (tags) the host belongs to, and any extra Tenable field under
+      custom.*.
+    expected_output_fields:
+      - host.name          # dnsName / netbiosName / ip (folds into unified host view)
+      - asset.type         # constant "Host"
+      - host.ip            # ip
+      - host.dns           # dnsName
+      - host.netbios       # netbiosName
+      - host.mac           # macAddress
+      - os                 # osCPE
+      - repository         # repository.name
+      - acr                # acrScore (Asset Criticality Rating; editable in the Plus tier)
+      - aes                # assetExposureScore (Asset Exposure Score)
+      - vuln.score         # score
+      - vuln.total         # total
+      - vuln.critical      # severityCritical
+      - vuln.high          # severityHigh
+      - vuln.medium        # severityMedium
+      - vuln.low           # severityLow
+      - vuln.info          # severityInfo
+      - last.auth.scan     # lastAuthRun (epoch -> ISO)
+      - last.unauth.scan   # lastUnauthRun (epoch -> ISO)
+      - tags               # asset lists (tags) whose membership includes this IP
+      - "custom.*"         # any extra field Tenable.sc returns for the host
+    notes: >-
+      POST /rest/analysis with type=vuln, sourceType=cumulative, tool=sumip,
+      paged by startOffset/endOffset. Asset-tag enrichment builds an IP ->
+      asset-list-name map from GET /rest/asset (bounded to the first 150 asset
+      lists, each expanded via a sumip analysis filtered by assetID); it is
+      best-effort and degrades to no tags on error. The time-range control adds a
+      lastSeen filter (24h/7d/30d/90d). Field names target Tenable Security Center
+      6.x (a 6.8.0 "Plus" deployment): 6.x adds acrScore / assetExposureScore to
+      sumip. Any other field the release returns still rides along under custom.*.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC002
+    category: Security Findings
+    name: Aggregated Security Findings
+    status: partially_validated
+    validated: false
+    resource: findings
+    purpose: >-
+      Fetch the aggregated security findings — one row per (host, plugin)
+      detection — with severity, plugin family, port/protocol, CVEs, CVSS and VPR
+      scores, risk factor, synopsis, solution, first/last seen, and mitigation
+      status.
+    expected_output_fields:
+      - host.name          # dnsName / netbiosName / ip
+      - host.ip            # ip
+      - host.dns           # dnsName
+      - host.mac           # macAddress
+      - plugin.id          # pluginID
+      - plugin.name        # pluginName
+      - severity           # severity.name (Critical / High / Medium / Low / Info)
+      - family             # family.name
+      - port               # port
+      - protocol           # protocol
+      - cve                # cve
+      - cvss.base          # baseScore
+      - cvss.v3.base       # cvssV3BaseScore
+      - vpr.score          # vprScore
+      - risk.factor        # riskFactor
+      - synopsis           # synopsis
+      - solution           # solution
+      - first.seen         # firstSeen (epoch -> ISO)
+      - last.seen          # lastSeen (epoch -> ISO)
+      - "custom.*"         # any extra field Tenable.sc returns for the finding
+    notes: >-
+      POST /rest/analysis with type=vuln, sourceType=cumulative, tool=vulndetails,
+      paged by startOffset/endOffset. Large text fields (pluginText, description,
+      xref, …) are intentionally excluded from the custom.* sweep so the table
+      stays legible. The time-range control adds a lastSeen filter.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC003
+    category: Software
+    name: Installed Software
+    status: partially_validated
+    validated: false
+    resource: software
+    purpose: >-
+      Enumerate installed software across the estate, one row per distinct
+      software string with the number of hosts it appears on (and a CPE where the
+      release provides one).
+    expected_output_fields:
+      - software.name      # name
+      - host.count         # count
+      - cpe                # cpe (when present)
+      - "custom.*"         # any extra field Tenable.sc returns
+    notes: >-
+      POST /rest/analysis with type=vuln, sourceType=cumulative, tool=listsoftware.
+      This is the estate-wide software list (the "Installed Software" table). Per-
+      host software can be obtained by filtering the analysis by IP/asset — a
+      natural follow-up resource.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC004
+    category: Users
+    name: Users
+    status: partially_validated
+    validated: false
+    resource: users
+    purpose: >-
+      List the Tenable.sc user accounts with role, group, organization, auth
+      type, lock/status, and last login — for the unified Users inventory.
+    expected_output_fields:
+      - host.name          # username (folds into the unified Users view)
+      - user.id            # id
+      - username           # username
+      - full.name          # firstname + lastname
+      - email              # email
+      - title              # title
+      - role               # role.name
+      - group              # group.name
+      - org                # orgName
+      - auth.type          # authType (tns / ldap / saml / linked)
+      - locked             # locked
+      - status             # status
+      - last.login         # lastLogin (epoch -> ISO)
+    notes: >-
+      GET /rest/user?fields=... The endpoint returns a plain list; role and group
+      are nested objects reduced to their name. Requires a role that can view
+      users (Security Manager can view users in its organization).
+    recommended_refresh_frequency: Weekly
+
+  - id: TSC005
+    category: Asset Tags
+    name: Asset Lists (Tags)
+    status: partially_validated
+    validated: false
+    resource: asset_lists
+    purpose: >-
+      List the asset lists that model asset tags / groupings in Tenable.sc — each
+      with its tags field, type (static / dynamic / dns / ldap / combination …),
+      owner, group, and member-IP count. This is the catalog of the tags the
+      device inventory (TSC001) stamps onto each host.
+    expected_output_fields:
+      - asset.name         # name
+      - asset.id           # id
+      - asset.type         # type
+      - tags               # tags (the asset-list tag string)
+      - description        # description
+      - ip.count           # ipCount
+      - owner              # owner.username
+      - owner.group        # ownerGroup.name
+      - status             # status
+      - created            # createdTime (epoch -> ISO)
+      - modified           # modifiedTime (epoch -> ISO)
+    notes: >-
+      GET /rest/asset?fields=... The response merges the usable + manageable
+      buckets, de-duplicated by id. Asset lists are Tenable.sc's tagging /
+      grouping primitive; TSC001 uses them to stamp per-device tags.
+    recommended_refresh_frequency: Weekly
+
+  - id: TSC006
+    category: Alerts & Incidents
+    name: Alerts
+    status: partially_validated
+    validated: false
+    resource: alerts
+    purpose: >-
+      List the configured Tenable.sc alerts with their trigger condition, status,
+      whether they triggered on the last evaluation, last-triggered / last-
+      evaluated times, and the actions taken.
+    expected_output_fields:
+      - alert.name         # name
+      - alert.id           # id
+      - description        # description
+      - trigger            # triggerName triggerOperator triggerValue
+      - status             # status
+      - did.trigger.last   # didTriggerLastEvaluation
+      - last.triggered     # lastTriggered (epoch -> ISO)
+      - last.evaluated     # lastEvaluated (epoch -> ISO)
+      - actions            # action[].type
+      - owner              # owner.username
+    notes: >-
+      GET /rest/alert?fields=... The response merges usable + manageable. Actions
+      are a list; their types are summarized.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC007
+    category: Alerts & Incidents
+    name: Incidents (Tickets)
+    status: partially_validated
+    validated: false
+    resource: incidents
+    purpose: >-
+      List Tenable.sc tickets — its incident objects — with status,
+      classification, assignee, owner, and assigned/created/modified times.
+    expected_output_fields:
+      - incident.name      # name
+      - incident.id        # id
+      - status             # status.name
+      - classification     # classification
+      - description        # description
+      - assignee           # assignee.username
+      - owner              # owner.username
+      - assigned           # assignedTime (epoch -> ISO)
+      - created            # createdTime (epoch -> ISO)
+      - modified           # modifiedTime (epoch -> ISO)
+    notes: >-
+      GET /rest/ticket?fields=... The response merges usable + manageable. Status
+      is a nested object reduced to its name.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC008
+    category: SaaS Applications
+    name: SaaS Applications
+    status: not_validated
+    validated: false
+    resource: saas_applications
+    purpose: >-
+      Inventory SaaS applications. Placeholder: the Tenable.sc (SecurityCenter)
+      core REST API does not enumerate SaaS applications — that is a Tenable One /
+      Tenable.io capability. The resource returns no rows so the asset type is
+      visible with an honest empty result rather than silently missing.
+    expected_output_fields:
+      - application.name
+      - vendor
+      - note
+    notes: >-
+      No Tenable.sc endpoint provides SaaS application discovery. If the estate
+      also runs Tenable.io / Tenable One, that data would come from a separate
+      adapter against the Tenable Vulnerability Management API.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC009
+    category: Device Inventory
+    name: Explore Assets (Hosts)
+    status: investigation_required
+    validated: false
+    resource: hosts
+    purpose: >-
+      Unified host inventory from the Tenable Security Center 6.x "Explore Assets"
+      endpoint (/rest/hosts) — one row per asset in the 6.x asset model, with ACR
+      (Asset Criticality Rating), AES (Asset Exposure Score), repositories, system
+      type, and first/last seen. The modern companion to the sumip-based Devices
+      resource (TSC001).
+    expected_output_fields:
+      - host.name        # name / dnsName / netbiosName / ipAddress
+      - asset.type       # systemType (falls back to "Host")
+      - host.ip          # ipAddress
+      - host.dns         # dnsName
+      - host.netbios     # netbiosName / netBios
+      - host.mac         # macAddress
+      - os               # os / osCPE
+      - acr              # acrScore / assetCriticalityRating
+      - aes              # assetExposureScore
+      - repositories     # repositories[].name
+      - first.seen       # firstSeen (epoch -> ISO)
+      - last.seen        # lastSeen (epoch -> ISO)
+      - uuid             # uuid / hostUUID / tenableUUID
+      - "custom.*"       # any extra field the release returns
+    notes: >-
+      GET /rest/hosts?startOffset=&endOffset=&fields=..., paged like the analysis
+      endpoint (falls back to an unfielded request if the fields selector is
+      rejected, and to a plain list response shape). Field names are read with
+      per-release fallbacks because 6.x renamed a few across point releases; marked
+      investigation_required until the exact response shape is confirmed against a
+      live 6.x box (the endpoint is new in the 6.x line). Requires Tenable Security
+      Center 6.x; older releases won't expose /rest/hosts (the resource returns no
+      rows there — use TSC001 instead).
+    recommended_refresh_frequency: Daily
