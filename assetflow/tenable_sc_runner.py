@@ -688,13 +688,14 @@ def _collect_databases(client, time_range: Optional[str]) -> Tuple[List[str], Li
         # Nessus detection plugins emit — reliable), then the record's own version
         # field, then a version token in the plugin name. Avoids parsing a bogus
         # number out of a vulnerability plugin's prose.
+        # NB: the record's own ``version`` field is the *plugin* revision (e.g.
+        # "1.46"), not the database version — do not use it, or every remote
+        # detection row gets a bogus version.
         version = ""
         vm = re.search(r"[Vv]ersion\s*:\s*([0-9][0-9A-Za-z.\-+~:_]*)",
                        str(rec.get("pluginText") or ""))
         if vm:
             version = vm.group(1)
-        if not version:
-            version = textish(rec.get("version"))
         if not version:
             mn = _VERSION_RE.search(plugin_name)
             version = mn.group(0) if mn else ""
@@ -953,9 +954,10 @@ def _fetch_hosts(client) -> List[Dict[str, Any]]:
 
 
 # Fields whose presence means a /rest/hosts row is a real asset, not a bare IP
-# that merely answered a ping. A record with any of these is kept.
+# that merely answered a ping. A record with any of these is kept. ``name`` is
+# handled separately because Tenable sets it to the IP when there's no hostname.
 _HOST_DATA_KEYS = (
-    "name", "dnsName", "netbiosName", "netBios", "os", "osCPE", "macAddress",
+    "dnsName", "netbiosName", "netBios", "os", "osCPE", "macAddress",
     "repositories", "repository", "acrScore", "assetCriticalityRating",
     "assetExposureScore",
 )
@@ -964,8 +966,14 @@ _HOST_DATA_KEYS = (
 def _host_has_data(rec: Dict[str, Any]) -> bool:
     """True if a /rest/hosts record carries real data beyond a bare IP.
 
-    A meaningful ``systemType`` (not blank / "N/A") also counts.
+    /rest/hosts sets ``name`` to the IP for hosts with no DNS name, so a name that
+    merely equals the IP does not count. A real hostname, any inventory field, or a
+    meaningful ``systemType`` (not blank / "N/A") keeps the row.
     """
+    ip = textish(rec.get("ipAddress") or rec.get("ip")).strip()
+    name = textish(rec.get("name")).strip()
+    if name and name != ip:
+        return True
     for key in _HOST_DATA_KEYS:
         if textish(rec.get(key)).strip():
             return True
