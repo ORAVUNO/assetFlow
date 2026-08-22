@@ -434,7 +434,9 @@ queries:
       database product is normalized to a clean label (MySQL / MariaDB / Oracle
       Database / Microsoft SQL Server / PostgreSQL / …) via keyword match on the
       plugin name, and the version is taken from the plugin output's "Version : X"
-      line (falling back to the record version / plugin name). The full plugin name
+      line (falling back to a version token in the plugin name; the record's own
+      version field is deliberately ignored — it is the Nessus plugin revision,
+      not the database version, e.g. 1.49). The full plugin name
       is always kept in plugin.name. Confirmed working against a live 6.8 box; still
       investigation_required because the family includes some vulnerability plugins
       (not only detections), so filter plugin.name if you want detections only.

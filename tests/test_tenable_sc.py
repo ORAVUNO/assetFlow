@@ -199,10 +199,11 @@ def test_hosts_plain_list_shape():
 
 
 def test_hosts_drop_bare_ping_only():
-    # A bare IP (only ip + timestamps, no name/OS/MAC/repo) is dropped by default;
-    # a host with real data is kept.
+    # A bare IP (name == ip, systemType N/A, no other data) is dropped by default;
+    # a host with a real hostname/OS is kept. Tenable sets name to the IP for
+    # DNS-less hosts, so name==ip must NOT count as real data.
     resp = {"results": [
-        {"id": "1", "ipAddress": "10.3.3.5", "systemType": "N/A",
+        {"id": "1", "name": "10.3.3.5", "ipAddress": "10.3.3.5", "systemType": "N/A",
          "firstSeen": "1600000000", "lastSeen": "1600000500"},         # bare -> dropped
         {"id": "2", "ipAddress": "10.0.0.9", "dnsName": "app.corp",
          "os": "Linux", "lastSeen": "1600000500"},                     # real -> kept
@@ -346,6 +347,23 @@ def test_databases_linked_to_host():
     assert row[cols.index("database")] == "MySQL"
     assert row[cols.index("version")] == "8.0.32"
     assert row[cols.index("port")] == "3306"
+
+
+def test_databases_ignore_plugin_revision_as_version():
+    # A remote detection with no "Version :" line must NOT fall back to the
+    # record's `version` field (which is the plugin revision, e.g. 1.49).
+    fam = [{"id": "10", "name": "Databases"}]
+    dbrows = [{"ip": "10.0.0.5", "dnsName": "ora.corp", "pluginID": "10658",
+               "pluginName": "Oracle Database tnslsnr Service Remote Version Disclosure",
+               "port": "1521", "protocol": "TCP", "family": {"name": "Databases"},
+               "version": "1.49", "pluginText": "The remote Oracle TNS listener responded."}]
+    client = FakeClient(analysis_rules={"vulndetails": dbrows},
+                        get_rules={"pluginFamily": fam})
+    result = tsc_runner_mod.run_query(client, _q("databases", "TSC010", "Software"))
+    cols = result.column_names
+    row = result.rows[0]
+    assert row[cols.index("database")] == "Oracle Database"
+    assert row[cols.index("version")] == ""     # not "1.49" (the plugin revision)
 
 
 # --------------------------------------------------------------------------- #
