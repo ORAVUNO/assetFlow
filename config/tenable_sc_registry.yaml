@@ -225,12 +225,13 @@ queries:
     notes: >-
       POST /rest/analysis with tool=vulndetails filtered to the software-
       enumeration plugins (pluginID = 20811,22869), then each plugin's pluginText
-      is split into individual package lines and each line into name + version
-      (CPE, "[version X]", and trailing dotted-number forms are handled; the raw
-      line is preserved). This replaces the previous estate-wide listsoftware view
-      so software links to hosts. Marked investigation_required until the exact
-      pluginText format is confirmed against a live box, since parsing is
-      format-dependent (the raw line always survives, so nothing is lost).
+      is split into individual package lines and each line into name + version.
+      Formats handled (confirmed against a live 6.8 box): Debian/Ubuntu `dpkg -l`
+      output (status flag + columns split on 2+ spaces), Windows "[version X]"
+      lines, CPEs, and rpm-style name-version; <plugin_output> wrapper lines are
+      dropped. This replaces the previous estate-wide listsoftware view so software
+      links to hosts. Still investigation_required until the Windows (20811) format
+      is also confirmed; the raw line always survives, so nothing is lost.
     recommended_refresh_frequency: Daily
 
   - id: TSC004
@@ -425,9 +426,11 @@ queries:
     notes: >-
       Resolves the "Databases" plugin family id via GET /rest/pluginFamily, then
       POST /rest/analysis with tool=vulndetails filtered to that family; the
-      database product is taken from the plugin name and the version parsed from
-      the plugin name/output. Marked investigation_required until confirmed against
-      a live box: the family-filter shape and plugin-name formats vary, so version
-      parsing is best-effort (the full plugin name is always kept). Returns no rows
-      if the Databases family can't be resolved.
+      database product is normalized to a clean label (MySQL / MariaDB / Oracle
+      Database / Microsoft SQL Server / PostgreSQL / …) via keyword match on the
+      plugin name, and the version is taken from the plugin output's "Version : X"
+      line (falling back to the record version / plugin name). The full plugin name
+      is always kept in plugin.name. Confirmed working against a live 6.8 box; still
+      investigation_required because the family includes some vulnerability plugins
+      (not only detections), so filter plugin.name if you want detections only.
     recommended_refresh_frequency: Daily
