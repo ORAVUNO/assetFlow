@@ -37,6 +37,7 @@ fields ride along and are never confused with the standard system columns.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,6 +48,132 @@ from .runner import QueryResult
 # Prefix marking an unmapped (extra / site-specific) field — a UDF or any other
 # key the runner doesn't name — so it is never confused with the system columns.
 CUSTOM_PREFIX = "custom."
+
+
+# --------------------------------------------------------------------------- #
+# Fetch configuration (fields projection, disposed assets, UDF labels)
+# --------------------------------------------------------------------------- #
+
+# The AssetExplorer /api/v3/assets *list* endpoint returns only a default field
+# projection unless the request names the fields it wants in list_info's
+# ``fields_required``. Without it, relational fields (serial, MAC, OS, category,
+# dates) come back empty even though the data exists — so we request a broad set.
+# Override or extend with AE_ASSET_FIELDS (comma-separated); set it to "none" to
+# send no projection (the raw default). If a field name is rejected by a given
+# release, the fetch transparently retries without the projection.
+_DEFAULT_ASSET_FIELDS = (
+    "name", "ip_addresses", "network_adapters", "mac_address", "operating_system",
+    "product", "product_type", "type", "category", "asset_category", "state",
+    "asset_tag", "barcode", "vendor", "serial_number", "org_serial_number",
+    "department", "site", "location", "region", "user", "acquisition_date",
+    "warranty_expiry", "expiry_date", "last_audit_on", "created_time",
+    "last_updated_time", "description", "purchase_cost", "total_cost",
+    "operational_cost", "current_cost", "udf_fields",
+)
+
+
+def _asset_fields() -> Optional[List[str]]:
+    override = (os.getenv("AE_ASSET_FIELDS") or "").strip()
+    if override.lower() in ("none", "off", "-"):
+        return None
+    if override:
+        return [f.strip() for f in override.split(",") if f.strip()]
+    return list(_DEFAULT_ASSET_FIELDS)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("false", "0", "no", "off")
+
+
+def _include_disposed() -> bool:
+    # The list endpoint omits assets in disposed/retired states by default; the
+    # AE report includes them. Default on so counts match the report; disable
+    # with AE_INCLUDE_DISPOSED=false.
+    return _bool_env("AE_INCLUDE_DISPOSED", True)
+
+
+def _disposed_states() -> List[str]:
+    override = (os.getenv("AE_DISPOSED_STATES") or "").strip()
+    if override:
+        return [s.strip() for s in override.split(",") if s.strip()]
+    return ["Disposed", "Expired", "Retired"]
+
+
+def _udf_label_overrides() -> Dict[str, str]:
+    """UDF api_name -> friendly label, from AE_UDF_LABELS.
+
+    The value is either a JSON object (``{"udf_pick_8909": "BCM Rating"}``) or
+    ``@/path/to/file.json`` pointing at one. UDF display labels are deployment
+    specific — this lets a site map its own ``udf_*`` keys to readable column
+    names without hard-coding anyone's fields into the adapter.
+    """
+    raw = (os.getenv("AE_UDF_LABELS") or "").strip()
+    if not raw:
+        return {}
+    try:
+        if raw.startswith("@"):
+            with open(raw[1:], encoding="utf-8") as fh:
+                data = json.load(fh)
+        else:
+            data = json.loads(raw)
+    except Exception:  # pragma: no cover - bad config degrades to no labels
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k and v}
+
+
+def _fetch_udf_labels(client) -> Dict[str, str]:
+    """Best-effort UDF api_name -> display label from AssetExplorer metadata.
+
+    Tries the asset field-metadata endpoints; any label found is overridden by
+    AE_UDF_LABELS. Returns ``{}`` when metadata isn't reachable, so column naming
+    degrades gracefully to the raw ``custom.udf_*`` keys.
+    """
+    labels: Dict[str, str] = {}
+    for path in ("assets/udf_fields", "asset_fields", "assets/fields"):
+        try:
+            payload = client.get(path)
+        except Exception:
+            continue
+        recs = None
+        if isinstance(payload, dict):
+            for key, val in payload.items():
+                if key in ("response_status", "list_info"):
+                    continue
+                if isinstance(val, list):
+                    recs = val
+                    break
+        elif isinstance(payload, list):
+            recs = payload
+        for rec in (recs or []):
+            if not isinstance(rec, dict):
+                continue
+            api = rec.get("name") or rec.get("api_name") or rec.get("column_name")
+            label = rec.get("display_name") or rec.get("label") or rec.get("display_label")
+            if api and label and str(api).startswith("udf_"):
+                labels.setdefault(str(api), str(label))
+        if labels:
+            break
+    return labels
+
+
+def _label_map(client) -> Dict[str, str]:
+    """Resolve the UDF api_name -> label map for this connection, cached on the
+    client. Metadata from AssetExplorer first, then AE_UDF_LABELS overrides."""
+    cached = getattr(client, "_ae_udf_labels", None)
+    if cached is not None:
+        return cached
+    labels = _fetch_udf_labels(client)
+    labels.update(_udf_label_overrides())
+    try:
+        client._ae_udf_labels = labels
+    except Exception:  # pragma: no cover - client may forbid attributes
+        pass
+    return labels
 
 
 # --------------------------------------------------------------------------- #
@@ -196,15 +323,17 @@ def _product_type(asset: Dict[str, Any]) -> str:
 # udf_fields entry and any other scalar key) is swept into custom.* below.
 _ASSET_SPEC: Tuple[Tuple[str, Any], ...] = (
     ("asset.tag", lambda a: textish(_pick(a, "asset_tag", "assettag"))),
-    ("resource.type", lambda a: _name(_pick(a, "type", "asset_category"))),
-    ("asset.category", lambda a: _name(_pick(a, "category", "asset_category"))),
+    ("resource.type", lambda a: _name(_pick(a, "type"))),
+    ("asset.category", lambda a: _name(_pick(a, "category", "asset_category", "resource_category"))),
     ("asset.state", lambda a: _name(_pick(a, "state", "asset_state"))),
     ("host.ip", _ip),
     ("mac", _mac),
     ("os", lambda a: _name(_pick(a, "operating_system", "os"))),
     ("product", lambda a: _name(_pick(a, "product"))),
     ("vendor", lambda a: _name(_pick(a, "vendor", "manufacturer"))),
-    ("serial.number", lambda a: textish(_pick(a, "serial_number", "serialnumber", "serial_no"))),
+    ("serial.number", lambda a: textish(_pick(a, "serial_number", "org_serial_number",
+                                               "serialnumber", "serial_no",
+                                               "discovered_serial_number"))),
     ("barcode", lambda a: textish(_pick(a, "barcode"))),
     ("department", lambda a: _name(_pick(a, "department", "dept"))),
     ("site", lambda a: _name(_pick(a, "site"))),
@@ -231,8 +360,9 @@ _ASSET_CONSUMED = {
     "asset_tag", "assettag", "type", "asset_category", "category",
     "state", "asset_state", "ip_address", "ip_addresses", "ipaddress",
     "network_adapters", "mac_address", "macaddress", "operating_system", "os",
-    "product", "product_type", "vendor", "manufacturer",
-    "serial_number", "serialnumber", "serial_no", "barcode",
+    "product", "product_type", "vendor", "manufacturer", "resource_category",
+    "serial_number", "org_serial_number", "serialnumber", "serial_no",
+    "discovered_serial_number", "barcode",
     "department", "dept", "site", "location", "region",
     "user", "assigned_to", "assigned_user", "managed_by", "asset_owner", "owner",
     "acquisition_date", "acquisitiondate", "warranty_expiry", "expiry_date",
@@ -243,17 +373,36 @@ _ASSET_CONSUMED = {
 }
 
 
+def _custom_column(key: str, label_map: Dict[str, str], used: set) -> str:
+    """Column name for a swept custom key.
+
+    A UDF key with a known friendly label (from AssetExplorer metadata /
+    AE_UDF_LABELS) becomes that label so the column reads "BCM Rating" instead of
+    "custom.udf_pick_8909"; otherwise it stays ``custom.<key>``. Names are kept
+    unique so a UDF label never silently collides with a system column.
+    """
+    label = label_map.get(key)
+    name = label if label else f"{CUSTOM_PREFIX}{key}"
+    if name in used:
+        name = f"{name} ({key})"
+    used.add(name)
+    return name
+
+
 def _flatten_assets(
     assets: List[Dict[str, Any]],
+    label_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[str], List[List[Any]]]:
     """Flatten asset records into (columns, rows) with a ``custom.*`` sweep.
 
     Leading ``host.name`` + ``asset.type`` fold the asset into the unified
     inventory (``asset.type`` = product type). Standard columns come from
     ``_ASSET_SPEC``; every ``udf_fields`` entry and any other scalar top-level key
-    is appended as ``custom.<key>`` (discovered as the union across assets, so
-    site-specific UDFs ride along), keeping first-seen order for stable columns.
+    is appended (discovered as the union across assets, first-seen order). A UDF
+    with a known friendly label (``label_map``) is named by that label; otherwise
+    it stays ``custom.<key>``.
     """
+    label_map = label_map or {}
     # Discover custom keys: all udf_fields keys, then any extra scalar top-level
     # keys, as the union across records (stable, first-seen order).
     custom_keys: List[str] = []
@@ -276,7 +425,8 @@ def _flatten_assets(
 
     columns = ["host.name", "asset.type"]
     columns.extend(out for out, _ in _ASSET_SPEC)
-    columns.extend(f"{CUSTOM_PREFIX}{k}" for k in custom_keys)
+    used = set(columns)
+    columns.extend(_custom_column(k, label_map, used) for k in custom_keys)
 
     rows: List[List[Any]] = []
     for asset in assets:
@@ -331,14 +481,61 @@ def _matches_bucket(product_type: str, keywords: Tuple[str, ...]) -> bool:
 # Per-resource collectors → (columns, rows)
 # --------------------------------------------------------------------------- #
 
+def _asset_id(asset: Dict[str, Any]) -> Any:
+    return asset.get("id") if isinstance(asset, dict) else None
+
+
+def _list_assets(client, list_info: Optional[dict], fields: Optional[List[str]]):
+    """One ``/api/v3/assets`` list call with an optional field projection.
+
+    If the projection makes the request fail (a field name a release rejects),
+    it retries once without the projection so the fetch still returns data."""
+    info = dict(list_info or {})
+    if fields:
+        info["fields_required"] = fields
+    try:
+        return client.list("assets", "assets", list_info=info or None)
+    except Exception:
+        if fields:  # the projection may be the culprit — retry without it
+            return client.list("assets", "assets", list_info=(list_info or None))
+        raise
+
+
 def _fetch_assets(client) -> List[Dict[str, Any]]:
-    """The full asset inventory (``GET /api/v3/assets``, paged)."""
-    return client.list("assets", "assets")
+    """The full asset inventory (``GET /api/v3/assets``, paged).
+
+    Requests a broad ``fields_required`` projection so relational fields (serial,
+    MAC, OS, category, dates) are populated rather than left empty by the list
+    endpoint's sparse default. When ``AE_INCLUDE_DISPOSED`` is on (default), also
+    fetches the disposed/retired states the list omits by default and merges them
+    (deduped by id), so the count matches the AssetExplorer report.
+    """
+    fields = _asset_fields()
+    assets = _list_assets(client, None, fields)
+    if not _include_disposed():
+        return assets
+    seen = {_asset_id(a) for a in assets}
+    for state in _disposed_states():
+        info = {"search_criteria": {"field": "state.name", "condition": "is",
+                                    "value": state}}
+        try:
+            extra = _list_assets(client, info, fields)
+        except Exception:  # pragma: no cover - state filter support varies
+            continue
+        for a in extra:
+            aid = _asset_id(a)
+            # dedupe by id; when id is missing fall back to name so a state
+            # filter that is silently ignored can't re-add the default set.
+            marker = aid if aid is not None else ("name:" + textish(a.get("name")))
+            if marker not in seen:
+                seen.add(marker)
+                assets.append(a)
+    return assets
 
 
 def _collect_assets(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Every asset, flattened with default + custom (UDF) columns."""
-    return _flatten_assets(_fetch_assets(client))
+    return _flatten_assets(_fetch_assets(client), _label_map(client))
 
 
 def _bucket_collector(keywords: Tuple[str, ...]):
@@ -346,7 +543,7 @@ def _bucket_collector(keywords: Tuple[str, ...]):
     def _collect(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
         assets = [a for a in _fetch_assets(client)
                   if _matches_bucket(_product_type(a), keywords)]
-        return _flatten_assets(assets)
+        return _flatten_assets(assets, _label_map(client))
     return _collect
 
 

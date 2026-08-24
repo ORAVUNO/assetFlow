@@ -178,6 +178,89 @@ def test_udf_pick_field_swept_to_custom():
     assert d["custom.udf_pick_8919"] == "CDN"
 
 
+def test_udf_labels_rename_columns(monkeypatch):
+    """AE_UDF_LABELS renames custom.udf_* columns to friendly labels."""
+    monkeypatch.setenv("AE_UDF_LABELS",
+                       '{"udf_pick_8909": "BCM Rating", "udf_pick_8919": "Network type"}')
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    asset = {"name": "a", "product_type": {"name": "Routers"},
+             "udf_fields": {"udf_pick_8909": "BC", "udf_pick_8919": "CDN",
+                            "udf_sline_9999": "raw"}}
+    result = ae_runner_mod.run_query(
+        FakeClient(list_rules={"assets": [asset]}), _q("assets"))
+    cols = result.column_names
+    assert "BCM Rating" in cols and "Network type" in cols
+    assert "custom.udf_pick_8909" not in cols
+    assert "custom.udf_sline_9999" in cols          # unlabeled UDF keeps custom.*
+    d = dict(zip(cols, result.rows[0]))
+    assert d["BCM Rating"] == "BC"
+    assert d["Network type"] == "CDN"
+
+
+def test_serial_from_org_serial_number(monkeypatch):
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    asset = {"name": "a", "product_type": {"name": "Access Points"},
+             "org_serial_number": "FCW2117JJZ3"}
+    result = ae_runner_mod.run_query(
+        FakeClient(list_rules={"assets": [asset]}), _q("assets"))
+    d = dict(zip(result.column_names, result.rows[0]))
+    assert d["serial.number"] == "FCW2117JJZ3"
+    assert "custom.org_serial_number" not in result.column_names
+
+
+class _StateFilterClient:
+    """Returns disposed assets only when a state search_criteria is applied —
+    mirroring how the list endpoint hides disposed assets by default."""
+    host, portal, api_key = "h", "", "k"
+
+    def get(self, path, input_data=None):
+        raise RuntimeError("no metadata")
+
+    def list(self, path, resource_key, *, list_info=None, **kw):
+        info = list_info or {}
+        sc = info.get("search_criteria")
+        if sc:
+            if sc.get("value") == "Disposed":
+                return [{"id": "D1", "name": "disp1", "state": {"name": "Disposed"},
+                         "product_type": {"name": "Workstations"}}]
+            return []  # Expired / Retired: none
+        return [{"id": "A1", "name": "act1", "state": {"name": "Active"},
+                 "product_type": {"name": "Servers"}}]
+
+
+def test_include_disposed_merges(monkeypatch):
+    monkeypatch.delenv("AE_INCLUDE_DISPOSED", raising=False)  # default = on
+    result = ae_runner_mod.run_query(_StateFilterClient(), _q("assets"))
+    names = {r[0] for r in result.rows}
+    assert names == {"act1", "disp1"}                # disposed merged in
+
+
+def test_exclude_disposed_when_disabled(monkeypatch):
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    result = ae_runner_mod.run_query(_StateFilterClient(), _q("assets"))
+    assert {r[0] for r in result.rows} == {"act1"}
+
+
+class _PickyFieldsClient:
+    """Rejects any request that carries a fields_required projection, so the
+    runner's retry-without-projection fallback is exercised."""
+    host, portal, api_key = "h", "", "k"
+
+    def get(self, path, input_data=None):
+        raise RuntimeError("no metadata")
+
+    def list(self, path, resource_key, *, list_info=None, **kw):
+        if list_info and "fields_required" in list_info:
+            raise RuntimeError("unknown field in fields_required")
+        return [{"id": "1", "name": "x", "product_type": {"name": "Servers"}}]
+
+
+def test_fields_projection_fallback(monkeypatch):
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    result = ae_runner_mod.run_query(_PickyFieldsClient(), _q("assets"))
+    assert {r[0] for r in result.rows} == {"x"}       # still returns data
+
+
 def test_epoch_millis_fallback_without_display_value():
     """A date object with only an epoch-ms value converts to ISO."""
     asset = {"name": "x", "product_type": {"name": "Servers"},
