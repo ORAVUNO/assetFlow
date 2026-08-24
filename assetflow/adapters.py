@@ -623,8 +623,13 @@ class AssetExplorerAdapter(Adapter):
 
     def env_for_form(self, form: dict) -> Dict[str, str]:
         host = (form.get("host") or form.get("url") or "").strip()
+        cleaned_host = assetexplorer_client_mod.clean_host(host)
+        # Preserve an explicit http:// scheme (on-prem often runs plain HTTP on a
+        # custom port); https is the default and needs no prefix.
+        if assetexplorer_client_mod.scheme_of(host) == "http" and cleaned_host:
+            cleaned_host = "http://" + cleaned_host
         env: Dict[str, str] = {
-            "AE_HOST": assetexplorer_client_mod.clean_host(host),
+            "AE_HOST": cleaned_host,
             "AE_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
         }
         portal = (form.get("portal") or form.get("base_path") or "").strip()

@@ -117,8 +117,17 @@ def _as_bool(value: Optional[str], default: bool) -> bool:
     return value.strip().lower() not in ("false", "0", "no", "off")
 
 
+def scheme_of(host: str) -> str:
+    """The URL scheme of a host string — ``http`` if it is written ``http://…``,
+    else ``https`` (the default). On-premises AssetExplorer often runs on plain
+    HTTP and/or a custom port (e.g. ``http://assetexplorer.corp:8080``), so an
+    explicit scheme is honored rather than forced to HTTPS."""
+    return "http" if (host or "").strip().lower().startswith("http://") else "https"
+
+
 def clean_host(host: str) -> str:
-    """Strip scheme, whitespace, trailing slash, and any pasted path from a host/URL."""
+    """Strip scheme, whitespace, trailing slash, and any pasted path from a host/URL
+    (the bare ``host`` or ``host:port`` is kept, so a custom on-prem port survives)."""
     host = (host or "").strip().rstrip("/")
     for scheme in ("https://", "http://"):
         if host.startswith(scheme):
@@ -159,6 +168,7 @@ class AssetExplorerClient:
         verify_certs: bool = True,
         request_timeout: int = 60,
     ):
+        self.scheme = scheme_of(host)  # honor http:// (on-prem); else https
         host = clean_host(host)
         if not host:
             raise AssetExplorerConfigError(
@@ -192,7 +202,7 @@ class AssetExplorerClient:
         """Build a v3 endpoint URL. A ``portal`` yields the Cloud form
         (``/app/<portal>/api/v3/...``); no portal yields the on-prem form
         (``/api/v3/...``)."""
-        base = f"https://{self.host}"
+        base = f"{self.scheme}://{self.host}"
         if self.portal:
             base += f"/app/{self.portal}"
         return f"{base}/api/v3/{path.lstrip('/')}"
@@ -535,7 +545,7 @@ def ping(client: AssetExplorerClient) -> dict:
             total = "" if total is None else str(total)
 
     auth = "technician key" if client.api_key else "OAuth"
-    summary = f"AssetExplorer @ {client.host}"
+    summary = f"AssetExplorer @ {client.scheme}://{client.host}"
     if client.portal:
         summary += f" · portal {client.portal}"
     summary += f" · {auth}"
