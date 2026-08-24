@@ -197,6 +197,36 @@ def test_udf_labels_rename_columns(monkeypatch):
     assert d["Network type"] == "CDN"
 
 
+def test_udf_labels_autoload_from_file(monkeypatch, tmp_path):
+    """With no AE_UDF_LABELS env, a labels file on the conventional path is loaded."""
+    monkeypatch.delenv("AE_UDF_LABELS", raising=False)
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "assetexplorer_udf_labels.json").write_text(
+        '{"udf_pick_8909": "BCM Rating"}', encoding="utf-8")
+    asset = {"name": "a", "product_type": {"name": "Routers"},
+             "udf_fields": {"udf_pick_8909": "BC"}}
+    result = ae_runner_mod.run_query(
+        FakeClient(list_rules={"assets": [asset]}), _q("assets"))
+    assert "BCM Rating" in result.column_names
+    assert "custom.udf_pick_8909" not in result.column_names
+
+
+def test_example_udf_label_map_is_complete():
+    """The shipped example map covers all 34 asset UDF slots (CHAR1-24, DATE1-10)."""
+    import json as _json
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "config" / "assetexplorer_udf_labels.example.json"
+    data = _json.loads(p.read_text())
+    labels = {k: v for k, v in data.items() if not k.startswith("_")}
+    assert len(labels) == 34
+    # the two value-confirmed anchors
+    assert labels["udf_date_8945"] == "Created date"
+    assert labels["udf_date_8949"] == "Updated at"
+
+
 def test_serial_from_org_serial_number(monkeypatch):
     monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     asset = {"name": "a", "product_type": {"name": "Access Points"},
