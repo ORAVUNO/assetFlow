@@ -544,6 +544,7 @@ rest are plain object listings:
 | TSC002 | **Aggregated Security Findings** (`findings`) | Security Findings | `/rest/analysis` tool `vulndetails` — one row per (host, plugin): severity, family, port/protocol, CVEs, CVSS/VPR, synopsis, solution, first/last seen, `custom.*` |
 | TSC003 | **Installed Software** (per host) (`software`) | Software | `/rest/analysis` `vulndetails` on the software-enumeration plugins (20811/22869) — one row per (host, package) with **name/version split out**, linked to the host |
 | TSC010 | **Databases** (per host) (`databases`) | Software | `/rest/analysis` `vulndetails` on the "Databases" plugin family — running databases + versions per host |
+| TSC011 | **Applications** (per host) (`applications`) | Applications | the notable apps within TSC003's software (Windows apps + allowlisted Linux server/app/desktop packages), emitting `application.name` for the unified Applications view |
 | TSC004 | Users (`users`) | Users | `GET /rest/user` |
 | TSC005 | **Asset Lists (Tags)** (`asset_lists`) | Asset Tags | `GET /rest/asset` |
 | TSC006 | Alerts (`alerts`) | Alerts & Incidents | `GET /rest/alert` |
