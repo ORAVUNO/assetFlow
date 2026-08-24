@@ -267,8 +267,8 @@ adapter's `assets` pull:
 - **Unreadable custom fields.** UDF columns came through as raw api names
   (`custom.udf_pick_8909`). The adapter now resolves a UDF api_name → label map —
   best-effort from AssetExplorer field metadata, overridden by `AE_UDF_LABELS`
-  (inline JSON or `@file`) — and renames the columns (`BCM Rating`, `Network
-  type`, …). UDF labels are deployment-specific; a **complete** recovered map for
+  (inline JSON or `@file`) — and renames the columns while keeping the `custom.` prefix (`custom.BCM
+  Rating`, `custom.Network type`, …), so custom fields stay marked as custom. UDF labels are deployment-specific; a **complete** recovered map for
   the reference instance (all 34 asset UDFs — `UDF_CHAR1..24` + `UDF_DATE1..10`,
   derived from the report definition and value-confirmed) ships at
   `config/assetexplorer_udf_labels.example.json`. With no `AE_UDF_LABELS` set, a

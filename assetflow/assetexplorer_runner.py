@@ -406,13 +406,13 @@ _ASSET_CONSUMED = {
 def _custom_column(key: str, label_map: Dict[str, str], used: set) -> str:
     """Column name for a swept custom key.
 
-    A UDF key with a known friendly label (from AssetExplorer metadata /
-    AE_UDF_LABELS) becomes that label so the column reads "BCM Rating" instead of
-    "custom.udf_pick_8909"; otherwise it stays ``custom.<key>``. Names are kept
-    unique so a UDF label never silently collides with a system column.
+    Every custom field keeps the ``custom.`` prefix so it is always distinguishable
+    from the system columns: a UDF with a known friendly label (from AssetExplorer
+    metadata / AE_UDF_LABELS) reads ``custom.BCM Rating``; an unlabeled one stays
+    ``custom.udf_pick_8909``. Names are kept unique so two labels can't collide.
     """
-    label = label_map.get(key)
-    name = label if label else f"{CUSTOM_PREFIX}{key}"
+    label = label_map.get(key) or key
+    name = f"{CUSTOM_PREFIX}{label}"
     if name in used:
         name = f"{name} ({key})"
     used.add(name)
