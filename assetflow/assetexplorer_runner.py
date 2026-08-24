@@ -113,6 +113,14 @@ def _udf_label_overrides() -> Dict[str, str]:
     """
     raw = (os.getenv("AE_UDF_LABELS") or "").strip()
     if not raw:
+        # Convention: auto-load a labels file if one is present, so a site can just
+        # drop it in place without setting AE_UDF_LABELS. (.example is not loaded.)
+        for cand in ("config/assetexplorer_udf_labels.json",
+                     "assetexplorer_udf_labels.json"):
+            if os.path.isfile(cand):
+                raw = "@" + cand
+                break
+    if not raw:
         return {}
     try:
         if raw.startswith("@"):
