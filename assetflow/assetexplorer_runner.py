@@ -140,6 +140,35 @@ def _result(columns: List[str], rows: List[List[Any]], limit: Optional[int]) -> 
     return QueryResult(columns=[{"name": c} for c in columns], rows=rows)
 
 
+def _first_adapter(asset: Dict[str, Any]) -> Dict[str, Any]:
+    """The first network adapter of an asset, or ``{}``.
+
+    The per-asset shape nests IP / MAC under ``network_adapters`` (a list of
+    ``{ip_address, mac_address}``); the list endpoint flattens IP into
+    ``ip_addresses``. Both are read (see ``_ip`` / ``_mac``).
+    """
+    na = asset.get("network_adapters")
+    if isinstance(na, list):
+        for item in na:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def _ip(asset: Dict[str, Any]) -> str:
+    """Asset IP — the flattened ``ip_addresses`` / ``ip_address`` field, falling
+    back to the first network adapter's ``ip_address``."""
+    val = textish(_pick(asset, "ip_address", "ip_addresses", "ipaddress"))
+    return val or textish(_first_adapter(asset).get("ip_address"))
+
+
+def _mac(asset: Dict[str, Any]) -> str:
+    """Asset MAC — the top-level ``mac_address`` field, falling back to the first
+    network adapter's ``mac_address``."""
+    val = textish(_pick(asset, "mac_address", "macaddress"))
+    return val or textish(_first_adapter(asset).get("mac_address"))
+
+
 def _product_type(asset: Dict[str, Any]) -> str:
     """The asset's product type — the fine category that buckets it into an asset
     type (Servers / Routers / Switches / Access Points / …).
@@ -170,8 +199,8 @@ _ASSET_SPEC: Tuple[Tuple[str, Any], ...] = (
     ("resource.type", lambda a: _name(_pick(a, "type", "asset_category"))),
     ("asset.category", lambda a: _name(_pick(a, "category", "asset_category"))),
     ("asset.state", lambda a: _name(_pick(a, "state", "asset_state"))),
-    ("host.ip", lambda a: textish(_pick(a, "ip_address", "ip_addresses", "ipaddress"))),
-    ("mac", lambda a: textish(_pick(a, "mac_address", "macaddress"))),
+    ("host.ip", _ip),
+    ("mac", _mac),
     ("os", lambda a: _name(_pick(a, "operating_system", "os"))),
     ("product", lambda a: _name(_pick(a, "product"))),
     ("vendor", lambda a: _name(_pick(a, "vendor", "manufacturer"))),
@@ -201,7 +230,7 @@ _ASSET_CONSUMED = {
     "id", "name", "udf_fields",
     "asset_tag", "assettag", "type", "asset_category", "category",
     "state", "asset_state", "ip_address", "ip_addresses", "ipaddress",
-    "mac_address", "macaddress", "operating_system", "os",
+    "network_adapters", "mac_address", "macaddress", "operating_system", "os",
     "product", "product_type", "vendor", "manufacturer",
     "serial_number", "serialnumber", "serial_no", "barcode",
     "department", "dept", "site", "location", "region",

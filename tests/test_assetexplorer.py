@@ -152,6 +152,32 @@ def test_assets_product_type_from_nested_or_direct():
     assert rows["rtr01"]["asset.type"] == "Routers"     # direct on the asset
 
 
+def test_ip_from_ip_addresses_and_network_adapters():
+    """On-prem shapes: the list endpoint returns `ip_addresses` (comma string);
+    the per-asset shape nests IP/MAC under `network_adapters`."""
+    listing = {"name": "a1", "product_type": {"name": "Servers"},
+               "ip_addresses": "10.0.0.5, 10.0.0.6"}
+    nested = {"name": "a2", "product_type": {"name": "Routers"},
+              "network_adapters": [{"ip_address": "10.0.0.9",
+                                    "mac_address": "28-c7-ce-88-4b-c1"}]}
+    result = ae_runner_mod.run_query(
+        FakeClient(list_rules={"assets": [listing, nested]}), _q("assets"))
+    rows = {r[0]: dict(zip(result.column_names, r)) for r in result.rows}
+    assert rows["a1"]["host.ip"] == "10.0.0.5, 10.0.0.6"
+    assert rows["a2"]["host.ip"] == "10.0.0.9"
+    assert rows["a2"]["mac"] == "28-c7-ce-88-4b-c1"
+
+
+def test_udf_pick_field_swept_to_custom():
+    """A pick-list UDF (e.g. udf_pick_8919 "Network type") rides along as custom.*."""
+    asset = {"name": "a", "product_type": {"name": "Routers"},
+             "udf_fields": {"udf_pick_8919": "CDN"}}
+    result = ae_runner_mod.run_query(
+        FakeClient(list_rules={"assets": [asset]}), _q("assets"))
+    d = dict(zip(result.column_names, result.rows[0]))
+    assert d["custom.udf_pick_8919"] == "CDN"
+
+
 def test_epoch_millis_fallback_without_display_value():
     """A date object with only an epoch-ms value converts to ISO."""
     asset = {"name": "x", "product_type": {"name": "Servers"},
@@ -283,6 +309,15 @@ def test_check_status_accepts_list_form():
     c = _client()
     ok = {"response_status": [{"status_code": 2000}], "assets": [{"id": "1"}]}
     assert c._check_status(ok) is ok
+
+
+def test_check_status_accepts_200_and_status_success():
+    """Some on-prem releases signal success with status_code 200 or status=success."""
+    c = _client()
+    ok200 = {"response_status": {"status_code": 200}, "assets": []}
+    assert c._check_status(ok200) is ok200
+    ok_str = {"response_status": {"status": "success"}, "assets": []}
+    assert c._check_status(ok_str) is ok_str
 
 
 def test_extract_list_by_key_and_fallback():

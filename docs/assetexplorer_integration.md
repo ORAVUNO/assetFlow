@@ -216,6 +216,35 @@ extraction, pagination, URL building, credential validation) plus the adapter
 wiring (kind registration, `connect_form` token mapping, `env_for_form`). No live
 AssetExplorer is contacted — a `FakeClient` answers from canned rules.
 
+## On-premises: confirmed behavior
+
+Verified against a live on-prem instance (`https://<host>:8443`, an
+AssetExplorer 6.x deployment):
+
+- **Base URL** `https://<host>:8443` — HTTPS on a **custom port**. The client
+  honors the scheme + port (`scheme_of` / `clean_host`); on-prem hosts that run
+  plain HTTP work too (`AE_HOST=http://host:8080`).
+- **Endpoint** `GET /api/v3/assets` — same v3 path as Cloud.
+- **Auth header** `authtoken: <technician key>` (the client also sends
+  `TECHNICIAN_KEY` for older builds; both are harmless).
+- **Paging** `input_data={"list_info": {row_count, start_index, sort_field,
+  sort_order, fields_required}}`, following `list_info.has_more_rows`.
+- **IP field** the list endpoint returns **`ip_addresses`** (a comma-separated
+  string); the per-asset shape nests IP/MAC under **`network_adapters[]`**
+  (`{ip_address, mac_address}`). `_ip` / `_mac` read both.
+- **Custom fields** live under **`udf_fields`**, keyed by `udf_*` api names —
+  including pick lists like `udf_pick_8919` ("Network type"). All are swept into
+  `custom.*`.
+- **`product`** is a controlled list; in this estate its values are exactly
+  `Server`, `Routers`, `Switches`, `Firewall`, `Access Points` — the same names
+  the asset-type buckets match on.
+- **Owner** is the **`user`** field (the API rejects `owner` / `asset_owner`);
+  **`location`** is a plain string. `department` / `user` are only populated when
+  the asset state mandates ownership (e.g. *In Use*).
+- **Success envelope** accepts `response_status.status_code` of **2000 or 200**
+  (and a `status` of `"success"`); a `status_code` of `7001` signals the
+  asset/license limit.
+
 ## API references
 
 - [AssetExplorer Cloud v3 REST API](https://www.manageengine.com/products/asset-explorer/aecloud-v3-api/)

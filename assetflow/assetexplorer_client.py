@@ -280,8 +280,8 @@ class AssetExplorerClient:
 
         AssetExplorer wraps every reply with ``response_status`` and — like many
         ManageEngine APIs — often returns HTTP 200 even for API errors, signalling
-        failure only through ``status_code`` (2000 = success). So the envelope is
-        always inspected here.
+        failure only through ``status_code`` (2000, and 200 on some on-prem
+        releases, = success). So the envelope is always inspected here.
         """
         if not isinstance(payload, dict):
             return payload
@@ -290,8 +290,12 @@ class AssetExplorerClient:
         if isinstance(status, list):
             status = status[0] if status else None
         if isinstance(status, dict):
+            # An explicit success status short-circuits (some releases send a
+            # "status" of "success" without a 2000 code).
+            if str(status.get("status") or "").lower() == "success":
+                return payload
             code = status.get("status_code")
-            if code not in (None, 2000, "2000"):
+            if code not in (None, 200, 2000, "200", "2000"):
                 messages = status.get("messages")
                 msg = ""
                 if isinstance(messages, list) and messages:
