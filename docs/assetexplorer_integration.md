@@ -245,6 +245,33 @@ AssetExplorer 6.x deployment):
   (and a `status` of `"success"`); a `status_code` of `7001` signals the
   asset/license limit.
 
+## Matching an AssetExplorer report (row & field parity)
+
+Validated against a real AssetExplorer report export (8,059 assets) vs. the
+adapter's `assets` pull, which revealed — and this section's features close —
+three gaps:
+
+- **Disposed assets.** The `/api/v3/assets` list endpoint omits disposed /
+  retired assets by default (the report included 1,128 of them; `8059 − 1128`
+  was exactly what the adapter returned). `_fetch_assets` now also fetches the
+  `AE_DISPOSED_STATES` (default `Disposed, Expired, Retired`) via a state
+  `search_criteria` and merges them, deduped by id, so counts match. Disable with
+  `AE_INCLUDE_DISPOSED=false`.
+- **Sparse default projection.** The list endpoint returns only a default field
+  set — so serial, MAC, OS, category, and dates came back empty even though the
+  data exists. The adapter now sends a broad `fields_required` projection
+  (`_DEFAULT_ASSET_FIELDS`, override with `AE_ASSET_FIELDS`); a rejected field
+  name makes the fetch retry without the projection. Serial in particular is read
+  from `org_serial_number` (where this estate keeps it). Note: costs, "Associated
+  To", and "Loan Start/End" are genuinely empty in the source report too — not a
+  fetch gap.
+- **Unreadable custom fields.** UDF columns came through as raw api names
+  (`custom.udf_pick_8909`). The adapter now resolves a UDF api_name → label map —
+  best-effort from AssetExplorer field metadata, overridden by `AE_UDF_LABELS`
+  (inline JSON or `@file`) — and renames the columns (`BCM Rating`, `Network
+  type`, …). UDF labels are deployment-specific; a recovered example map ships at
+  `config/assetexplorer_udf_labels.example.json`.
+
 ## API references
 
 - [AssetExplorer Cloud v3 REST API](https://www.manageengine.com/products/asset-explorer/aecloud-v3-api/)
