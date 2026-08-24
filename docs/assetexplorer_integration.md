@@ -248,15 +248,14 @@ AssetExplorer 6.x deployment):
 ## Matching an AssetExplorer report (row & field parity)
 
 Validated against a real AssetExplorer report export (8,059 assets) vs. the
-adapter's `assets` pull, which revealed — and this section's features close —
-three gaps:
+adapter's `assets` pull:
 
-- **Disposed assets.** The `/api/v3/assets` list endpoint omits disposed /
-  retired assets by default (the report included 1,128 of them; `8059 − 1128`
-  was exactly what the adapter returned). `_fetch_assets` now also fetches the
-  `AE_DISPOSED_STATES` (default `Disposed, Expired, Retired`) via a state
-  `search_criteria` and merges them, deduped by id, so counts match. Disable with
-  `AE_INCLUDE_DISPOSED=false`.
+- **Disposed assets (intentionally excluded).** The `/api/v3/assets` list
+  endpoint omits disposed / retired assets by default (the report included 1,128
+  of them; `8059 − 1128` was exactly what the adapter returned). The adapter
+  returns the **live** inventory the endpoint exposes and does not chase disposed
+  assets — the AE report reads the database directly, which is where disposed
+  assets live.
 - **Sparse default projection.** The list endpoint returns only a default field
   set — so serial, MAC, OS, category, and dates came back empty even though the
   data exists. The adapter now sends a broad `fields_required` projection

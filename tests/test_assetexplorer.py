@@ -191,7 +191,6 @@ def test_udf_labels_rename_columns(monkeypatch):
     """AE_UDF_LABELS renames custom.udf_* columns to friendly labels."""
     monkeypatch.setenv("AE_UDF_LABELS",
                        '{"udf_pick_8909": "BCM Rating", "udf_pick_8919": "Network type"}')
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     asset = {"name": "a", "product_type": {"name": "Routers"},
              "udf_fields": {"udf_pick_8909": "BC", "udf_pick_8919": "CDN",
                             "udf_sline_9999": "raw"}}
@@ -209,7 +208,6 @@ def test_udf_labels_rename_columns(monkeypatch):
 def test_udf_labels_autoload_from_file(monkeypatch, tmp_path):
     """With no AE_UDF_LABELS env, a labels file on the conventional path is loaded."""
     monkeypatch.delenv("AE_UDF_LABELS", raising=False)
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     monkeypatch.chdir(tmp_path)
     cfg = tmp_path / "config"
     cfg.mkdir()
@@ -238,7 +236,6 @@ def test_example_udf_label_map_is_complete():
 
 def test_unresolvable_labels_path_falls_back_to_autoload(monkeypatch, tmp_path):
     """A set-but-broken AE_UDF_LABELS @path doesn't block the auto-load file."""
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     monkeypatch.setenv("AE_UDF_LABELS", "@/does/not/exist.json")  # unresolvable
     monkeypatch.chdir(tmp_path)
     cfg = tmp_path / "config"
@@ -255,7 +252,6 @@ def test_unresolvable_labels_path_falls_back_to_autoload(monkeypatch, tmp_path):
 def test_label_cache_not_stuck_empty(monkeypatch, tmp_path):
     """An empty label result isn't cached, so a labels file added after the first
     fetch is picked up on the next one without reconnecting."""
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     monkeypatch.setenv("AE_UDF_LABELS", "none")   # disabled on first fetch
     monkeypatch.chdir(tmp_path)
     client = FakeClient(list_rules={"assets": [
@@ -271,7 +267,6 @@ def test_label_cache_not_stuck_empty(monkeypatch, tmp_path):
 
 
 def test_serial_from_org_serial_number(monkeypatch):
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     asset = {"name": "a", "product_type": {"name": "Access Points"},
              "org_serial_number": "FCW2117JJZ3"}
     result = ae_runner_mod.run_query(
@@ -279,39 +274,6 @@ def test_serial_from_org_serial_number(monkeypatch):
     d = dict(zip(result.column_names, result.rows[0]))
     assert d["serial.number"] == "FCW2117JJZ3"
     assert "custom.org_serial_number" not in result.column_names
-
-
-class _StateFilterClient:
-    """Returns disposed assets only when a state search_criteria is applied —
-    mirroring how the list endpoint hides disposed assets by default."""
-    host, portal, api_key = "h", "", "k"
-
-    def get(self, path, input_data=None):
-        raise RuntimeError("no metadata")
-
-    def list(self, path, resource_key, *, list_info=None, **kw):
-        info = list_info or {}
-        sc = info.get("search_criteria")
-        if sc:
-            if sc.get("value") == "Disposed":
-                return [{"id": "D1", "name": "disp1", "state": {"name": "Disposed"},
-                         "product_type": {"name": "Workstations"}}]
-            return []  # Expired / Retired: none
-        return [{"id": "A1", "name": "act1", "state": {"name": "Active"},
-                 "product_type": {"name": "Servers"}}]
-
-
-def test_include_disposed_merges(monkeypatch):
-    monkeypatch.delenv("AE_INCLUDE_DISPOSED", raising=False)  # default = on
-    result = ae_runner_mod.run_query(_StateFilterClient(), _q("assets"))
-    names = {r[0] for r in result.rows}
-    assert names == {"act1", "disp1"}                # disposed merged in
-
-
-def test_exclude_disposed_when_disabled(monkeypatch):
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
-    result = ae_runner_mod.run_query(_StateFilterClient(), _q("assets"))
-    assert {r[0] for r in result.rows} == {"act1"}
 
 
 class _PickyFieldsClient:
@@ -328,8 +290,7 @@ class _PickyFieldsClient:
         return [{"id": "1", "name": "x", "product_type": {"name": "Servers"}}]
 
 
-def test_fields_projection_fallback(monkeypatch):
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+def test_fields_projection_fallback():
     result = ae_runner_mod.run_query(_PickyFieldsClient(), _q("assets"))
     assert {r[0] for r in result.rows} == {"x"}       # still returns data
 
@@ -354,7 +315,6 @@ class _CountingClient:
 def test_asset_fetch_cached_across_resources(monkeypatch):
     """A fetch-all runs assets + every bucket; the estate must be scanned once,
     not re-scanned per resource (the cache prevents the timeout storm)."""
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     monkeypatch.setenv("AE_ASSET_CACHE_TTL", "120")
     client = _CountingClient([
         {"id": "1", "name": "s1", "product_type": {"name": "Servers"}},
@@ -366,26 +326,12 @@ def test_asset_fetch_cached_across_resources(monkeypatch):
 
 
 def test_asset_cache_disabled(monkeypatch):
-    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
     monkeypatch.setenv("AE_ASSET_CACHE_TTL", "0")
     client = _CountingClient([{"id": "1", "name": "s1",
                                "product_type": {"name": "Servers"}}])
     ae_runner_mod.run_query(client, _q("assets"))
     ae_runner_mod.run_query(client, _q("servers", category="Servers & Compute"))
     assert client.assets_calls == 2          # no cache -> scanned each time
-
-
-def test_disposed_early_abort_when_filter_ignored(monkeypatch):
-    """If a state filter is ignored (echoes the live set), disposed merging stops
-    after the first extra scan instead of re-scanning for every state."""
-    monkeypatch.delenv("AE_INCLUDE_DISPOSED", raising=False)  # default on
-    monkeypatch.setenv("AE_ASSET_CACHE_TTL", "0")
-    client = _CountingClient([{"id": "1", "name": "s1",
-                               "product_type": {"name": "Servers"}}])
-    result = ae_runner_mod.run_query(client, _q("assets"))
-    # 1 base scan + 1 disposed scan (adds nothing new -> abort), not 1 + 3.
-    assert client.assets_calls == 2
-    assert {r[0] for r in result.rows} == {"s1"}   # no duplicates from the echo
 
 
 class _AbsentEndpointClient:

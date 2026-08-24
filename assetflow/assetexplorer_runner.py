@@ -52,7 +52,7 @@ CUSTOM_PREFIX = "custom."
 
 
 # --------------------------------------------------------------------------- #
-# Fetch configuration (fields projection, disposed assets, UDF labels)
+# Fetch configuration (fields projection, UDF labels)
 # --------------------------------------------------------------------------- #
 
 # The AssetExplorer /api/v3/assets *list* endpoint returns only a default field
@@ -80,27 +80,6 @@ def _asset_fields() -> Optional[List[str]]:
     if override:
         return [f.strip() for f in override.split(",") if f.strip()]
     return list(_DEFAULT_ASSET_FIELDS)
-
-
-def _bool_env(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() not in ("false", "0", "no", "off")
-
-
-def _include_disposed() -> bool:
-    # The list endpoint omits assets in disposed/retired states by default; the
-    # AE report includes them. Default on so counts match the report; disable
-    # with AE_INCLUDE_DISPOSED=false.
-    return _bool_env("AE_INCLUDE_DISPOSED", True)
-
-
-def _disposed_states() -> List[str]:
-    override = (os.getenv("AE_DISPOSED_STATES") or "").strip()
-    if override:
-        return [s.strip() for s in override.split(",") if s.strip()]
-    return ["Disposed", "Expired", "Retired"]
 
 
 def _resolve_labels_path(path: str) -> Optional[str]:
@@ -532,23 +511,17 @@ def _matches_bucket(product_type: str, keywords: Tuple[str, ...]) -> bool:
 # Per-resource collectors → (columns, rows)
 # --------------------------------------------------------------------------- #
 
-def _asset_id(asset: Dict[str, Any]) -> Any:
-    return asset.get("id") if isinstance(asset, dict) else None
-
-
-def _list_assets(client, list_info: Optional[dict], fields: Optional[List[str]]):
-    """One ``/api/v3/assets`` list call with an optional field projection.
+def _list_assets(client, fields: Optional[List[str]]):
+    """Page ``/api/v3/assets`` with an optional field projection.
 
     If the projection makes the request fail (a field name a release rejects),
     it retries once without the projection so the fetch still returns data."""
-    info = dict(list_info or {})
-    if fields:
-        info["fields_required"] = fields
+    info = {"fields_required": fields} if fields else None
     try:
-        return client.list("assets", "assets", list_info=info or None)
+        return client.list("assets", "assets", list_info=info)
     except Exception:
         if fields:  # the projection may be the culprit — retry without it
-            return client.list("assets", "assets", list_info=(list_info or None))
+            return client.list("assets", "assets")
         raise
 
 
@@ -567,15 +540,14 @@ def _asset_cache_ttl() -> int:
 
 
 def _fetch_assets(client) -> List[Dict[str, Any]]:
-    """The full asset inventory (``GET /api/v3/assets``, paged), cached per run.
+    """The full (live) asset inventory (``GET /api/v3/assets``, paged), cached per run.
 
     Requests a broad ``fields_required`` projection so relational fields (serial,
     MAC, OS, category, dates) are populated rather than left empty by the list
-    endpoint's sparse default. When ``AE_INCLUDE_DISPOSED`` is on (default), also
-    fetches the disposed/retired states the list omits by default and merges them
-    (deduped by id), so the count matches the AssetExplorer report. The whole
-    result is cached briefly on the client so the buckets in a "fetch all" reuse
-    one scan instead of re-scanning the estate per resource.
+    endpoint's sparse default. Returns the assets the list endpoint exposes —
+    disposed/retired assets, which the endpoint omits, are not chased. The result
+    is cached briefly on the client so the buckets in a "fetch all" reuse one scan
+    instead of re-scanning the estate per resource.
     """
     ttl = _asset_cache_ttl()
     now = time.time()
@@ -584,32 +556,7 @@ def _fetch_assets(client) -> List[Dict[str, Any]]:
         if cache and (now - cache[0]) < ttl:
             return cache[1]
 
-    fields = _asset_fields()
-    assets = _list_assets(client, None, fields)
-    if _include_disposed():
-        seen = {_asset_id(a) for a in assets}
-        for state in _disposed_states():
-            info = {"search_criteria": {"field": "state.name", "condition": "is",
-                                        "value": state}}
-            try:
-                extra = _list_assets(client, info, fields)
-            except Exception:  # pragma: no cover - state filter support varies
-                continue
-            added = 0
-            for a in extra:
-                aid = _asset_id(a)
-                # dedupe by id; when id is missing fall back to name so a state
-                # filter that is silently ignored can't re-add the default set.
-                marker = aid if aid is not None else ("name:" + textish(a.get("name")))
-                if marker not in seen:
-                    seen.add(marker)
-                    assets.append(a)
-                    added += 1
-            # A state filter that returns rows but adds nothing new was ignored by
-            # this build (it echoed the live set) — the API can't reach disposed
-            # this way, so stop rather than repeat full scans for each state.
-            if extra and added == 0:
-                break
+    assets = _list_assets(client, _asset_fields())
 
     if ttl > 0:
         try:
