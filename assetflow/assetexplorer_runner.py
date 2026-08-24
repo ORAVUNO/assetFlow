@@ -103,6 +103,24 @@ def _disposed_states() -> List[str]:
     return ["Disposed", "Expired", "Retired"]
 
 
+def _resolve_labels_path(path: str) -> Optional[str]:
+    """Resolve a labels-file path against the cwd and the repo root.
+
+    The web server is not always started from the repo root, so a relative path
+    (an ``@config/…`` env value, or the auto-load convention) is searched under
+    both the current directory and the package's parent, like the registry loader.
+    """
+    from pathlib import Path
+    p = Path(path)
+    if p.is_absolute():
+        return str(p) if p.is_file() else None
+    for root in (Path.cwd(), Path(__file__).resolve().parent.parent):
+        cand = root / p
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
 def _udf_label_overrides() -> Dict[str, str]:
     """UDF api_name -> friendly label, from AE_UDF_LABELS.
 
@@ -117,14 +135,15 @@ def _udf_label_overrides() -> Dict[str, str]:
         # drop it in place without setting AE_UDF_LABELS. (.example is not loaded.)
         for cand in ("config/assetexplorer_udf_labels.json",
                      "assetexplorer_udf_labels.json"):
-            if os.path.isfile(cand):
+            if _resolve_labels_path(cand):
                 raw = "@" + cand
                 break
     if not raw:
         return {}
     try:
         if raw.startswith("@"):
-            with open(raw[1:], encoding="utf-8") as fh:
+            resolved = _resolve_labels_path(raw[1:]) or raw[1:]
+            with open(resolved, encoding="utf-8") as fh:
                 data = json.load(fh)
         else:
             data = json.loads(raw)
