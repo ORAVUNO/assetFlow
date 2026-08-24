@@ -948,6 +948,8 @@ INDEX_HTML = r"""<!doctype html>
     <label id="f_basepath" class="hidden">API base path <input type="text" id="c_basepath" value="/securetrack/api" style="min-width:160px"/></label>
     <label>Username <input type="text" id="c_user" autocomplete="off" placeholder="elastic"/></label>
     <label>Password <input type="password" id="c_pass" autocomplete="off"/></label>
+    <label id="f_aesecret" class="hidden">Client secret <input type="password" id="c_aesecret" autocomplete="off" style="min-width:150px"/></label>
+    <label id="f_aekey" class="hidden">API key <input type="password" id="c_aekey" autocomplete="off" style="min-width:150px"/></label>
     <label>Timeout (s) <input type="text" id="c_timeout" value="60" style="min-width:80px"/></label>
     <label class="chk"><input type="checkbox" id="c_verify" checked/> Verify TLS certificate</label>
     <label class="chk"><input type="checkbox" id="c_remember"/> Remember on this machine</label>
@@ -1004,7 +1006,8 @@ const KIND_LOGO={
   tufin:{bg:'#12b886',fg:'#ffffff',txt:'T'},
   vmware:{bg:'#607d8b',fg:'#ffffff',txt:'vm'},
   solarwinds:{bg:'#f7941e',fg:'#1c1e24',txt:'SW'},
-  tenable_sc:{bg:'#00447c',fg:'#ffffff',txt:'sc'}
+  tenable_sc:{bg:'#00447c',fg:'#ffffff',txt:'sc'},
+  assetexplorer:{bg:'#c1272d',fg:'#ffffff',txt:'AE'}
 };
 function kindMeta(kind){return KIND_LOGO[kind]||{bg:'#8a8f98',fg:'#ffffff',txt:String(kind||'?').slice(0,2)};}
 function kindName(kind){const k=(KINDS||[]).find(x=>x.kind===kind);return k?k.name:(kind||'');}
@@ -1390,14 +1393,39 @@ function applyKind(kind){
   const vmware = (kind==='vmware');
   const solarwinds = (kind==='solarwinds');
   const tenable_sc = (kind==='tenable_sc');
-  // Tufin uses an API base path; Elasticsearch, VMware, and SolarWinds use a
-  // port; Tenable.sc uses neither (fixed https://host/rest).
-  document.getElementById('f_port').classList.toggle('hidden', tufin||tenable_sc);
-  document.getElementById('f_basepath').classList.toggle('hidden', !tufin);
+  const assetexplorer = (kind==='assetexplorer');
+  // Tufin uses an API base path; AssetExplorer reuses that field as its portal;
+  // Elasticsearch, VMware, and SolarWinds use a port; Tenable.sc / AssetExplorer
+  // use neither port.
+  document.getElementById('f_port').classList.toggle('hidden', tufin||tenable_sc||assetexplorer);
+  document.getElementById('f_basepath').classList.toggle('hidden', !tufin && !assetexplorer);
+  // AssetExplorer's OAuth client-secret / on-prem API-key fields ride only for it.
+  document.getElementById('f_aesecret').classList.toggle('hidden', !assetexplorer);
+  document.getElementById('f_aekey').classList.toggle('hidden', !assetexplorer);
+  // The base-path field is labeled "API base path" for Tufin and "Portal" for
+  // AssetExplorer; relabel its text node to match the current kind.
+  document.getElementById('f_basepath').childNodes[0].nodeValue =
+    assetexplorer ? 'Portal ' : 'API base path ';
   // The (hidden) base-path field defaults to Tufin's value; clear it for kinds
   // that don't use it so it isn't sent as a stray API prefix.
   if(!tufin) document.getElementById('c_basepath').value='';
   const remember='Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). ';
+  if(assetexplorer){
+    document.getElementById('c_host').placeholder = 'assetexplorer.example.com  ·  sdpondemand.manageengine.com';
+    document.getElementById('c_basepath').placeholder = 'itdesk (Cloud portal; leave blank on-prem)';
+    document.getElementById('c_user').placeholder = 'OAuth client id (Cloud; blank on-prem)';
+    document.getElementById('c_timeout').value = '60';
+    document.getElementById('c_hint').innerHTML = remember+
+      'Connects to the ManageEngine AssetExplorer v3 REST API. <b>Cloud:</b> set the '+
+      'service domain, the <code>Portal</code>, and OAuth — paste a current access token '+
+      'into <code>Password</code>, or a long-lived <code>refresh token</code> into Password '+
+      'with the <code>client id</code> (Username) and <code>Client secret</code> so tokens '+
+      'auto-renew. <b>On-prem:</b> leave Portal blank and paste the technician <code>API key</code>. '+
+      'Fetches the full asset inventory bucketed into asset types (servers, routers, switches, '+
+      'access points, …) with default + custom (<code>custom.</code>) fields, plus CMDB, '+
+      'contracts, and purchase orders.';
+    return;
+  }
   if(tenable_sc){
     document.getElementById('c_host').placeholder = 'tenable-sc.example.com  ·  10.0.0.30';
     document.getElementById('c_user').placeholder = 'security-manager';
@@ -2371,6 +2399,12 @@ async function connect(){
   const body={host:val('c_host'),port:val('c_port'),username:val('c_user'),
               password:document.getElementById('c_pass').value||'',
               base_path:val('c_basepath'),
+              // AssetExplorer: portal (base_path), OAuth client id (username),
+              // client secret, and on-prem API key. Harmless/ignored for others.
+              portal:val('c_basepath'),
+              client_id:val('c_user'),
+              client_secret:document.getElementById('c_aesecret').value||'',
+              api_key:document.getElementById('c_aekey').value||'',
               verify_certs:document.getElementById('c_verify').checked,
               remember:document.getElementById('c_remember').checked,
               request_timeout:parseInt(val('c_timeout'))||60};

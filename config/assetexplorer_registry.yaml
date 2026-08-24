@@ -1,0 +1,594 @@
+# =============================================================================
+# ManageEngine AssetExplorer Asset Intelligence Registry
+# =============================================================================
+# Resource registry for the AssetExplorer adapter. Where the Elasticsearch registry
+# carries ES|QL query bodies, each entry here names a `resource` that the
+# AssetExplorer runner maps to one or more v3 REST calls and normalizes into the
+# same column/row shape (see assetflow/assetexplorer_runner.py).
+#
+# Everything is read over the AssetExplorer v3 REST API (see
+# assetflow/assetexplorer_client.py):
+#   - GET /api/v3/assets                 -> the full asset inventory (one row per
+#                                           asset, default fields + UDF custom fields)
+#   - GET /api/v3/cmdb/{ci_type}         -> CMDB configuration items, per CI type
+#   - GET /api/v3/contracts              -> maintenance / lease / warranty contracts
+#   - GET /api/v3/purchase_orders        -> purchase orders
+#   - GET /api/v3/asset_types, /products -> the product-type / product catalog
+# Every list endpoint uses the same input_data / list_info paging contract and the
+# {response_status, list_info, <resource>} envelope.
+#
+# Authentication is an OAuth access token (AssetExplorer Cloud — Zoho-oauthtoken;
+# a refresh token mints access tokens on demand) or an on-prem technician API key.
+#
+# Asset types (asked for by the integration):
+#   - The `assets` resource returns every asset, with asset.type carrying the
+#     asset's *product type* (Servers / Routers / Switches / Access Points / …).
+#   - The per-asset-type resources (servers, routers, switches, access_points, …)
+#     return the same rows bucketed by product type, so each asset lands in its
+#     respective asset type as the report does.
+#
+# Custom fields (asked for by the integration):
+#   - Every udf_fields entry (the site's custom fields) and any other unmapped
+#     field AssetExplorer returns is emitted under a `custom.` prefix, so extra
+#     fields are captured, never dropped, and never confused with system fields.
+#
+# Status meanings match the other registries:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Endpoint + field names follow AssetExplorer's v3 API
+#                              docs; mapping is best-effort and needs confirming
+#                              against a live deployment.
+#   - investigation_required : Endpoint exists but response shape / availability
+#                              varies by AssetExplorer version or CI-type config.
+#   - not_validated          : Not exercised against live data (placeholders).
+# =============================================================================
+
+metadata:
+  version: 1
+  description: >-
+    ManageEngine AssetExplorer asset intelligence — the full asset inventory
+    (default fields + custom UDF fields) bucketed into its asset types (servers,
+    workstations, routers, switches, firewalls, access points, printers, storage,
+    UPS, …), the CMDB configuration items, contracts, and purchase orders — over
+    the AssetExplorer v3 REST API. Every asset's UDF and unmapped fields ride along
+    under a `custom.` prefix.
+  query_language: AssetExplorer v3 REST API (input_data / list_info paging)
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Asset Inventory
+    - Servers & Compute
+    - Network Devices
+    - End-User Devices
+    - Peripherals & Facilities
+    - CMDB
+    - Contracts
+    - Purchase
+    - Catalog
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+feeds:
+  - id: FEED-AE-INVENTORY
+    name: Asset Inventory
+    category: Asset Inventory
+    description: Every asset AssetExplorer tracks, with its default fields (name, IP, state, product, vendor, site, department, user, serial, costs, dates) and every custom (UDF) field, keyed to its product type.
+    query_ids: [AE001]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AE-SERVERS
+    name: Servers & Compute
+    category: Servers & Compute
+    description: Assets bucketed into the compute asset types — servers, workstations, virtual machines, and clusters.
+    query_ids: [AE002, AE003, AE004, AE005]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AE-NETWORK
+    name: Network Devices
+    category: Network Devices
+    description: Assets bucketed into the network asset types — routers, switches, firewalls, access points, and the combined network-devices view.
+    query_ids: [AE006, AE007, AE008, AE009, AE013]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AE-ENDUSER
+    name: End-User Devices
+    category: End-User Devices
+    description: Assets bucketed into the end-user asset types — mobile devices.
+    query_ids: [AE014]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AE-PERIPHERALS
+    name: Peripherals & Facilities
+    category: Peripherals & Facilities
+    description: Assets bucketed into peripheral / facility asset types — printers, storage devices, and UPS units.
+    query_ids: [AE010, AE011, AE012]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AE-CMDB
+    name: CMDB
+    category: CMDB
+    description: CMDB configuration items across the configured CI types, each stamped with its CI type.
+    query_ids: [AE015]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AE-CONTRACTS
+    name: Contracts
+    category: Contracts
+    description: Maintenance, lease, and warranty contracts with vendor, cost, and start / end / notify dates.
+    query_ids: [AE016]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-AE-PURCHASE
+    name: Purchase
+    category: Purchase
+    description: Purchase orders with vendor, status, totals, and order / expected-delivery dates.
+    query_ids: [AE017]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-AE-CATALOG
+    name: Catalog
+    category: Catalog
+    description: The product-type / asset-type and product catalog that categorizes assets.
+    query_ids: [AE018, AE019]
+    recommended_refresh_frequency: Weekly
+
+# =============================================================================
+# QUERIES (resources)
+# =============================================================================
+queries:
+  - id: AE001
+    category: Asset Inventory
+    name: All Assets
+    status: partially_validated
+    validated: false
+    resource: assets
+    purpose: >-
+      Inventory every asset AssetExplorer tracks, one row per asset, with its
+      default fields — name, IP, state, product, vendor, site, department, assigned
+      user, serial number, barcode, acquisition / expiry dates, and costs — plus
+      every site-specific custom (UDF) field under custom.*. asset.type carries the
+      asset's product type so it folds into the unified inventory as the right type.
+    expected_output_fields:
+      - host.name          # asset name (folds into unified inventory)
+      - asset.type         # product type (Servers / Routers / Access Points / …)
+      - asset.tag          # asset_tag
+      - resource.type      # type (Asset / Software / …)
+      - asset.category     # category
+      - asset.state        # state.name (In Use / In Store / …)
+      - host.ip            # ip_address
+      - mac                # mac_address
+      - os                 # operating_system.name
+      - product            # product.name
+      - vendor             # vendor.name
+      - serial.number      # serial_number
+      - barcode            # barcode
+      - department         # department.name
+      - site               # site.name
+      - location           # location.name
+      - region             # region.name
+      - assigned.user      # user.name (assigned to)
+      - technical.owner    # managed_by / asset_owner
+      - acquisition.date   # acquisition_date (epoch-ms -> ISO)
+      - expiry.date        # warranty_expiry / expiry_date
+      - purchase.cost      # purchase_cost
+      - total.cost         # total_cost
+      - operational.cost   # operational_cost
+      - current.cost       # current_cost (current book value)
+      - last.audit         # last_audit_on / last_scan
+      - created.date       # created_time
+      - updated.date       # last_updated_time
+      - "custom.*"         # every udf_fields entry + any other extra field
+    notes: >-
+      GET /api/v3/assets, paged via input_data.list_info (start_index / row_count,
+      100 per page) until has_more_rows is false. Nested object fields (state,
+      vendor, department, site, user, product, product_type) are reduced to their
+      name; date fields are read from the {value, display_value} object (epoch
+      milliseconds -> ISO). Every udf_fields entry rides along as custom.<udf_name>
+      and any other extra scalar field as custom.<key>. Field names follow the v3
+      API docs and are read with per-release fallbacks; marked partially_validated
+      until confirmed against a live AssetExplorer (the list endpoint returns the
+      Asset-level UDFs; product-type subform fields may need a per-asset GET).
+    recommended_refresh_frequency: Daily
+
+  - id: AE002
+    category: Servers & Compute
+    name: Servers
+    status: partially_validated
+    validated: false
+    resource: servers
+    purpose: >-
+      The assets whose product type is a server (physical servers, Unix servers,
+      mainframes, ESX/blade hosts), with the same default + custom columns as the
+      full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type         # the matched server product type
+      - host.ip
+      - os
+      - product
+      - serial.number
+      - site
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching server keywords
+      (server / mainframe / esx / blade / vcenter). Same flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE003
+    category: Servers & Compute
+    name: Workstations
+    status: partially_validated
+    validated: false
+    resource: workstations
+    purpose: >-
+      The assets whose product type is a workstation / desktop / laptop, with the
+      same default + custom columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - os
+      - assigned.user
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching workstation keywords
+      (workstation / desktop / laptop / notebook / pc). Same flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE004
+    category: Servers & Compute
+    name: Virtual Machines
+    status: partially_validated
+    validated: false
+    resource: virtual_machines
+    purpose: >-
+      The assets whose product type is a virtual machine / virtual server, with the
+      same default + custom columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - os
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching VM keywords (virtual
+      machine / virtual server / vm / guest). Same flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE005
+    category: Servers & Compute
+    name: Clusters
+    status: partially_validated
+    validated: false
+    resource: clusters
+    purpose: >-
+      The assets whose product type is a cluster, with the same default + custom
+      columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching "cluster". Same
+      flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE006
+    category: Network Devices
+    name: Routers
+    status: partially_validated
+    validated: false
+    resource: routers
+    purpose: >-
+      The assets whose product type is a router, with the same default + custom
+      columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - product
+      - vendor
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching "router". Same
+      flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE007
+    category: Network Devices
+    name: Switches
+    status: partially_validated
+    validated: false
+    resource: switches
+    purpose: >-
+      The assets whose product type is a switch, with the same default + custom
+      columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - product
+      - vendor
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching "switch". Same
+      flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE008
+    category: Network Devices
+    name: Firewalls
+    status: partially_validated
+    validated: false
+    resource: firewalls
+    purpose: >-
+      The assets whose product type is a firewall, with the same default + custom
+      columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - product
+      - vendor
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching "firewall". Same
+      flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE009
+    category: Network Devices
+    name: Access Points
+    status: partially_validated
+    validated: false
+    resource: access_points
+    purpose: >-
+      The assets whose product type is a wireless access point, with the same
+      default + custom columns as the full inventory (the sample report's asset type).
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - product
+      - serial.number
+      - site
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching access-point keywords
+      (access point / wireless / wlan / wap). Same flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE010
+    category: Peripherals & Facilities
+    name: Printers
+    status: partially_validated
+    validated: false
+    resource: printers
+    purpose: >-
+      The assets whose product type is a printer / MFP / scanner, with the same
+      default + custom columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - product
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching printer keywords
+      (printer / mfp / scanner / copier). Same flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE011
+    category: Peripherals & Facilities
+    name: Storage Devices
+    status: partially_validated
+    validated: false
+    resource: storage_devices
+    purpose: >-
+      The assets whose product type is a storage device (SAN / NAS / tape / disk
+      array), with the same default + custom columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - product
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching storage keywords
+      (storage / san / nas / tape / disk array). Same flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE012
+    category: Peripherals & Facilities
+    name: UPS
+    status: partially_validated
+    validated: false
+    resource: ups
+    purpose: >-
+      The assets whose product type is a UPS / power unit, with the same default +
+      custom columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching power keywords (ups /
+      power supply / pdu). Same flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE013
+    category: Network Devices
+    name: Network Devices (all)
+    status: partially_validated
+    validated: false
+    resource: network_devices
+    purpose: >-
+      All network-infrastructure assets in one view — routers, switches, firewalls,
+      access points, load balancers, gateways, modems, and other network gear —
+      with the same default + custom columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - host.ip
+      - product
+      - vendor
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching any network keyword.
+      A superset of the individual router / switch / firewall / access-point views.
+    recommended_refresh_frequency: Daily
+
+  - id: AE014
+    category: End-User Devices
+    name: Mobile Devices
+    status: partially_validated
+    validated: false
+    resource: mobile_devices
+    purpose: >-
+      The assets whose product type is a mobile device (phone / tablet), with the
+      same default + custom columns as the full inventory.
+    expected_output_fields:
+      - host.name
+      - asset.type
+      - assigned.user
+      - "custom.*"
+    notes: >-
+      The assets resource filtered to product types matching mobile keywords
+      (mobile / phone / tablet / ipad / iphone / android / smartphone). Same
+      flattening as AE001.
+    recommended_refresh_frequency: Daily
+
+  - id: AE015
+    category: CMDB
+    name: CMDB Configuration Items
+    status: investigation_required
+    validated: false
+    resource: cmdb
+    purpose: >-
+      Inventory the CMDB configuration items across the configured CI types (server,
+      workstation, router, switch, firewall, access point, printer, storage, UPS,
+      network device, database, application, business service, …), each row stamped
+      with its CI type so CIs land in their respective type in the unified inventory.
+    expected_output_fields:
+      - host.name          # CI name
+      - asset.type         # CI type
+      - ci.type            # CI type
+      - host.ip            # ip_address
+      - asset.state        # state / status
+      - site
+      - department
+      - product
+      - serial.number
+      - updated.date
+      - "custom.*"         # every udf_fields entry + any other extra field
+    notes: >-
+      GET /api/v3/cmdb/{ci_type} for each CI type in the configured set (override
+      with AE_CMDB_CI_TYPES). Best-effort: a CI type the deployment does not have
+      simply contributes no rows. Marked investigation_required because CI-type api
+      names and their response shape vary by deployment / CMDB configuration; adjust
+      AE_CMDB_CI_TYPES to your instance's CI types.
+    recommended_refresh_frequency: Daily
+
+  - id: AE016
+    category: Contracts
+    name: Contracts
+    status: partially_validated
+    validated: false
+    resource: contracts
+    purpose: >-
+      List the maintenance / lease / warranty contracts with their type, status,
+      vendor, cost, and start / end / notify dates.
+    expected_output_fields:
+      - host.name          # contract name
+      - asset.type         # constant "Contract"
+      - contract.id        # id
+      - contract.type      # type
+      - status             # status
+      - vendor             # vendor.name
+      - maintenance.vendor # maintenance_vendor.name
+      - owner              # owner.name
+      - cost               # cost
+      - start.date         # active_from / start_date
+      - end.date           # expiry_date / active_to
+      - notify.date        # notify_date
+      - "custom.*"
+    notes: >-
+      GET /api/v3/contracts, paged via input_data.list_info. Field names follow the
+      v3 API docs, read with fallbacks; marked partially_validated until confirmed
+      against a live deployment.
+    recommended_refresh_frequency: Weekly
+
+  - id: AE017
+    category: Purchase
+    name: Purchase Orders
+    status: partially_validated
+    validated: false
+    resource: purchases
+    purpose: >-
+      List the purchase orders with their number, status, vendor, owner, totals, and
+      order / expected-delivery dates.
+    expected_output_fields:
+      - host.name          # PO name / number
+      - asset.type         # constant "Purchase Order"
+      - po.id              # id
+      - po.number          # po_number
+      - status             # status
+      - vendor             # vendor.name
+      - owner              # owner / requester
+      - total.cost         # total_cost / grand_total
+      - ordered.date       # order_date / created_time
+      - expected.date      # expected_delivery_date
+      - "custom.*"
+    notes: >-
+      GET /api/v3/purchase_orders, paged via input_data.list_info. Field names
+      follow the v3 API docs, read with fallbacks; marked partially_validated until
+      confirmed against a live deployment.
+    recommended_refresh_frequency: Weekly
+
+  - id: AE018
+    category: Catalog
+    name: Asset Types
+    status: partially_validated
+    validated: false
+    resource: asset_types
+    purpose: >-
+      The catalog of asset types / product types (Servers, Routers, Access Points,
+      Workstations, …) — the categories the asset inventory is bucketed into — with
+      each type's parent and category.
+    expected_output_fields:
+      - asset.type         # name
+      - type.id            # id
+      - category           # type / category (IT / Non-IT / …)
+      - parent             # parent_asset_type.name
+      - accessibility      # accessibility
+      - "custom.*"
+    notes: >-
+      GET /api/v3/asset_types. This is the catalog the per-asset-type resources
+      bucket assets into. Field names follow the v3 API docs, read with fallbacks.
+    recommended_refresh_frequency: Weekly
+
+  - id: AE019
+    category: Catalog
+    name: Products
+    status: partially_validated
+    validated: false
+    resource: products
+    purpose: >-
+      The product catalog (each product's model, its product type, manufacturer, and
+      part number) — the models assets are instances of.
+    expected_output_fields:
+      - product            # name
+      - product.id         # id
+      - product.type       # product_type.name
+      - category           # type / category
+      - manufacturer       # manufacturer / vendor
+      - part.number        # part_no
+      - "custom.*"
+    notes: >-
+      GET /api/v3/products. Field names follow the v3 API docs, read with fallbacks.
+    recommended_refresh_frequency: Weekly

@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from . import assetexplorer_client as assetexplorer_client_mod
+from . import assetexplorer_runner as assetexplorer_runner_mod
 from . import client as client_mod
 from . import db as db_mod
 from . import runner as runner_mod
@@ -527,6 +529,153 @@ class TenableScAdapter(Adapter):
         )
 
 
+class AssetExplorerAdapter(Adapter):
+    """ManageEngine AssetExplorer source: fetches the full asset inventory —
+    bucketed into its asset types (servers, workstations, routers, switches,
+    firewalls, access points, printers, storage, UPS, …) — plus the CMDB
+    configuration items, contracts, and purchase orders over the AssetExplorer v3
+    REST API. Each asset carries its default fields and every custom (UDF) field
+    under a ``custom.`` prefix."""
+
+    def connect(
+        self,
+        *,
+        host: Optional[str] = None,
+        portal: str = "",
+        access_token: str = "",
+        refresh_token: str = "",
+        client_id: str = "",
+        client_secret: str = "",
+        api_key: str = "",
+        accounts_url: str = "https://accounts.zoho.com",
+        verify_certs: bool = True,
+        request_timeout: int = 60,
+    ) -> dict:
+        candidate = assetexplorer_client_mod.build_client(
+            host=host or "",
+            portal=portal or "",
+            access_token=access_token or "",
+            refresh_token=refresh_token or "",
+            client_id=client_id or "",
+            client_secret=client_secret or "",
+            api_key=api_key or "",
+            accounts_url=accounts_url or "https://accounts.zoho.com",
+            verify_certs=verify_certs,
+            request_timeout=request_timeout,
+        )
+        info = assetexplorer_client_mod.ping(candidate)  # raises on failure
+        self._client = candidate
+        self._conn_info = info
+        return info
+
+    def connect_form(self, form: dict) -> dict:
+        """Resolve the shared connection form into AssetExplorer credentials.
+
+        AssetExplorer has no single username/password: the UI supplies the host,
+        an optional portal (Cloud), and either an OAuth token (the ``password``
+        field doubles as the access token, or the ``api_key`` field carries a
+        refresh token / on-prem technician key) as interpreted below.
+        """
+        # The UI sends OAuth material and the on-prem key under dedicated keys when
+        # present, and falls back to the shared password field for the token.
+        access_token = (form.get("access_token") or "").strip()
+        refresh_token = (form.get("refresh_token") or "").strip()
+        api_key = (form.get("api_key") or "").strip()
+        password = (form.get("password") or "").strip()
+        # A bare token pasted into the password field is treated as an access token
+        # unless client id/secret are also given (then it is the refresh token).
+        client_id = (form.get("client_id") or "").strip()
+        client_secret = (form.get("client_secret") or "").strip()
+        if password and not (access_token or refresh_token or api_key):
+            if client_id and client_secret:
+                refresh_token = password
+            else:
+                access_token = password
+        return self.connect(
+            host=(form.get("host") or form.get("url") or None),
+            portal=(form.get("portal") or form.get("base_path") or ""),
+            access_token=access_token,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            api_key=api_key,
+            accounts_url=(form.get("accounts_url") or "https://accounts.zoho.com"),
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 60)),
+        )
+
+    def try_auto_connect(self) -> bool:
+        try:
+            candidate = assetexplorer_client_mod.build_client_from_env()
+            info = assetexplorer_client_mod.ping(candidate)
+        except Exception:
+            return False
+        self._client = candidate
+        self._conn_info = info
+        return True
+
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "AE_HOST", "AE_PORTAL", "AE_ACCESS_TOKEN", "AE_REFRESH_TOKEN",
+            "AE_CLIENT_ID", "AE_CLIENT_SECRET", "AE_API_KEY",
+            "AE_ACCOUNTS_URL", "AE_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        host = (form.get("host") or form.get("url") or "").strip()
+        env: Dict[str, str] = {
+            "AE_HOST": assetexplorer_client_mod.clean_host(host),
+            "AE_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
+        }
+        portal = (form.get("portal") or form.get("base_path") or "").strip()
+        if portal:
+            env["AE_PORTAL"] = assetexplorer_client_mod.clean_portal(portal)
+        # Persist whichever credential style was supplied.
+        access_token = (form.get("access_token") or "").strip()
+        refresh_token = (form.get("refresh_token") or "").strip()
+        api_key = (form.get("api_key") or "").strip()
+        password = (form.get("password") or "").strip()
+        client_id = (form.get("client_id") or "").strip()
+        client_secret = (form.get("client_secret") or "").strip()
+        if password and not (access_token or refresh_token or api_key):
+            if client_id and client_secret:
+                refresh_token = password
+            else:
+                access_token = password
+        if api_key:
+            env["AE_API_KEY"] = api_key
+        if access_token:
+            env["AE_ACCESS_TOKEN"] = access_token
+        if refresh_token:
+            env["AE_REFRESH_TOKEN"] = refresh_token
+        if client_id:
+            env["AE_CLIENT_ID"] = client_id
+        if client_secret:
+            env["AE_CLIENT_SECRET"] = client_secret
+        accounts_url = (form.get("accounts_url") or "").strip()
+        if accounts_url:
+            env["AE_ACCOUNTS_URL"] = accounts_url
+        return env
+
+    def ping(self) -> dict:
+        if self._client is None:
+            raise assetexplorer_client_mod.AssetExplorerConfigError(
+                "adapter is not connected"
+            )
+        info = assetexplorer_client_mod.ping(self._client)
+        self._conn_info = info
+        return info
+
+    def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
+        if self._client is None:
+            raise assetexplorer_client_mod.AssetExplorerConfigError(
+                "adapter is not connected"
+            )
+        return assetexplorer_runner_mod.run_query(
+            self._client, query, limit=limit, time_range=time_range
+        )
+
+
 @dataclass
 class AdapterKind:
     """A *type* of data source (Elasticsearch, Tufin, …) — the template from
@@ -724,6 +873,26 @@ def available_kinds(registry_path: Optional[str] = None) -> Dict[str, AdapterKin
             ),
             registry=load_registry(tenable_sc_path),
             adapter_cls=TenableScAdapter,
+        )
+
+    assetexplorer_path = _find_registry(
+        "config/assetexplorer_registry.yaml", "assetexplorer_registry.yaml"
+    )
+    if assetexplorer_path:
+        kinds["assetexplorer"] = AdapterKind(
+            kind="assetexplorer",
+            name="ManageEngine AssetExplorer",
+            category="IT Asset Management / CMDB",
+            description=(
+                "ManageEngine AssetExplorer — the full asset inventory bucketed "
+                "into its asset types (servers, workstations, routers, switches, "
+                "firewalls, access points, printers, storage, UPS, …) with all "
+                "default and custom (UDF) fields (extra fields prefixed 'custom.'), "
+                "plus the CMDB configuration items, contracts, and purchase orders "
+                "via the AssetExplorer v3 REST API."
+            ),
+            registry=load_registry(assetexplorer_path),
+            adapter_cls=AssetExplorerAdapter,
         )
     return kinds
 
