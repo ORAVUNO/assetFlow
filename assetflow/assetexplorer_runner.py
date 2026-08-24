@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -501,36 +502,97 @@ def _list_assets(client, list_info: Optional[dict], fields: Optional[List[str]])
         raise
 
 
+def _asset_cache_ttl() -> int:
+    """Seconds an asset fetch is reused across resources in one run.
+
+    A "fetch all" runs every asset-type resource (assets + the ~13 buckets) back
+    to back; without a cache each would re-scan the whole estate, so a big estate
+    would time out partway through the run. Caching the fetch on the client for a
+    short window collapses that to a single scan. Disable with AE_ASSET_CACHE_TTL=0.
+    """
+    try:
+        return int(os.getenv("AE_ASSET_CACHE_TTL") or 120)
+    except (TypeError, ValueError):
+        return 120
+
+
 def _fetch_assets(client) -> List[Dict[str, Any]]:
-    """The full asset inventory (``GET /api/v3/assets``, paged).
+    """The full asset inventory (``GET /api/v3/assets``, paged), cached per run.
 
     Requests a broad ``fields_required`` projection so relational fields (serial,
     MAC, OS, category, dates) are populated rather than left empty by the list
     endpoint's sparse default. When ``AE_INCLUDE_DISPOSED`` is on (default), also
     fetches the disposed/retired states the list omits by default and merges them
-    (deduped by id), so the count matches the AssetExplorer report.
+    (deduped by id), so the count matches the AssetExplorer report. The whole
+    result is cached briefly on the client so the buckets in a "fetch all" reuse
+    one scan instead of re-scanning the estate per resource.
     """
+    ttl = _asset_cache_ttl()
+    now = time.time()
+    if ttl > 0:
+        cache = getattr(client, "_ae_assets_cache", None)
+        if cache and (now - cache[0]) < ttl:
+            return cache[1]
+
     fields = _asset_fields()
     assets = _list_assets(client, None, fields)
-    if not _include_disposed():
-        return assets
-    seen = {_asset_id(a) for a in assets}
-    for state in _disposed_states():
-        info = {"search_criteria": {"field": "state.name", "condition": "is",
-                                    "value": state}}
+    if _include_disposed():
+        seen = {_asset_id(a) for a in assets}
+        for state in _disposed_states():
+            info = {"search_criteria": {"field": "state.name", "condition": "is",
+                                        "value": state}}
+            try:
+                extra = _list_assets(client, info, fields)
+            except Exception:  # pragma: no cover - state filter support varies
+                continue
+            added = 0
+            for a in extra:
+                aid = _asset_id(a)
+                # dedupe by id; when id is missing fall back to name so a state
+                # filter that is silently ignored can't re-add the default set.
+                marker = aid if aid is not None else ("name:" + textish(a.get("name")))
+                if marker not in seen:
+                    seen.add(marker)
+                    assets.append(a)
+                    added += 1
+            # A state filter that returns rows but adds nothing new was ignored by
+            # this build (it echoed the live set) — the API can't reach disposed
+            # this way, so stop rather than repeat full scans for each state.
+            if extra and added == 0:
+                break
+
+    if ttl > 0:
         try:
-            extra = _list_assets(client, info, fields)
-        except Exception:  # pragma: no cover - state filter support varies
-            continue
-        for a in extra:
-            aid = _asset_id(a)
-            # dedupe by id; when id is missing fall back to name so a state
-            # filter that is silently ignored can't re-add the default set.
-            marker = aid if aid is not None else ("name:" + textish(a.get("name")))
-            if marker not in seen:
-                seen.add(marker)
-                assets.append(a)
+            client._ae_assets_cache = (now, assets)
+        except Exception:  # pragma: no cover - client may forbid attributes
+            pass
     return assets
+
+
+def _endpoint_absent(exc: Exception) -> bool:
+    """True when an error looks like "this endpoint isn't on this build".
+
+    On-premises AssetExplorer editions don't all expose every v3 resource
+    (contracts / purchase_orders / asset_types / products / cmdb vary). A missing
+    endpoint should leave that resource empty, not fail the whole fetch — so those
+    collectors treat an absent-endpoint error as no rows.
+    """
+    s = str(exc).lower()
+    return any(tok in s for tok in (
+        "404", "not found", "url_not_found", "no handler", "does not exist",
+        "no such", "resource not found", "4004",
+    ))
+
+
+def _safe_list(client, path: str, resource_key: str) -> List[Dict[str, Any]]:
+    """``client.list`` that returns ``[]`` when the endpoint is absent on this
+    build (see :func:`_endpoint_absent`); other errors still propagate."""
+    try:
+        return client.list(path, resource_key)
+    except Exception as exc:
+        if _endpoint_absent(exc):
+            return []
+        raise
 
 
 def _collect_assets(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
@@ -642,7 +704,7 @@ def _collect_cmdb(client, time_range: Optional[str]) -> Tuple[List[str], List[Li
 
 def _collect_contracts(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Maintenance / lease / warranty contracts (``GET /api/v3/contracts``)."""
-    records = client.list("contracts", "contracts")
+    records = _safe_list(client, "contracts", "contracts")
     lead: List[Tuple[str, Any]] = [
         ("host.name", lambda r: textish(_pick(r, "name", "contract_name"))),
         ("asset.type", lambda r: "Contract"),
@@ -669,7 +731,7 @@ def _collect_contracts(client, time_range: Optional[str]) -> Tuple[List[str], Li
 
 def _collect_purchases(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Purchase orders (``GET /api/v3/purchase_orders``)."""
-    records = client.list("purchase_orders", "purchase_orders")
+    records = _safe_list(client, "purchase_orders", "purchase_orders")
     lead: List[Tuple[str, Any]] = [
         ("host.name", lambda r: textish(_pick(r, "name", "po_name", "po_number"))),
         ("asset.type", lambda r: "Purchase Order"),
@@ -693,7 +755,7 @@ def _collect_purchases(client, time_range: Optional[str]) -> Tuple[List[str], Li
 
 def _collect_asset_types(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """The product-type / asset-type catalog (``GET /api/v3/asset_types``)."""
-    records = client.list("asset_types", "asset_types")
+    records = _safe_list(client, "asset_types", "asset_types")
     lead: List[Tuple[str, Any]] = [
         ("asset.type", lambda r: textish(_pick(r, "name", "display_name"))),
         ("type.id", lambda r: textish(_pick(r, "id"))),
@@ -708,7 +770,7 @@ def _collect_asset_types(client, time_range: Optional[str]) -> Tuple[List[str], 
 
 def _collect_products(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """The product catalog (``GET /api/v3/products``)."""
-    records = client.list("products", "products")
+    records = _safe_list(client, "products", "products")
     lead: List[Tuple[str, Any]] = [
         ("product", lambda r: textish(_pick(r, "name"))),
         ("product.id", lambda r: textish(_pick(r, "id"))),

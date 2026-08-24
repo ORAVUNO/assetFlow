@@ -261,6 +261,89 @@ def test_fields_projection_fallback(monkeypatch):
     assert {r[0] for r in result.rows} == {"x"}       # still returns data
 
 
+class _CountingClient:
+    """Counts how many times the assets list endpoint is scanned."""
+    host, portal, api_key = "h", "", "k"
+
+    def __init__(self, assets):
+        self._assets = assets
+        self.assets_calls = 0
+
+    def get(self, path, input_data=None):
+        raise RuntimeError("no metadata")
+
+    def list(self, path, resource_key, *, list_info=None, **kw):
+        if path == "assets":
+            self.assets_calls += 1
+        return list(self._assets)
+
+
+def test_asset_fetch_cached_across_resources(monkeypatch):
+    """A fetch-all runs assets + every bucket; the estate must be scanned once,
+    not re-scanned per resource (the cache prevents the timeout storm)."""
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    monkeypatch.setenv("AE_ASSET_CACHE_TTL", "120")
+    client = _CountingClient([
+        {"id": "1", "name": "s1", "product_type": {"name": "Servers"}},
+        {"id": "2", "name": "r1", "product_type": {"name": "Routers"}},
+    ])
+    for res in ("assets", "servers", "routers", "switches", "workstations"):
+        ae_runner_mod.run_query(client, _q(res, category="Network Devices"))
+    assert client.assets_calls == 1          # scanned once, reused from cache
+
+
+def test_asset_cache_disabled(monkeypatch):
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    monkeypatch.setenv("AE_ASSET_CACHE_TTL", "0")
+    client = _CountingClient([{"id": "1", "name": "s1",
+                               "product_type": {"name": "Servers"}}])
+    ae_runner_mod.run_query(client, _q("assets"))
+    ae_runner_mod.run_query(client, _q("servers", category="Servers & Compute"))
+    assert client.assets_calls == 2          # no cache -> scanned each time
+
+
+def test_disposed_early_abort_when_filter_ignored(monkeypatch):
+    """If a state filter is ignored (echoes the live set), disposed merging stops
+    after the first extra scan instead of re-scanning for every state."""
+    monkeypatch.delenv("AE_INCLUDE_DISPOSED", raising=False)  # default on
+    monkeypatch.setenv("AE_ASSET_CACHE_TTL", "0")
+    client = _CountingClient([{"id": "1", "name": "s1",
+                               "product_type": {"name": "Servers"}}])
+    result = ae_runner_mod.run_query(client, _q("assets"))
+    # 1 base scan + 1 disposed scan (adds nothing new -> abort), not 1 + 3.
+    assert client.assets_calls == 2
+    assert {r[0] for r in result.rows} == {"s1"}   # no duplicates from the echo
+
+
+class _AbsentEndpointClient:
+    host, portal, api_key = "h", "", "k"
+
+    def get(self, path, input_data=None):
+        raise RuntimeError("no metadata")
+
+    def list(self, path, resource_key, *, list_info=None, **kw):
+        raise RuntimeError("HTTP 404: URL_NOT_FOUND")
+
+
+def test_catalog_endpoint_absent_is_graceful():
+    """A catalog endpoint missing on an on-prem build yields empty rows, not a
+    failure that would count against the fetch-all tally."""
+    client = _AbsentEndpointClient()
+    for res, cat in [("contracts", "Contracts"), ("purchases", "Purchase"),
+                     ("asset_types", "Catalog"), ("products", "Catalog")]:
+        result = ae_runner_mod.run_query(client, _q(res, category=cat))
+        assert result.rows == []             # empty, but did not raise
+
+
+def test_non_absent_error_still_propagates():
+    """A real error (not a missing endpoint) is not swallowed."""
+    class _BoomClient(_AbsentEndpointClient):
+        def list(self, path, resource_key, *, list_info=None, **kw):
+            raise RuntimeError("HTTP 500: internal error")
+    with pytest.raises(RuntimeError):
+        ae_runner_mod.run_query(_BoomClient(), _q("contracts", category="Contracts"))
+
+
 def test_epoch_millis_fallback_without_display_value():
     """A date object with only an epoch-ms value converts to ISO."""
     asset = {"name": "x", "product_type": {"name": "Servers"},
