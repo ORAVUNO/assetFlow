@@ -137,8 +137,8 @@ queries:
   - id: TSC001
     category: Device Inventory
     name: Devices (Host Inventory)
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: devices
     purpose: >-
       Inventory every host Tenable.sc has data for, one row per IP, with DNS /
@@ -182,8 +182,8 @@ queries:
   - id: TSC002
     category: Security Findings
     name: Aggregated Security Findings
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: findings
     purpose: >-
       Fetch the aggregated security findings — one row per (host, plugin)
@@ -224,8 +224,8 @@ queries:
   - id: TSC003
     category: Software
     name: Installed Software (per host)
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: software
     purpose: >-
       Enumerate installed software linked to each host, one row per (host,
@@ -256,8 +256,8 @@ queries:
   - id: TSC004
     category: Users
     name: Users
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: users
     purpose: >-
       List the Tenable.sc user accounts with role, group, organization, auth
@@ -285,8 +285,8 @@ queries:
   - id: TSC005
     category: Asset Tags
     name: Asset Lists (Tags)
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: asset_lists
     purpose: >-
       List the asset lists that model asset tags / groupings in Tenable.sc — each
@@ -314,8 +314,8 @@ queries:
   - id: TSC006
     category: Alerts & Incidents
     name: Alerts
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: alerts
     purpose: >-
       List the configured Tenable.sc alerts with their trigger condition, status,
@@ -340,8 +340,8 @@ queries:
   - id: TSC007
     category: Alerts & Incidents
     name: Incidents (Tickets)
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: incidents
     purpose: >-
       List Tenable.sc tickets — its incident objects — with status,
@@ -386,8 +386,8 @@ queries:
   - id: TSC009
     category: Device Inventory
     name: Explore Assets (Hosts)
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: hosts
     purpose: >-
       Unified host inventory from the Tenable Security Center 6.x "Explore Assets"
@@ -426,8 +426,8 @@ queries:
   - id: TSC010
     category: Software
     name: Databases (per host)
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: databases
     purpose: >-
       Inventory the running databases and their versions, linked to each host —
@@ -461,8 +461,8 @@ queries:
   - id: TSC011
     category: Applications
     name: Applications (per host)
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: applications
     purpose: >-
       Extract the notable applications from the per-host software enumeration —
@@ -493,8 +493,8 @@ queries:
   - id: TSC012
     category: Summaries
     name: Vulnerability Summary (hosts affected)
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: findings_summary
     purpose: >-
       Aggregate the security findings by plugin — one row per vulnerability with
@@ -518,8 +518,8 @@ queries:
   - id: TSC013
     category: Summaries
     name: Software Summary (hosts per package)
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: software_summary
     purpose: >-
       Aggregate installed software across the estate — one row per distinct
@@ -537,8 +537,8 @@ queries:
   - id: TSC014
     category: Summaries
     name: Application Summary (hosts per app)
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: application_summary
     purpose: >-
       Aggregate the notable applications — one row per application with the number
@@ -557,8 +557,8 @@ queries:
   - id: TSC015
     category: Summaries
     name: Database Summary (hosts per database)
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: database_summary
     purpose: >-
       Aggregate the running databases — one row per database product with the
