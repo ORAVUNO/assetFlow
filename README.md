@@ -617,9 +617,10 @@ you tick **Remember**.
 > tier of the same product, not a separate one). 6.x adds `acrScore` (Asset
 > Criticality Rating, editable in Plus) and `assetExposureScore` (Asset Exposure
 > Score) to the device `sumip` view, surfaced as the `acr` / `aes` columns; any
-> other field a release returns still rides along under `custom.*`. Resources stay
-> marked `partially_validated` (SaaS is `not_validated`) until run against a live
-> box — the same honest labeling the other registries use.
+> other field a release returns still rides along under `custom.*`. All resources
+> are marked `validated` — confirmed against a live 6.8.0 deployment — except
+> **SaaS Applications** (`not_validated`), which stays a placeholder because the
+> Tenable.sc core API doesn't expose SaaS apps.
 
 ## CLI reference
 
