@@ -322,6 +322,26 @@ def test_url_for_cloud_and_onprem():
     assert onprem.url_for("assets") == "https://ae.test/api/v3/assets"
 
 
+def test_url_for_onprem_http_and_custom_port():
+    """On-prem often runs plain HTTP on a custom port — the scheme/port is honored."""
+    c = _client(host="http://assetexplorer.corp:8080", portal="")
+    assert c.scheme == "http"
+    assert c.host == "assetexplorer.corp:8080"
+    assert c.url_for("assets") == "http://assetexplorer.corp:8080/api/v3/assets"
+    # https default and a custom port together.
+    c2 = _client(host="assetexplorer.corp:8443", portal="")
+    assert c2.url_for("cmdb/server") == "https://assetexplorer.corp:8443/api/v3/cmdb/server"
+
+
+def test_env_for_form_preserves_http_scheme():
+    mgr = adapters_mod.AdapterManager(adapters_mod.available_kinds())
+    a = mgr.add_instance("assetexplorer", "AE onprem")
+    env = a.env_for_form({"host": "http://assetexplorer.corp:8080",
+                          "api_key": "k", "verify_certs": False})
+    assert env["AE_HOST"] == "http://assetexplorer.corp:8080"
+    assert env["AE_VERIFY_CERTS"] == "false"
+
+
 def test_build_client_requires_credentials():
     with pytest.raises(ae_client_mod.AssetExplorerConfigError):
         ae_client_mod.build_client(host="ae.test")  # no token / key
