@@ -47,6 +47,15 @@ class FakeClient:
         raise RuntimeError(f"no get rule for {path}")
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_udf_labels(monkeypatch):
+    """Keep tests hermetic: the repo ships config/assetexplorer_udf_labels.json,
+    which the runner auto-loads. Default it off (AE_UDF_LABELS="{}") so tests that
+    assert on raw custom.udf_* columns aren't affected; label tests override this.
+    """
+    monkeypatch.setenv("AE_UDF_LABELS", "{}")
+
+
 def _q(resource: str, qid: str = "AE999", category: str = "Asset Inventory") -> Query:
     return Query(
         id=qid, category=category, name="test",
