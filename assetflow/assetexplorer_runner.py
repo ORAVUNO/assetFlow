@@ -129,20 +129,38 @@ def _udf_label_overrides() -> Dict[str, str]:
     specific — this lets a site map its own ``udf_*`` keys to readable column
     names without hard-coding anyone's fields into the adapter.
     """
+    # First honor an explicit AE_UDF_LABELS (inline JSON or @file). If it is set
+    # but yields nothing (e.g. an @path that doesn't resolve), fall through to the
+    # auto-load convention rather than staying silently unlabeled — unless it is an
+    # explicit disable token, which turns UDF labeling off entirely.
     raw = (os.getenv("AE_UDF_LABELS") or "").strip()
-    if not raw:
-        # Convention: auto-load a labels file if one is present, so a site can just
-        # drop it in place without setting AE_UDF_LABELS. (.example is not loaded.)
-        for cand in ("config/assetexplorer_udf_labels.json",
-                     "assetexplorer_udf_labels.json"):
-            if _resolve_labels_path(cand):
-                raw = "@" + cand
-                break
+    if raw.lower() in ("none", "off", "{}"):
+        return {}
+    labels = _parse_label_source(raw) if raw else {}
+    if labels:
+        return labels
+    # Convention: auto-load a labels file if one is present, so a site can just
+    # drop it in place without setting AE_UDF_LABELS. (.example is not loaded.)
+    for cand in ("config/assetexplorer_udf_labels.json",
+                 "assetexplorer_udf_labels.json"):
+        if _resolve_labels_path(cand):
+            found = _parse_label_source("@" + cand)
+            if found:
+                return found
+    return {}
+
+
+def _parse_label_source(raw: str) -> Dict[str, str]:
+    """Parse a label source — inline JSON, or ``@path`` to a JSON file (resolved
+    against cwd and the repo root). Returns ``{}`` on any problem."""
+    raw = (raw or "").strip()
     if not raw:
         return {}
     try:
         if raw.startswith("@"):
-            resolved = _resolve_labels_path(raw[1:]) or raw[1:]
+            resolved = _resolve_labels_path(raw[1:])
+            if not resolved:
+                return {}
             with open(resolved, encoding="utf-8") as fh:
                 data = json.load(fh)
         else:
@@ -151,7 +169,9 @@ def _udf_label_overrides() -> Dict[str, str]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {str(k): str(v) for k, v in data.items() if k and v}
+    # Drop the documentation comment key and keep udf-ish string mappings.
+    return {str(k): str(v) for k, v in data.items()
+            if k and v and not str(k).startswith("_")}
 
 
 def _fetch_udf_labels(client) -> Dict[str, str]:
@@ -193,14 +213,17 @@ def _label_map(client) -> Dict[str, str]:
     """Resolve the UDF api_name -> label map for this connection, cached on the
     client. Metadata from AssetExplorer first, then AE_UDF_LABELS overrides."""
     cached = getattr(client, "_ae_udf_labels", None)
-    if cached is not None:
+    if cached:  # only a non-empty map is cached (see below)
         return cached
     labels = _fetch_udf_labels(client)
     labels.update(_udf_label_overrides())
-    try:
-        client._ae_udf_labels = labels
-    except Exception:  # pragma: no cover - client may forbid attributes
-        pass
+    # Cache only a non-empty result, so a labels file added after the connection
+    # was made is picked up on the next fetch without needing to reconnect.
+    if labels:
+        try:
+            client._ae_udf_labels = labels
+        except Exception:  # pragma: no cover - client may forbid attributes
+            pass
     return labels
 
 

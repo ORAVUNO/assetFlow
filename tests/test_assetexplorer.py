@@ -50,10 +50,10 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def _no_ambient_udf_labels(monkeypatch):
     """Keep tests hermetic: the repo ships config/assetexplorer_udf_labels.json,
-    which the runner auto-loads. Default it off (AE_UDF_LABELS="{}") so tests that
+    which the runner auto-loads. Default it off (the disable token) so tests that
     assert on raw custom.udf_* columns aren't affected; label tests override this.
     """
-    monkeypatch.setenv("AE_UDF_LABELS", "{}")
+    monkeypatch.setenv("AE_UDF_LABELS", "none")
 
 
 def _q(resource: str, qid: str = "AE999", category: str = "Asset Inventory") -> Query:
@@ -234,6 +234,40 @@ def test_example_udf_label_map_is_complete():
     # the two value-confirmed anchors
     assert labels["udf_date_8945"] == "Created date"
     assert labels["udf_date_8949"] == "Updated at"
+
+
+def test_unresolvable_labels_path_falls_back_to_autoload(monkeypatch, tmp_path):
+    """A set-but-broken AE_UDF_LABELS @path doesn't block the auto-load file."""
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    monkeypatch.setenv("AE_UDF_LABELS", "@/does/not/exist.json")  # unresolvable
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "assetexplorer_udf_labels.json").write_text(
+        '{"udf_pick_8909": "BCM Rating"}', encoding="utf-8")
+    asset = {"name": "a", "product_type": {"name": "Routers"},
+             "udf_fields": {"udf_pick_8909": "BC"}}
+    result = ae_runner_mod.run_query(
+        FakeClient(list_rules={"assets": [asset]}), _q("assets"))
+    assert "BCM Rating" in result.column_names   # fell through to the file
+
+
+def test_label_cache_not_stuck_empty(monkeypatch, tmp_path):
+    """An empty label result isn't cached, so a labels file added after the first
+    fetch is picked up on the next one without reconnecting."""
+    monkeypatch.setenv("AE_INCLUDE_DISPOSED", "false")
+    monkeypatch.setenv("AE_UDF_LABELS", "none")   # disabled on first fetch
+    monkeypatch.chdir(tmp_path)
+    client = FakeClient(list_rules={"assets": [
+        {"name": "a", "product_type": {"name": "Routers"},
+         "udf_fields": {"udf_pick_8909": "BC"}}]})
+    r1 = ae_runner_mod.run_query(client, _q("assets"))
+    assert "custom.udf_pick_8909" in r1.column_names   # no labels yet
+
+    # Now enable labels; the same client must pick them up (nothing cached).
+    monkeypatch.setenv("AE_UDF_LABELS", '{"udf_pick_8909": "BCM Rating"}')
+    r2 = ae_runner_mod.run_query(client, _q("assets"))
+    assert "BCM Rating" in r2.column_names
 
 
 def test_serial_from_org_serial_number(monkeypatch):
