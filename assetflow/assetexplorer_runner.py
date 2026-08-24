@@ -619,30 +619,21 @@ def _fetch_assets(client) -> List[Dict[str, Any]]:
     return assets
 
 
-def _endpoint_absent(exc: Exception) -> bool:
-    """True when an error looks like "this endpoint isn't on this build".
+def _optional_list(client, path: str, resource_key: str) -> List[Dict[str, Any]]:
+    """``client.list`` for an *optional* v3 resource — returns ``[]`` on any error.
 
-    On-premises AssetExplorer editions don't all expose every v3 resource
-    (contracts / purchase_orders / asset_types / products / cmdb vary). A missing
-    endpoint should leave that resource empty, not fail the whole fetch — so those
-    collectors treat an absent-endpoint error as no rows.
+    AssetExplorer editions (especially on-premises) don't all expose every v3
+    resource: contracts, purchase_orders, asset_types, and products are commonly
+    absent or return an edition-specific error rather than a clean 404. These are
+    optional catalog resources, so a fetch-all should show them as empty rather
+    than as a failure — the asset inventory (the point of the adapter) is
+    unaffected. The absence reason is available via the diagnostic tool when a site
+    does expect these endpoints to work.
     """
-    s = str(exc).lower()
-    return any(tok in s for tok in (
-        "404", "not found", "url_not_found", "no handler", "does not exist",
-        "no such", "resource not found", "4004",
-    ))
-
-
-def _safe_list(client, path: str, resource_key: str) -> List[Dict[str, Any]]:
-    """``client.list`` that returns ``[]`` when the endpoint is absent on this
-    build (see :func:`_endpoint_absent`); other errors still propagate."""
     try:
         return client.list(path, resource_key)
-    except Exception as exc:
-        if _endpoint_absent(exc):
-            return []
-        raise
+    except Exception:
+        return []
 
 
 def _collect_assets(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
@@ -754,7 +745,7 @@ def _collect_cmdb(client, time_range: Optional[str]) -> Tuple[List[str], List[Li
 
 def _collect_contracts(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Maintenance / lease / warranty contracts (``GET /api/v3/contracts``)."""
-    records = _safe_list(client, "contracts", "contracts")
+    records = _optional_list(client, "contracts", "contracts")
     lead: List[Tuple[str, Any]] = [
         ("host.name", lambda r: textish(_pick(r, "name", "contract_name"))),
         ("asset.type", lambda r: "Contract"),
@@ -781,7 +772,7 @@ def _collect_contracts(client, time_range: Optional[str]) -> Tuple[List[str], Li
 
 def _collect_purchases(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Purchase orders (``GET /api/v3/purchase_orders``)."""
-    records = _safe_list(client, "purchase_orders", "purchase_orders")
+    records = _optional_list(client, "purchase_orders", "purchase_orders")
     lead: List[Tuple[str, Any]] = [
         ("host.name", lambda r: textish(_pick(r, "name", "po_name", "po_number"))),
         ("asset.type", lambda r: "Purchase Order"),
@@ -805,7 +796,7 @@ def _collect_purchases(client, time_range: Optional[str]) -> Tuple[List[str], Li
 
 def _collect_asset_types(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """The product-type / asset-type catalog (``GET /api/v3/asset_types``)."""
-    records = _safe_list(client, "asset_types", "asset_types")
+    records = _optional_list(client, "asset_types", "asset_types")
     lead: List[Tuple[str, Any]] = [
         ("asset.type", lambda r: textish(_pick(r, "name", "display_name"))),
         ("type.id", lambda r: textish(_pick(r, "id"))),
@@ -820,7 +811,7 @@ def _collect_asset_types(client, time_range: Optional[str]) -> Tuple[List[str], 
 
 def _collect_products(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """The product catalog (``GET /api/v3/products``)."""
-    records = _safe_list(client, "products", "products")
+    records = _optional_list(client, "products", "products")
     lead: List[Tuple[str, Any]] = [
         ("product", lambda r: textish(_pick(r, "name"))),
         ("product.id", lambda r: textish(_pick(r, "id"))),
