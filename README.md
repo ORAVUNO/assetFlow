@@ -3,9 +3,10 @@
 Asset-intelligence tool that fetches assets from pluggable **adapters** (data
 sources), shows them in a local web UI, and persists every fetch to a local
 database. Elasticsearch is the first adapter, Tufin SecureTrack is the second,
-VMware vCenter is the third, SolarWinds Orion is the fourth, and Tenable.sc
-(SecurityCenter) is the fifth; more sources plug in beside them, grouped by
-category, so results from many sources can later be merged.
+VMware vCenter is the third, SolarWinds Orion is the fourth, Tenable.sc
+(SecurityCenter) is the fifth, and ManageEngine AssetExplorer is the sixth; more
+sources plug in beside them, grouped by category, so results from many sources
+can later be merged.
 
 - **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, VMware,
   SolarWinds, …) is a template with its own metadata and query registry. You can
@@ -17,8 +18,11 @@ category, so results from many sources can later be merged.
   **Tufin SecureTrack** (category *Network Security Policy* — see
   [Tufin adapter](#tufin-securetrack-adapter)), **VMware vCenter** (category
   *Virtualization / Infrastructure* — see [VMware adapter](#vmware-vcenter-adapter)),
-  and **SolarWinds Orion** (category *Network Monitoring / NCM* — see
-  [SolarWinds adapter](#solarwinds-orion-adapter)).
+  **SolarWinds Orion** (category *Network Monitoring / NCM* — see
+  [SolarWinds adapter](#solarwinds-orion-adapter)), **Tenable.sc (SecurityCenter)**
+  (category *Vulnerability Management*), and **ManageEngine AssetExplorer**
+  (category *IT Asset Management / CMDB* — see
+  [AssetExplorer adapter](#manageengine-assetexplorer-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity,
@@ -32,6 +36,12 @@ category, so results from many sources can later be merged.
   `config/solarwinds_registry.yaml` — the SolarWinds adapter's 7 SWQL resources
   in 7 feeds (Device Inventory, Interfaces, Storage, Custom Properties, Config
   Posture, Config Changes, Compliance).
+  `config/assetexplorer_registry.yaml` — the AssetExplorer adapter's 19 v3 REST
+  resources in 9 feeds (Asset Inventory, Servers & Compute, Network Devices,
+  End-User Devices, Peripherals & Facilities, CMDB, Contracts, Purchase, Catalog):
+  the full asset inventory bucketed into asset types (servers, routers, switches,
+  access points, …) with default + custom (`custom.`) fields, plus CMDB,
+  contracts, and purchase orders.
 - **Database:** fetched results are saved to a local SQLite file
   (`assetflow.db`, gitignored). The newest run per query is the panel's saved
   view; older runs form the history. Real telemetry never leaves your machine.
@@ -47,7 +57,8 @@ correlation design, decisions & flow ·
 [`docs/tufin_securetrack_api_reference.md`](docs/tufin_securetrack_api_reference.md) ·
 [`docs/vmware_integration.md`](docs/vmware_integration.md) ·
 [`docs/solarwinds_integration.md`](docs/solarwinds_integration.md) ·
-[`docs/tenable_sc_integration.md`](docs/tenable_sc_integration.md).
+[`docs/tenable_sc_integration.md`](docs/tenable_sc_integration.md) ·
+[`docs/assetexplorer_integration.md`](docs/assetexplorer_integration.md).
 
 ## Requirements
 
@@ -67,6 +78,12 @@ correlation design, decisions & flow ·
   config-change, and compliance resources need **NCM** licensed and archiving
   configs. No extra Python package is required — SWQL runs over the standard
   library.
+- For the AssetExplorer adapter: network access to your ManageEngine
+  AssetExplorer and either — for **Cloud** — an OAuth token (a current access
+  token, or a long-lived refresh token with its client id/secret so tokens
+  auto-renew) plus the account portal, or — for **on-premises** — a technician
+  API key. Everything is read over the AssetExplorer v3 REST API; no extra Python
+  package is required.
 
 ## Setup
 
@@ -621,6 +638,75 @@ you tick **Remember**.
 > are marked `validated` — confirmed against a live 6.8.0 deployment — except
 > **SaaS Applications** (`not_validated`), which stays a placeholder because the
 > Tenable.sc core API doesn't expose SaaS apps.
+
+## ManageEngine AssetExplorer adapter
+
+The **ManageEngine AssetExplorer** adapter (category *IT Asset Management / CMDB*)
+fetches the full asset inventory from
+[AssetExplorer](https://www.manageengine.com/products/asset-explorer/) over its
+[v3 REST API](https://www.manageengine.com/products/asset-explorer/aecloud-v3-api/),
+**bucketed into its asset types** (servers, workstations, routers, switches,
+firewalls, access points, printers, storage, UPS, …), with **all default fields
+and every custom (UDF) field**, plus the **CMDB** configuration items,
+**contracts**, and **purchase orders**.
+
+### What it fetches
+
+| ID | Resource | Feed | AssetExplorer endpoint |
+| --- | --- | --- | --- |
+| AE001 | All Assets (`assets`) | Asset Inventory | `GET /api/v3/assets` |
+| AE002–AE005 | Servers, Workstations, Virtual Machines, Clusters | Servers & Compute | `assets`, bucketed by product type |
+| AE006–AE009, AE013 | Routers, Switches, Firewalls, Access Points, Network Devices | Network Devices | `assets`, bucketed by product type |
+| AE010–AE012 | Printers, Storage Devices, UPS | Peripherals & Facilities | `assets`, bucketed by product type |
+| AE014 | Mobile Devices | End-User Devices | `assets`, bucketed by product type |
+| AE015 | CMDB Configuration Items (`cmdb`) | CMDB | `GET /api/v3/cmdb/{ci_type}` |
+| AE016 | Contracts (`contracts`) | Contracts | `GET /api/v3/contracts` |
+| AE017 | Purchase Orders (`purchases`) | Purchase | `GET /api/v3/purchase_orders` |
+| AE018–AE019 | Asset Types, Products | Catalog | `GET /api/v3/asset_types`, `/products` |
+
+Each asset lands in its **respective asset type** the way the AssetExplorer
+report does: the leading `asset.type` column carries the asset's **product type**
+(Servers / Routers / Access Points / …), and the per-type resources return the
+same rows filtered to that product type. Every list endpoint is paged with the v3
+`input_data` / `list_info` contract (`start_index` / `row_count`, following
+`has_more_rows`).
+
+### Default fields vs. custom fields
+
+- **Default fields.** Named columns cover the standard asset fields — name, IP,
+  state, product, vendor, serial number, barcode, department, site, location,
+  assigned user, acquisition / expiry dates, and the cost fields — read with
+  per-release key fallbacks so the mapping survives API version differences.
+- **Custom fields.** Every entry in an asset's `udf_fields` (the site's custom
+  UDF fields) and any other unmapped field AssetExplorer returns is emitted under
+  a `custom.` prefix — the same convention the SolarWinds, VMware, and Tenable.sc
+  adapters use — so nothing is dropped and system fields are never confused with
+  extra ones.
+
+### Connecting
+
+In the web UI, open the **ManageEngine AssetExplorer** card and click
+**Connect**. For **AssetExplorer Cloud**, enter the service domain, the account
+**Portal**, and OAuth credentials — paste a current access token into *Password*,
+or a long-lived **refresh token** into *Password* with the OAuth **client id**
+(*Username*) and **Client secret** so the adapter mints fresh access tokens on
+demand (surviving the one-hour token lifetime). For **on-premises
+AssetExplorer**, leave *Portal* blank and paste the technician **API key**.
+Credentials can also come from environment variables (`AE_HOST`, `AE_PORTAL`,
+`AE_ACCESS_TOKEN` / `AE_REFRESH_TOKEN` + `AE_CLIENT_ID` / `AE_CLIENT_SECRET`, or
+`AE_API_KEY`; see [`.env.example`](.env.example)).
+
+> **Provenance & validation.** Endpoints and field names follow the AssetExplorer
+> v3 REST API documentation; the mappings are best-effort and marked
+> `partially_validated` (the CMDB resource `investigation_required`, since CI-type
+> api names vary by deployment — tune them with `AE_CMDB_CI_TYPES`) until
+> confirmed against a live AssetExplorer instance. The asset list endpoint returns
+> the Asset-level UDFs; product-type subform fields may need a per-asset fetch.
+
+> **Developer guide.** For a full walkthrough — architecture, module map, data
+> flow, authentication, asset flattening, the asset-type buckets, custom-field
+> handling, and how to add a resource — see
+> [`docs/assetexplorer_integration.md`](docs/assetexplorer_integration.md).
 
 ## CLI reference
 
