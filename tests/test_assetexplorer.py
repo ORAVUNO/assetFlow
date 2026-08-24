@@ -398,23 +398,18 @@ class _AbsentEndpointClient:
         raise RuntimeError("HTTP 404: URL_NOT_FOUND")
 
 
-def test_catalog_endpoint_absent_is_graceful():
-    """A catalog endpoint missing on an on-prem build yields empty rows, not a
-    failure that would count against the fetch-all tally."""
-    client = _AbsentEndpointClient()
+def test_catalog_endpoints_are_optional():
+    """The optional catalog endpoints (contracts / purchases / asset_types /
+    products) return empty rows on ANY error — including edition-specific ones an
+    on-prem build returns instead of a clean 404 — so they never fail a fetch-all."""
+    class _ErrClient(_AbsentEndpointClient):
+        def list(self, path, resource_key, *, list_info=None, **kw):
+            raise RuntimeError("HTTP 400: URL_NO_MATCHING (edition-specific)")
+    client = _ErrClient()
     for res, cat in [("contracts", "Contracts"), ("purchases", "Purchase"),
                      ("asset_types", "Catalog"), ("products", "Catalog")]:
         result = ae_runner_mod.run_query(client, _q(res, category=cat))
         assert result.rows == []             # empty, but did not raise
-
-
-def test_non_absent_error_still_propagates():
-    """A real error (not a missing endpoint) is not swallowed."""
-    class _BoomClient(_AbsentEndpointClient):
-        def list(self, path, resource_key, *, list_info=None, **kw):
-            raise RuntimeError("HTTP 500: internal error")
-    with pytest.raises(RuntimeError):
-        ae_runner_mod.run_query(_BoomClient(), _q("contracts", category="Contracts"))
 
 
 def test_epoch_millis_fallback_without_display_value():
