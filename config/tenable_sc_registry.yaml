@@ -61,6 +61,7 @@ metadata:
     - Asset Tags
     - Alerts & Incidents
     - SaaS Applications
+    - Summaries
 
 # =============================================================================
 # FEEDS
@@ -120,6 +121,13 @@ feeds:
     category: SaaS Applications
     description: SaaS application inventory (placeholder — not exposed by the Tenable.sc core API; a Tenable One / Tenable.io capability).
     query_ids: [TSC008]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-TSC-SUMMARY
+    name: Summaries (host counts)
+    category: Summaries
+    description: Aggregated views — one row per vulnerability / package / application / database with a count of how many hosts it is on.
+    query_ids: [TSC012, TSC013, TSC014, TSC015]
     recommended_refresh_frequency: Daily
 
 # =============================================================================
@@ -480,4 +488,87 @@ queries:
       TENABLE_SC_APP_KEYWORDS (comma-separated). Marked investigation_required
       because the allowlist is necessarily curated — widen it for your estate as
       needed; TSC003 remains the complete package inventory.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC012
+    category: Summaries
+    name: Vulnerability Summary (hosts affected)
+    status: partially_validated
+    validated: false
+    resource: findings_summary
+    purpose: >-
+      Aggregate the security findings by plugin — one row per vulnerability with
+      the number of hosts it affects, its severity, family, and CVSS/VPR. Answers
+      "how widespread is this vulnerability?".
+    expected_output_fields:
+      - plugin.id
+      - plugin.name
+      - severity
+      - family
+      - host.count      # hostTotal — number of hosts affected
+      - total
+      - vpr.score
+      - cvss.v3.base
+    notes: >-
+      POST /rest/analysis tool=sumid (Tenable computes the per-plugin host total),
+      with the same Info-excluded severity filter as TSC002. Sorted most-widespread
+      first. Not host-keyed (a summary row is not a single host).
+    recommended_refresh_frequency: Daily
+
+  - id: TSC013
+    category: Summaries
+    name: Software Summary (hosts per package)
+    status: partially_validated
+    validated: false
+    resource: software_summary
+    purpose: >-
+      Aggregate installed software across the estate — one row per distinct
+      package with the number of hosts it appears on. Answers "how many machines
+      have package X?".
+    expected_output_fields:
+      - software.name
+      - host.count      # count — number of hosts
+      - cpe
+    notes: >-
+      POST /rest/analysis tool=listsoftware, which returns the host count natively.
+      Sorted most-common first. Not host-keyed.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC014
+    category: Summaries
+    name: Application Summary (hosts per app)
+    status: investigation_required
+    validated: false
+    resource: application_summary
+    purpose: >-
+      Aggregate the notable applications — one row per application with the number
+      of hosts it runs on and the distinct versions seen. Answers "how many servers
+      run Apache / MySQL / Docker?".
+    expected_output_fields:
+      - application.name
+      - host.count      # number of distinct hosts the app is on
+      - versions        # distinct versions seen (first few)
+    notes: >-
+      Groups the applications resource (TSC011) by application name and counts
+      distinct hosts. Same curated allowlist as TSC011 (extend with
+      TENABLE_SC_APP_KEYWORDS). Not host-keyed.
+    recommended_refresh_frequency: Daily
+
+  - id: TSC015
+    category: Summaries
+    name: Database Summary (hosts per database)
+    status: investigation_required
+    validated: false
+    resource: database_summary
+    purpose: >-
+      Aggregate the running databases — one row per database product with the
+      number of hosts it runs on and the distinct versions seen. Answers "how many
+      servers run MySQL / Oracle / MSSQL?".
+    expected_output_fields:
+      - database
+      - host.count      # number of distinct hosts the database is on
+      - versions        # distinct versions seen (first few)
+    notes: >-
+      Groups the databases resource (TSC010) by product and counts distinct hosts.
+      Not host-keyed.
     recommended_refresh_frequency: Daily

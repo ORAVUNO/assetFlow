@@ -22,6 +22,10 @@ The resources cover the asset types the integration asked for:
   ``application.name`` so it folds into the unified Applications inventory.
 * ``databases`` — running databases and their versions, **linked to each host**,
   from the "Databases" plugin family via ``vulndetails``.
+* ``findings_summary`` / ``software_summary`` / ``application_summary`` /
+  ``database_summary`` — the **aggregated** counterparts: one row per
+  vulnerability / package / application / database with a ``host.count`` of how
+  many hosts it is on ("MySQL runs on 12 servers", "this CVE affects 40 hosts").
 * ``users`` — the Tenable.sc user accounts (``GET /rest/user``).
 * ``asset_lists`` — the asset lists that model **asset tags / groupings** in
   Tenable.sc (``GET /rest/asset``), each with its ``tags`` field, type, owner,
@@ -792,6 +796,103 @@ def _collect_databases(client, time_range: Optional[str]) -> Tuple[List[str], Li
     return columns, rows
 
 
+# --------------------------------------------------------------------------- #
+# Aggregated summaries — one row per item with a host count ("exists on N hosts")
+# --------------------------------------------------------------------------- #
+
+def _int(value: Any) -> int:
+    try:
+        return int(str(value).strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _collect_findings_summary(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Vulnerabilities aggregated by plugin — one row per finding with the number
+    of hosts it affects. Uses the ``sumid`` analysis tool (Tenable computes the
+    host total), with the same Info-excluded severity filter as the detail view."""
+    filters = list(_range_filters(time_range))
+    sev = FINDINGS_SEVERITIES.lower()
+    if sev and sev not in ("all", "*"):
+        filters.append({"filterName": "severity", "operator": "=", "value": FINDINGS_SEVERITIES})
+    records = client.analysis("sumid", filters=filters)
+    columns = [
+        "plugin.id", "plugin.name", "severity", "family", "host.count",
+        "total", "vpr.score", "cvss.v3.base",
+    ]
+    rows = [
+        [textish(r.get("pluginID")), textish(r.get("name")), _obj_name(r.get("severity")),
+         _obj_name(r.get("family")), textish(r.get("hostTotal")), textish(r.get("total")),
+         textish(r.get("vprScore")), textish(r.get("cvssV3BaseScore"))]
+        for r in records
+    ]
+    rows.sort(key=lambda r: _int(r[4]), reverse=True)  # most-widespread first
+    return columns, rows
+
+
+def _collect_software_summary(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Installed software aggregated across the estate — one row per distinct
+    package with the number of hosts it appears on. Uses the ``listsoftware``
+    analysis tool, which returns the host count natively."""
+    records = client.analysis("listsoftware", filters=_range_filters(time_range))
+    columns = ["software.name", "host.count", "cpe"]
+    rows = [[textish(r.get("name")), textish(r.get("count")), textish(r.get("cpe"))]
+            for r in records]
+    rows.sort(key=lambda r: _int(r[1]), reverse=True)
+    return columns, rows
+
+
+def _summarize(rows: List[List[Any]], name_idx: int, host_idx: int, ip_idx: int,
+               ver_idx: int, name_col: str) -> Tuple[List[str], List[List[Any]]]:
+    """Group per-host rows by a name column into (name, host.count, versions)."""
+    agg: Dict[str, Dict[str, set]] = {}
+    for r in rows:
+        key = r[name_idx]
+        if not key:
+            continue
+        bucket = agg.setdefault(key, {"hosts": set(), "versions": set()})
+        host = r[host_idx] or (r[ip_idx] if ip_idx is not None else "")
+        if host:
+            bucket["hosts"].add(host)
+        if ver_idx is not None and r[ver_idx]:
+            bucket["versions"].add(r[ver_idx])
+    columns = [name_col, "host.count", "versions"]
+    out = [[k, str(len(v["hosts"])), ", ".join(sorted(v["versions"])[:8])]
+           for k, v in agg.items()]
+    out.sort(key=lambda r: _int(r[1]), reverse=True)
+    return columns, out
+
+
+def _collect_application_summary(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Applications aggregated across the estate — one row per application with the
+    number of hosts it runs on and the distinct versions seen."""
+    agg: Dict[str, Dict[str, set]] = {}
+    for h, ip, dns, name, ver, raw, pid, seen in _iter_software(client, time_range):
+        if not _is_application(name, pid):
+            continue
+        bucket = agg.setdefault(name, {"hosts": set(), "versions": set()})
+        host = h or ip
+        if host:
+            bucket["hosts"].add(host)
+        if ver:
+            bucket["versions"].add(ver)
+    columns = ["application.name", "host.count", "versions"]
+    rows = [[k, str(len(v["hosts"])), ", ".join(sorted(v["versions"])[:8])]
+            for k, v in agg.items()]
+    rows.sort(key=lambda r: _int(r[1]), reverse=True)
+    return columns, rows
+
+
+def _collect_database_summary(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
+    """Databases aggregated across the estate — one row per database product with
+    the number of hosts it runs on and the distinct versions seen."""
+    cols, rows = _collect_databases(client, time_range)
+    return _summarize(
+        rows, cols.index("database"), cols.index("host.name"),
+        cols.index("host.ip"), cols.index("version"), "database",
+    )
+
+
 def _collect_users(client, time_range: Optional[str]) -> Tuple[List[str], List[List[Any]]]:
     """Tenable.sc user accounts (``GET /rest/user``)."""
     fields = (
@@ -1123,6 +1224,10 @@ _COLLECTORS = {
     "devices": _collect_devices,
     "databases": _collect_databases,
     "applications": _collect_applications,
+    "findings_summary": _collect_findings_summary,
+    "software_summary": _collect_software_summary,
+    "application_summary": _collect_application_summary,
+    "database_summary": _collect_database_summary,
     "hosts": _collect_hosts,
     "findings": _collect_findings,
     "software": _collect_software,

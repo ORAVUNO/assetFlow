@@ -69,6 +69,8 @@ def test_registry_loads_and_validates():
     assert {
         "devices", "hosts", "findings", "software", "applications", "databases",
         "users", "asset_lists", "alerts", "incidents", "saas_applications",
+        "findings_summary", "software_summary", "application_summary",
+        "database_summary",
     } <= resources
 
 
@@ -329,6 +331,41 @@ def test_applications_filters_libs_keeps_apps():
     assert "libssl3" not in apps and "libc6" not in apps          # OS libs dropped
     assert "fonts-dejavu-core" not in apps and "coreutils" not in apps
     assert "Google Chrome" in apps and "Some Internal Tool" in apps  # all Windows kept
+
+
+def test_summaries_count_hosts():
+    # Software summary from listsoftware (native count), sorted by host.count desc.
+    sw = [{"name": "openssl", "count": "40"}, {"name": "nginx", "count": "7"}]
+    # Vulnerability summary from sumid (hostTotal).
+    sumid = [{"pluginID": "1", "name": "Some CVE", "severity": {"name": "High"},
+              "family": {"name": "General"}, "hostTotal": "12", "total": "12"}]
+    # Applications summary aggregates the app-filtered enumeration.
+    apps_text = (
+        "ii   apache2  2.4.58  amd64  Apache\n"
+        "ii   libc6  2.39  amd64  GNU C Library\n"
+    )
+    vuln = [
+        {"ip": "10.0.0.1", "dnsName": "a", "pluginID": "22869", "pluginText": apps_text},
+        {"ip": "10.0.0.2", "dnsName": "b", "pluginID": "22869", "pluginText": apps_text},
+    ]
+    client = FakeClient(analysis_rules={
+        "listsoftware": sw, "sumid": sumid, "vulndetails": vuln,
+    })
+    # software_summary
+    r = tsc_runner_mod.run_query(client, _q("software_summary", "TSC013", "Summaries"))
+    c = r.column_names
+    assert c == ["software.name", "host.count", "cpe"]
+    assert r.rows[0][:2] == ["openssl", "40"]           # sorted, most-common first
+    # findings_summary
+    r = tsc_runner_mod.run_query(client, _q("findings_summary", "TSC012", "Summaries"))
+    c = r.column_names
+    assert r.rows[0][c.index("host.count")] == "12"
+    # application_summary — apache2 on 2 hosts, libc6 excluded (not an app)
+    r = tsc_runner_mod.run_query(client, _q("application_summary", "TSC014", "Summaries"))
+    c = r.column_names
+    names = {row[c.index("application.name")]: row for row in r.rows}
+    assert "apache2" in names and "libc6" not in names
+    assert names["apache2"][c.index("host.count")] == "2"
 
 
 def test_is_application_classifier():
