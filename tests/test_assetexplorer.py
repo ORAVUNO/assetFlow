@@ -188,7 +188,8 @@ def test_udf_pick_field_swept_to_custom():
 
 
 def test_udf_labels_rename_columns(monkeypatch):
-    """AE_UDF_LABELS renames custom.udf_* columns to friendly labels."""
+    """AE_UDF_LABELS renames custom.udf_* columns to friendly labels, keeping the
+    custom. prefix so they stay marked as custom fields."""
     monkeypatch.setenv("AE_UDF_LABELS",
                        '{"udf_pick_8909": "BCM Rating", "udf_pick_8919": "Network type"}')
     asset = {"name": "a", "product_type": {"name": "Routers"},
@@ -197,12 +198,12 @@ def test_udf_labels_rename_columns(monkeypatch):
     result = ae_runner_mod.run_query(
         FakeClient(list_rules={"assets": [asset]}), _q("assets"))
     cols = result.column_names
-    assert "BCM Rating" in cols and "Network type" in cols
+    assert "custom.BCM Rating" in cols and "custom.Network type" in cols
     assert "custom.udf_pick_8909" not in cols
-    assert "custom.udf_sline_9999" in cols          # unlabeled UDF keeps custom.*
+    assert "custom.udf_sline_9999" in cols          # unlabeled UDF keeps custom.<key>
     d = dict(zip(cols, result.rows[0]))
-    assert d["BCM Rating"] == "BC"
-    assert d["Network type"] == "CDN"
+    assert d["custom.BCM Rating"] == "BC"
+    assert d["custom.Network type"] == "CDN"
 
 
 def test_udf_labels_autoload_from_file(monkeypatch, tmp_path):
@@ -217,7 +218,7 @@ def test_udf_labels_autoload_from_file(monkeypatch, tmp_path):
              "udf_fields": {"udf_pick_8909": "BC"}}
     result = ae_runner_mod.run_query(
         FakeClient(list_rules={"assets": [asset]}), _q("assets"))
-    assert "BCM Rating" in result.column_names
+    assert "custom.BCM Rating" in result.column_names
     assert "custom.udf_pick_8909" not in result.column_names
 
 
@@ -246,7 +247,7 @@ def test_unresolvable_labels_path_falls_back_to_autoload(monkeypatch, tmp_path):
              "udf_fields": {"udf_pick_8909": "BC"}}
     result = ae_runner_mod.run_query(
         FakeClient(list_rules={"assets": [asset]}), _q("assets"))
-    assert "BCM Rating" in result.column_names   # fell through to the file
+    assert "custom.BCM Rating" in result.column_names   # fell through to the file
 
 
 def test_label_cache_not_stuck_empty(monkeypatch, tmp_path):
@@ -263,7 +264,7 @@ def test_label_cache_not_stuck_empty(monkeypatch, tmp_path):
     # Now enable labels; the same client must pick them up (nothing cached).
     monkeypatch.setenv("AE_UDF_LABELS", '{"udf_pick_8909": "BCM Rating"}')
     r2 = ae_runner_mod.run_query(client, _q("assets"))
-    assert "BCM Rating" in r2.column_names
+    assert "custom.BCM Rating" in r2.column_names
 
 
 def test_serial_from_org_serial_number(monkeypatch):
