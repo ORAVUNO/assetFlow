@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from . import active_directory_client as ad_client_mod
+from . import active_directory_runner as ad_runner_mod
 from . import assetexplorer_client as assetexplorer_client_mod
 from . import assetexplorer_runner as assetexplorer_runner_mod
 from . import client as client_mod
@@ -681,6 +683,117 @@ class AssetExplorerAdapter(Adapter):
         )
 
 
+class ActiveDirectoryAdapter(Adapter):
+    """Microsoft Active Directory (AD DS) source: fetches identity and
+    infrastructure inventory over LDAP — users, groups, organizational units,
+    computers, job titles, the domain, managed service accounts, AD CS
+    certificate templates / CAs / published certs, and AD-integrated DNS zones
+    and records. Binary attributes (SID, GUID, certificates, DNS record blobs)
+    are decoded by the adapter."""
+
+    def connect(
+        self,
+        *,
+        host: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        base_dn: str = "",
+        port: Optional[int] = None,
+        use_ssl: bool = True,
+        verify_certs: bool = True,
+        request_timeout: int = 30,
+    ) -> dict:
+        candidate = ad_client_mod.build_client(
+            host=host or "",
+            username=username or "",
+            password=password or "",
+            base_dn=base_dn or "",
+            port=port,
+            use_ssl=use_ssl,
+            verify_certs=verify_certs,
+            request_timeout=request_timeout,
+        )
+        info = ad_client_mod.ping(candidate)  # binds + reads RootDSE, raises on failure
+        self._client = candidate
+        self._conn_info = info
+        return info
+
+    @staticmethod
+    def _resolve_ssl(form: dict) -> bool:
+        """LDAPS by default; inferred off when the plain-LDAP port 389 is given
+        and the form carries no explicit use_ssl flag (the UI sends only a port)."""
+        if "use_ssl" in form:
+            return bool(form.get("use_ssl"))
+        raw_port = (str(form.get("port") or "")).strip()
+        if raw_port == "389":
+            return False
+        return True
+
+    def connect_form(self, form: dict) -> dict:
+        # LDAPS is the default; the port field defaults to 636 (LDAPS) / 389.
+        use_ssl = self._resolve_ssl(form)
+        raw_port = (str(form.get("port") or "")).strip()
+        port = int(raw_port) if raw_port else None
+        return self.connect(
+            host=(form.get("host") or form.get("url") or None),
+            username=(form.get("username") or None),
+            password=(form.get("password") or None),
+            base_dn=(form.get("base_dn") or form.get("base_path") or ""),
+            port=port,
+            use_ssl=use_ssl,
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 30)),
+        )
+
+    def try_auto_connect(self) -> bool:
+        try:
+            candidate = ad_client_mod.build_client_from_env()
+            info = ad_client_mod.ping(candidate)
+        except Exception:
+            return False
+        self._client = candidate
+        self._conn_info = info
+        return True
+
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "AD_HOST", "AD_USERNAME", "AD_PASSWORD", "AD_BASE_DN",
+            "AD_PORT", "AD_USE_SSL", "AD_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        host = (form.get("host") or form.get("url") or "").strip()
+        use_ssl = self._resolve_ssl(form)
+        env: Dict[str, str] = {
+            "AD_HOST": ad_client_mod.clean_host(host),
+            "AD_USERNAME": str(form.get("username") or ""),
+            "AD_PASSWORD": str(form.get("password") or ""),
+            "AD_USE_SSL": "true" if use_ssl else "false",
+            "AD_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
+        }
+        base_dn = (form.get("base_dn") or form.get("base_path") or "").strip()
+        if base_dn:
+            env["AD_BASE_DN"] = base_dn
+        port = (str(form.get("port") or "")).strip()
+        if port:
+            env["AD_PORT"] = port
+        return env
+
+    def ping(self) -> dict:
+        if self._client is None:
+            raise ad_client_mod.ActiveDirectoryConfigError("adapter is not connected")
+        info = ad_client_mod.ping(self._client)
+        self._conn_info = info
+        return info
+
+    def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
+        if self._client is None:
+            raise ad_client_mod.ActiveDirectoryConfigError("adapter is not connected")
+        return ad_runner_mod.run_query(
+            self._client, query, limit=limit, time_range=time_range
+        )
+
+
 @dataclass
 class AdapterKind:
     """A *type* of data source (Elasticsearch, Tufin, …) — the template from
@@ -898,6 +1011,26 @@ def available_kinds(registry_path: Optional[str] = None) -> Dict[str, AdapterKin
             ),
             registry=load_registry(assetexplorer_path),
             adapter_cls=AssetExplorerAdapter,
+        )
+
+    active_directory_path = _find_registry(
+        "config/active_directory_registry.yaml", "active_directory_registry.yaml"
+    )
+    if active_directory_path:
+        kinds["active_directory"] = AdapterKind(
+            kind="active_directory",
+            name="Microsoft Active Directory",
+            category="Identity / Directory",
+            description=(
+                "Microsoft Active Directory (AD DS) over LDAP — users, groups, "
+                "organizational units, computers, job titles, the domain, managed "
+                "service accounts, AD CS certificate templates / CAs / published "
+                "certs, and AD-integrated DNS zones and records. Binary attributes "
+                "(SID, GUID, certificates, DNS record blobs) are decoded by the "
+                "adapter; users/computers/DNS fold into the unified inventory."
+            ),
+            registry=load_registry(active_directory_path),
+            adapter_cls=ActiveDirectoryAdapter,
         )
     return kinds
 

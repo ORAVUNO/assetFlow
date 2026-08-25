@@ -4,9 +4,9 @@ Asset-intelligence tool that fetches assets from pluggable **adapters** (data
 sources), shows them in a local web UI, and persists every fetch to a local
 database. Elasticsearch is the first adapter, Tufin SecureTrack is the second,
 VMware vCenter is the third, SolarWinds Orion is the fourth, Tenable.sc
-(SecurityCenter) is the fifth, and ManageEngine AssetExplorer is the sixth; more
-sources plug in beside them, grouped by category, so results from many sources
-can later be merged.
+(SecurityCenter) is the fifth, ManageEngine AssetExplorer is the sixth, and
+Microsoft Active Directory is the seventh; more sources plug in beside them,
+grouped by category, so results from many sources can later be merged.
 
 - **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, VMware,
   SolarWinds, …) is a template with its own metadata and query registry. You can
@@ -20,9 +20,11 @@ can later be merged.
   *Virtualization / Infrastructure* — see [VMware adapter](#vmware-vcenter-adapter)),
   **SolarWinds Orion** (category *Network Monitoring / NCM* — see
   [SolarWinds adapter](#solarwinds-orion-adapter)), **Tenable.sc (SecurityCenter)**
-  (category *Vulnerability Management*), and **ManageEngine AssetExplorer**
+  (category *Vulnerability Management*), **ManageEngine AssetExplorer**
   (category *IT Asset Management / CMDB* — see
-  [AssetExplorer adapter](#manageengine-assetexplorer-adapter)).
+  [AssetExplorer adapter](#manageengine-assetexplorer-adapter)), and **Microsoft
+  Active Directory** (category *Identity / Directory* — see
+  [Active Directory adapter](#microsoft-active-directory-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity,
@@ -42,6 +44,11 @@ can later be merged.
   the full asset inventory bucketed into asset types (servers, routers, switches,
   access points, …) with default + custom (`custom.`) fields, plus CMDB,
   contracts, and purchase orders.
+  `config/active_directory_registry.yaml` — the Active Directory adapter's 13
+  LDAP resources in 8 feeds (Users, Groups, Organizational Units, Computers, Job
+  Titles, Accounts/Tenants, Managed Identities, Certificates, DNS): identity and
+  infrastructure inventory over LDAP, with SID/GUID/certificate/`dnsRecord` blobs
+  decoded by the adapter.
 - **Database:** fetched results are saved to a local SQLite file
   (`assetflow.db`, gitignored). The newest run per query is the panel's saved
   view; older runs form the history. Real telemetry never leaves your machine.
@@ -58,7 +65,8 @@ correlation design, decisions & flow ·
 [`docs/vmware_integration.md`](docs/vmware_integration.md) ·
 [`docs/solarwinds_integration.md`](docs/solarwinds_integration.md) ·
 [`docs/tenable_sc_integration.md`](docs/tenable_sc_integration.md) ·
-[`docs/assetexplorer_integration.md`](docs/assetexplorer_integration.md).
+[`docs/assetexplorer_integration.md`](docs/assetexplorer_integration.md) ·
+[`docs/active_directory_integration.md`](docs/active_directory_integration.md).
 
 ## Requirements
 
@@ -84,6 +92,12 @@ correlation design, decisions & flow ·
   auto-renew) plus the account portal, or — for **on-premises** — a technician
   API key. Everything is read over the AssetExplorer v3 REST API; no extra Python
   package is required.
+- For the Active Directory adapter: network access to a domain controller and a
+  read account (host + username + password). Needs the **`ldap3`** package
+  (`pip install ldap3`, or `pip install -e ".[active_directory]"`); certificate
+  subject/issuer/validity parsing additionally uses **`cryptography`** when
+  present (thumbprints work without it). AD CS certificate resources need AD CS
+  deployed, and the DNS resources need DNS to be AD-integrated.
 
 ## Setup
 
@@ -707,6 +721,85 @@ Credentials can also come from environment variables (`AE_HOST`, `AE_PORTAL`,
 > flow, authentication, asset flattening, the asset-type buckets, custom-field
 > handling, and how to add a resource — see
 > [`docs/assetexplorer_integration.md`](docs/assetexplorer_integration.md).
+
+## Microsoft Active Directory adapter
+
+The **Microsoft Active Directory** adapter (category *Identity / Directory*)
+fetches identity and infrastructure inventory from on-prem **AD DS over LDAP**
+(`ldaps://<dc>:636` by default, or `ldap://<dc>:389`) and folds it into the same
+host/identity-keyed views as the other adapters. It answers "which of our
+directory entities can we actually pull from AD?" — users, groups, OUs,
+computers, job titles, the domain, managed service accounts, certificates, and
+DNS.
+
+### What it fetches
+
+Thirteen resources (`AD001`–`AD013`). The client binds with a read account and
+discovers the directory's naming contexts from the RootDSE, so nothing is
+hard-coded:
+
+| ID | Resource | Feed | LDAP source |
+|---|---|---|---|
+| AD001 | **Users** (`users`) | Users | `(&(objectCategory=person)(objectClass=user))` — UPN, email, title, department, manager, enabled, SID |
+| AD002 | **Groups** (`groups`) | Groups | `(objectClass=group)` — scope + category from `groupType`, member count |
+| AD003 | Group Memberships (`group_members`) | Groups | `member` expanded to one row per edge |
+| AD004 | **Organizational Units** (`organizational_units`) | Organizational Units | `(objectClass=organizationalUnit)` |
+| AD005 | **Computers** (`computers`) | Computers | `(objectClass=computer)` — OS name/version (folds into Devices) |
+| AD006 | **Job Titles** (`job_titles`) | Job Titles | distinct `title` across users, with a headcount |
+| AD007 | Domain (`domain`) | Accounts/Tenants | `(objectClass=domainDNS)` + RootDSE functional levels |
+| AD008 | Managed Service Accounts (`managed_service_accounts`) | Managed Identities | gMSA / sMSA classes |
+| AD009 | **Certificate Templates** (`certificate_templates`) | Certificates | `pKICertificateTemplate` in the config NC — `is_server_auth` marks SSL templates |
+| AD010 | Certification Authorities (`certificate_authorities`) | Certificates | `pKIEnrollmentService` in the config NC |
+| AD011 | Published Certificates (`published_certificates`) | Certificates | `(userCertificate=*)` — decoded, with SHA-1 thumbprint |
+| AD012 | **DNS Zones** (`dns_zones`) | DNS | `(objectClass=dnsZone)` across the DNS partitions |
+| AD013 | **DNS Records** (`dns_records`) | DNS | `(objectClass=dnsNode)` — `dnsRecord` blobs decoded to typed records |
+
+Users emit the `user.name` / `user.principal_name` / `user.email` / `user.sid`
+keys the unified **Users** inventory correlates on; computers and DNS A/AAAA
+records emit `host.name` (+ `host.ip`) so they fold into the **Devices**
+inventory. Binary attributes — `objectSid`, `objectGUID`, `userCertificate`,
+`dnsRecord` — are decoded by the adapter.
+
+### Certificates: what's in LDAP, and what isn't
+
+Over LDAP you get the PKI **config** (templates + CAs) and **published** certs
+(`userCertificate`). The `is_server_auth` flag marks the templates/certs that
+are **SSL/TLS** (Server Authentication EKU). But **the full AD CS
+issued-certificate inventory is not in LDAP** — every issued/revoked cert lives
+in the **CA database**, read from the CA with `certutil -view` / PSPKI (a
+Windows/RPC path). If you need that complete inventory, collect it as a separate
+feed from a `certutil`/PSPKI export; the in-product registry notes say so.
+
+### DNS: AD-integrated only
+
+Only **AD-integrated** zones are stored in the directory and fetchable here.
+**File-backed standalone Windows DNS** or **third-party DNS** (BIND/Infoblox) is
+not in AD. The `dnsRecord` attribute is a packed binary blob the adapter decodes
+into typed records (A, AAAA, CNAME, NS, PTR, MX, SRV, TXT, SOA); unknown types
+fall back to hex.
+
+### Connecting
+
+In the web UI, open the **Microsoft Active Directory** card and click
+**Connection**: enter the **host** (a domain controller), **username**
+(`user@corp.local` or `CORP\user`), **password**, optional **port** (636 LDAPS /
+389 LDAP), and an optional **Base DN** (auto-detected from the RootDSE when
+blank). Toggle **Verify TLS certificate** (keep it on for production LDAPS certs;
+disable only for a lab/self-signed environment). Or set `AD_HOST` / `AD_USERNAME`
+/ `AD_PASSWORD` in `.env` (see `.env.example`) to auto-connect on startup.
+Credentials entered in the form are held in the local server's memory only unless
+you tick **Remember**. The adapter needs the `ldap3` package installed on the
+server.
+
+> **Developer guide.** For a full walkthrough — architecture, the RootDSE
+> discovery, the binary-attribute parsers (SID/GUID/FILETIME/`dnsRecord`), the
+> certificate scope, and how to add a resource — see
+> [`docs/active_directory_integration.md`](docs/active_directory_integration.md).
+
+> **Validation status.** Filters and attribute mappings follow the documented AD
+> schema; resources are marked `partially_validated` (or `investigation_required`
+> where availability varies by deployment — AD CS, AD-integrated DNS, MSAs) until
+> run against a live directory, the same honest labeling the other registries use.
 
 ## CLI reference
 
