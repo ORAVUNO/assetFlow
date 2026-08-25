@@ -734,10 +734,33 @@ def _collect_dns_zones(client, base_dn: str = "") -> Tuple[List[str], List[List[
     return columns, rows
 
 
+def ptr_to_ip(record_name: str, zone: str) -> str:
+    """Reconstruct the IP a reverse (PTR) record points at, from its position.
+
+    A PTR node's identity *is* the address, reversed: ``22.168.18`` in zone
+    ``172.in-addr.arpa`` is ``172.18.168.22``; an ``ip6.arpa`` name is 32
+    reversed nibbles. Returns "" for classless-delegation (RFC 2317) or partial
+    names that don't form a complete address.
+    """
+    parts = [] if record_name in ("@", "") else [record_name]
+    full = ".".join(parts + [zone]).strip(".").lower()
+    if full.endswith(".in-addr.arpa"):
+        octets = full[: -len(".in-addr.arpa")].split(".")
+        if len(octets) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+            return ".".join(reversed(octets))
+    elif full.endswith(".ip6.arpa"):
+        nibbles = full[: -len(".ip6.arpa")].split(".")
+        if len(nibbles) == 32 and all(len(n) == 1 and n in "0123456789abcdef" for n in nibbles):
+            rev = list(reversed(nibbles))
+            return ":".join("".join(rev[i:i + 4]) for i in range(0, 32, 4))
+    return ""
+
+
 def _collect_dns_records(client, base_dn: str = "") -> Tuple[List[str], List[List[Any]]]:
     """AD-integrated DNS records (``dnsNode`` objects), decoding each dnsRecord
-    blob. A/AAAA rows also emit host.name/host.ip so name→address records fold
-    into the Devices inventory."""
+    blob. Forward A/AAAA rows emit host.name/host.ip, and reverse PTR rows emit
+    the target host.name plus the IP reconstructed from the reverse-zone name,
+    so both directions fold into the Devices inventory."""
     columns = ["zone", "record.name", "record.type", "record.data", "ttl",
                "host.name", "host.ip"]
     bases = [base_dn] if base_dn else _dns_bases(client)
@@ -753,8 +776,13 @@ def _collect_dns_records(client, base_dn: str = "") -> Tuple[List[str], List[Lis
                 rtype, data, ttl = parse_dns_record(blob)
                 if not rtype:
                     continue
-                host_name = fqdn if rtype in ("A", "AAAA") else ""
-                host_ip = data if rtype in ("A", "AAAA") else ""
+                if rtype in ("A", "AAAA"):
+                    host_name, host_ip = fqdn, data
+                elif rtype == "PTR":
+                    # The PTR target is the host; the address is the reverse name.
+                    host_name, host_ip = data, ptr_to_ip(name, zone)
+                else:
+                    host_name = host_ip = ""
                 rows.append([zone, name, rtype, data, ttl, host_name, host_ip])
     return columns, rows
 

@@ -90,8 +90,11 @@ The identity/device keys come straight from `merge.py`'s type specs:
 - **Computers** emit `host.name` (dNSHostName) and `os.name`
   (operatingSystem) — so they land in the *Devices* namespace and get
   categorized (server/workstation) from the OS string.
-- **DNS A/AAAA records** additionally emit `host.name` (the FQDN) and `host.ip`,
-  so name→address records correlate to the very devices other adapters report.
+- **DNS records** additionally emit `host.name` and `host.ip` in both
+  directions: forward **A/AAAA** (the FQDN → its address) and reverse **PTR**
+  (the target host → the IP rebuilt from the reverse-zone name by
+  `ptr_to_ip`), so name↔address records correlate to the very devices other
+  adapters report.
 
 ## Binary attribute parsers
 
@@ -176,8 +179,9 @@ blank). Or set `AD_HOST` / `AD_USERNAME` / `AD_PASSWORD` in `.env` (see
 entered in the form are held in the local server's memory only unless you tick
 **Remember**.
 
-> **Validation status.** Filters and attribute mappings follow the documented AD
-> schema; resources are marked `partially_validated` (or `investigation_required`
-> where availability varies by deployment — AD CS, AD-integrated DNS, MSAs) until
-> run against a live directory, the same honest labeling the other registries
-> use.
+> **Validation status.** All resources are marked `validated` — confirmed
+> returning correct data against a live directory (users, groups, OUs, computers,
+> job titles, the domain, gMSAs, AD CS templates/CAs/published certs, and
+> AD-integrated DNS forward + reverse zones). Environment-dependent resources
+> still return nothing where the feature is absent (no AD CS, or DNS that isn't
+> AD-integrated) — that's an empty result, not a failure.
