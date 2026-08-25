@@ -36,6 +36,7 @@ from __future__ import annotations
 import binascii
 import hashlib
 import struct
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -276,9 +277,15 @@ def cert_summary(der: bytes) -> Dict[str, str]:
     if x509 is None or not der:  # pragma: no cover - depends on optional dep
         return out
     try:  # pragma: no cover - exercised only with cryptography installed
-        cert = x509.load_der_x509_certificate(der)
-        out["subject"] = cert.subject.rfc4514_string()
-        out["issuer"] = cert.issuer.rfc4514_string()
+        # Real-world certs carry non-standard DN attributes (e.g. a Country
+        # value longer than 2 chars), and cryptography warns while still
+        # rendering the string. Silence those benign RFC4514 warnings so the
+        # server console isn't spammed on a certificate fetch.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cert = x509.load_der_x509_certificate(der)
+            out["subject"] = cert.subject.rfc4514_string()
+            out["issuer"] = cert.issuer.rfc4514_string()
         out["serial"] = format(cert.serial_number, "x")
         out["not_before"] = cert.not_valid_before_utc.strftime("%Y-%m-%d")
         out["not_after"] = cert.not_valid_after_utc.strftime("%Y-%m-%d")
