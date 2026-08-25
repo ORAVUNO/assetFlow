@@ -85,6 +85,38 @@ def clean_host(host: str) -> str:
     return host
 
 
+def dns_partition_candidates(
+    base_dn: str, root_domain_nc: str = "", advertised: Optional[List[str]] = None
+) -> List[str]:
+    """The DNS application-partition DNs to search for AD-integrated DNS.
+
+    AD-integrated zones live in the **DomainDnsZones** (domain-replicated) and
+    **ForestDnsZones** (forest-replicated) application partitions, with a legacy
+    ``CN=MicrosoftDNS,CN=System`` container that on a modern DC holds only the
+    ``RootDNSServers`` hints. We don't rely on the RootDSE *advertising* the app
+    partitions (a plain bind may not, and ldap3 surfaces namingContexts
+    separately), so the standard partition DNs are **derived** from the base /
+    root-domain NCs and merged with any advertised ``*DnsZones*`` contexts. The
+    result is de-duplicated and order-stable (advertised first, then derived,
+    then legacy). Non-existent partitions are simply searched and return nothing.
+    """
+    parts: List[str] = []
+
+    def _add(dn: str) -> None:
+        if dn and dn not in parts:
+            parts.append(dn)
+
+    for nc in (advertised or []):
+        if isinstance(nc, str) and "DnsZones" in nc:
+            _add(nc)
+    if base_dn:
+        _add(f"DC=DomainDnsZones,{base_dn}")
+    _add(f"DC=ForestDnsZones,{(root_domain_nc or base_dn)}")
+    if base_dn:
+        _add(f"CN=MicrosoftDNS,CN=System,{base_dn}")
+    return parts
+
+
 class Entry(dict):
     """A single LDAP entry: its ``dn``, decoded ``attributes`` (string values),
     and ``raw`` (bytes) for binary attributes the runner parses itself
@@ -215,6 +247,12 @@ class ActiveDirectoryClient:
             val = getattr(info, key.lower(), None) or (info.other or {}).get(key)
             if val is not None:
                 root[key] = val[0] if isinstance(val, list) and len(val) == 1 else val
+        # ldap3 parses namingContexts into its own DsaInfo attribute
+        # (naming_contexts) rather than leaving it in `other`, so read it there;
+        # the app partitions (Domain/ForestDnsZones) are not in `other`.
+        nc = getattr(info, "naming_contexts", None)
+        if nc:
+            root["namingContexts"] = list(nc)
         self._root_dse = root
         return root
 
@@ -225,16 +263,16 @@ class ActiveDirectoryClient:
         self.config_nc = str(root.get("configurationNamingContext", "") or "")
         self.schema_nc = str(root.get("schemaNamingContext", "") or "")
         self.root_domain_nc = str(root.get("rootDomainNamingContext", self.base_dn) or "")
-        # AD-integrated DNS lives in application partitions named DomainDnsZones /
-        # ForestDnsZones (plus a legacy container under the domain's System).
+        # AD-integrated DNS lives in the DomainDnsZones / ForestDnsZones
+        # application partitions (plus a legacy System container). Derive these
+        # rather than trusting the RootDSE to advertise them — see
+        # ``dns_partition_candidates``.
         contexts = root.get("namingContexts") or []
         if isinstance(contexts, str):
             contexts = [contexts]
-        self.dns_partitions = [c for c in contexts if "DnsZones" in c]
-        if self.base_dn:
-            legacy = f"CN=MicrosoftDNS,CN=System,{self.base_dn}"
-            if legacy not in self.dns_partitions:
-                self.dns_partitions.append(legacy)
+        self.dns_partitions = dns_partition_candidates(
+            self.base_dn, self.root_domain_nc, contexts
+        )
 
     def root_dse(self) -> Dict[str, Any]:
         return dict(self._root_dse)

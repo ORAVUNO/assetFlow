@@ -37,9 +37,13 @@ naming contexts, so the collectors don't hard-code them:
 - `configurationNamingContext` → the forest config, home of the **PKI**
   containers (`CN=Public Key Services,CN=Services,…`) — certificate templates
   and enterprise CAs
-- `namingContexts` entries containing `DnsZones` → the **AD-integrated DNS**
-  application partitions (`DomainDnsZones` / `ForestDnsZones`), plus the legacy
-  `CN=MicrosoftDNS,CN=System,<domain>` container
+- the **AD-integrated DNS** application partitions (`DomainDnsZones` /
+  `ForestDnsZones`), plus the legacy `CN=MicrosoftDNS,CN=System,<domain>`
+  container. These are **derived** from the base / root-domain NCs by
+  `dns_partition_candidates`, not taken solely from the RootDSE: a plain bind may
+  not advertise the app partitions (and ldap3 surfaces `namingContexts`
+  separately), so relying on the advertised list alone leaves you searching only
+  the legacy container — which on a modern DC holds just `RootDNSServers`
 
 The collectors reach everything through one primitive:
 
