@@ -217,6 +217,10 @@ class ActiveDirectoryClient:
                 authentication=ldap3.NTLM if "\\" in self.username else ldap3.SIMPLE,
                 auto_bind=True,
                 receive_timeout=self.request_timeout,
+                # Don't chase referrals: reading e.g. the DomainDnsZones partition
+                # can return referrals this bind can't follow, which otherwise
+                # surface as a silent empty result. Read what this DC holds.
+                auto_referrals=False,
             )
         except LDAPException as exc:
             raise ActiveDirectoryConfigError(
