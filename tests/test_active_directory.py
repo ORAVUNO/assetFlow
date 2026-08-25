@@ -406,6 +406,29 @@ def test_clean_host_strips_scheme_and_port():
     assert ad_client_mod.clean_host("  dc.corp.local  ") == "dc.corp.local"
 
 
+def test_dns_partition_candidates_derives_app_partitions():
+    # Even when the RootDSE advertises nothing, the DomainDnsZones /
+    # ForestDnsZones app partitions are derived from the base / root-domain NCs,
+    # so real zones are searched — not just the legacy RootDNSServers container.
+    parts = ad_client_mod.dns_partition_candidates("DC=corp,DC=local")
+    assert "DC=DomainDnsZones,DC=corp,DC=local" in parts
+    assert "DC=ForestDnsZones,DC=corp,DC=local" in parts
+    assert "CN=MicrosoftDNS,CN=System,DC=corp,DC=local" in parts
+
+
+def test_dns_partition_candidates_uses_forest_root_and_dedupes():
+    parts = ad_client_mod.dns_partition_candidates(
+        "DC=child,DC=corp,DC=local",
+        root_domain_nc="DC=corp,DC=local",
+        advertised=["DC=DomainDnsZones,DC=child,DC=corp,DC=local", "DC=corp,DC=local"],
+    )
+    # Forest partition follows the forest root, not the child domain.
+    assert "DC=ForestDnsZones,DC=corp,DC=local" in parts
+    # Advertised app partition kept; non-DnsZones context ignored; no duplicates.
+    assert parts.count("DC=DomainDnsZones,DC=child,DC=corp,DC=local") == 1
+    assert "DC=corp,DC=local" not in parts
+
+
 def test_default_port_follows_ssl():
     assert ad_client_mod.build_client(host="dc", username="u", password="p",
                                       use_ssl=True).port == 636
