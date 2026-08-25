@@ -134,8 +134,8 @@ queries:
   - id: AD001
     category: Users
     name: Users
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: users
     purpose: >-
       Inventory every user account with the identity fields the unified Users
@@ -165,8 +165,8 @@ queries:
   - id: AD002
     category: Groups
     name: Groups
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: groups
     purpose: >-
       Inventory security and distribution groups with their scope
@@ -190,8 +190,8 @@ queries:
   - id: AD003
     category: Groups
     name: Group Memberships
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: group_members
     purpose: >-
       Expand each group's `member` attribute into one row per (group, member)
@@ -209,8 +209,8 @@ queries:
   - id: AD004
     category: Organizational Units
     name: Organizational Units
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: organizational_units
     purpose: Inventory the OU tree — AD's native organizing container.
     expected_output_fields:
@@ -225,8 +225,8 @@ queries:
   - id: AD005
     category: Computers
     name: Computers
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: computers
     purpose: >-
       Inventory computer accounts as devices, with DNS hostname, operating
@@ -251,8 +251,8 @@ queries:
   - id: AD006
     category: Job Titles
     name: Job Titles
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: job_titles
     purpose: >-
       Aggregate the distinct `title` values across users into a headcount per
@@ -269,8 +269,8 @@ queries:
   - id: AD007
     category: Accounts/Tenants
     name: Domain (Account/Tenant)
-    status: partially_validated
-    validated: false
+    status: validated
+    validated: true
     resource: domain
     purpose: >-
       The domain object — on-prem AD's single "account/tenant" — with its DNS
@@ -292,8 +292,8 @@ queries:
   - id: AD008
     category: Managed Identities
     name: Managed Service Accounts
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: managed_service_accounts
     purpose: >-
       Inventory group and standalone Managed Service Accounts (gMSA/sMSA) — the
@@ -315,8 +315,8 @@ queries:
   - id: AD009
     category: Certificates
     name: Certificate Templates
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: certificate_templates
     purpose: >-
       List AD CS certificate templates from the Configuration NC, including which
@@ -338,8 +338,8 @@ queries:
   - id: AD010
     category: Certificates
     name: Certification Authorities
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: certificate_authorities
     purpose: >-
       List the enterprise CAs (enrollment services) published in AD, with each
@@ -362,8 +362,8 @@ queries:
   - id: AD011
     category: Certificates
     name: Published Certificates
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: published_certificates
     purpose: >-
       Enumerate end-entity certificates published to AD (the userCertificate
@@ -393,8 +393,8 @@ queries:
   - id: AD012
     category: DNS
     name: DNS Zones
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: dns_zones
     purpose: List the AD-integrated DNS zones stored in the directory's DNS partitions.
     expected_output_fields:
@@ -412,21 +412,21 @@ queries:
   - id: AD013
     category: DNS
     name: DNS Records
-    status: investigation_required
-    validated: false
+    status: validated
+    validated: true
     resource: dns_records
     purpose: >-
       Enumerate AD-integrated DNS records, decoding each dnsRecord blob into a
-      typed record (A, AAAA, CNAME, NS, PTR, MX, SRV, TXT, SOA). A/AAAA records
-      also emit host.name/host.ip so name→address records fold into Devices.
+      typed record (A, AAAA, CNAME, NS, PTR, MX, SRV, TXT, SOA). Forward A/AAAA
+      and reverse PTR records both fold into Devices (name↔address).
     expected_output_fields:
       - zone                # parent zone
       - record.name         # dnsNode name (dc), '@' for the zone apex
       - record.type         # A / AAAA / CNAME / NS / PTR / MX / SRV / TXT / SOA / …
       - record.data         # decoded record data (IP, target name, etc.)
       - ttl                 # record TTL in seconds
-      - host.name           # fqdn for A/AAAA records (Devices-inventory key)
-      - host.ip             # address for A/AAAA records (Devices-inventory key)
+      - host.name           # A/AAAA: the fqdn; PTR: the target host (Devices key)
+      - host.ip             # A/AAAA: the address; PTR: IP rebuilt from the reverse name
     notes: >-
       LDAP filter (objectClass=dnsNode) under the DNS partitions. The dnsRecord
       attribute is a packed binary blob (fixed header + type-specific RDATA,

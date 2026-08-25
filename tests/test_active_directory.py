@@ -372,6 +372,36 @@ def test_dns_records_decode_and_fold_a_records():
     assert by_type["CNAME"][cols.index("host.ip")] == ""
 
 
+def test_ptr_to_ip_reconstruction():
+    # Split reverse zones: the record name + zone together form the full address.
+    assert ad_runner_mod.ptr_to_ip("22.168.18", "172.in-addr.arpa") == "172.18.168.22"
+    assert ad_runner_mod.ptr_to_ip("5", "0.0.10.in-addr.arpa") == "10.0.0.5"
+    # Classless / partial names don't form a complete address → blank.
+    assert ad_runner_mod.ptr_to_ip("168.18", "172.in-addr.arpa") == ""
+    # IPv6 reverse: 32 reversed nibbles.
+    rev = ".".join(reversed(list("0" * 31 + "1")))
+    assert ad_runner_mod.ptr_to_ip(rev, "ip6.arpa").endswith(":0001")
+
+
+def test_dns_ptr_records_fold_into_devices():
+    client = FakeClient(
+        {"objectClass=dnsNode": [
+            Entry(dn="DC=22.168.18,DC=172.in-addr.arpa,CN=MicrosoftDNS,"
+                     "DC=DomainDnsZones,DC=corp,DC=local",
+                  attributes={"name": "22.168.18"},
+                  raw={"dnsRecord": [_dns_blob(12, _count_name("web01.corp.local"))]}),
+        ]},
+        dns_partitions=["DC=DomainDnsZones,DC=corp,DC=local"],
+    )
+    result = ad_runner_mod.run_query(client, _q("dns_records"))
+    cols = result.column_names
+    row = result.rows[0]
+    assert row[cols.index("record.type")] == "PTR"
+    # PTR target becomes host.name; the reversed zone name becomes host.ip.
+    assert row[cols.index("host.name")] == "web01.corp.local"
+    assert row[cols.index("host.ip")] == "172.18.168.22"
+
+
 def test_limit_caps_rows():
     client = FakeClient({
         "objectClass=user": [Entry(attributes={"sAMAccountName": f"u{i}"}) for i in range(5)]

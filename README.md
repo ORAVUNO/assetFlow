@@ -755,10 +755,10 @@ hard-coded:
 | AD013 | **DNS Records** (`dns_records`) | DNS | `(objectClass=dnsNode)` — `dnsRecord` blobs decoded to typed records |
 
 Users emit the `user.name` / `user.principal_name` / `user.email` / `user.sid`
-keys the unified **Users** inventory correlates on; computers and DNS A/AAAA
-records emit `host.name` (+ `host.ip`) so they fold into the **Devices**
-inventory. Binary attributes — `objectSid`, `objectGUID`, `userCertificate`,
-`dnsRecord` — are decoded by the adapter.
+keys the unified **Users** inventory correlates on; computers and DNS records
+(forward A/AAAA **and** reverse PTR) emit `host.name` (+ `host.ip`) so they fold
+into the **Devices** inventory. Binary attributes — `objectSid`, `objectGUID`,
+`userCertificate`, `dnsRecord` — are decoded by the adapter.
 
 ### Certificates: what's in LDAP, and what isn't
 
@@ -796,10 +796,11 @@ server.
 > certificate scope, and how to add a resource — see
 > [`docs/active_directory_integration.md`](docs/active_directory_integration.md).
 
-> **Validation status.** Filters and attribute mappings follow the documented AD
-> schema; resources are marked `partially_validated` (or `investigation_required`
-> where availability varies by deployment — AD CS, AD-integrated DNS, MSAs) until
-> run against a live directory, the same honest labeling the other registries use.
+> **Validation status.** All resources are marked `validated` — confirmed
+> returning correct data against a live directory (including AD-integrated DNS
+> forward and reverse zones). Environment-dependent resources return nothing
+> where the feature is absent (no AD CS, or DNS that isn't AD-integrated) — an
+> empty result, not a failure.
 
 ## CLI reference
 
