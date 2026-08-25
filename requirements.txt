@@ -10,3 +10,6 @@ SQLAlchemy>=2.0
 requests>=2.31
 # Optional — VMware adapter Custom Attributes only (standard inventory works without it):
 # pyvmomi>=8.0
+# Optional — Active Directory adapter (LDAP transport; cryptography adds cert parsing):
+# ldap3>=2.9
+# cryptography>=41.0

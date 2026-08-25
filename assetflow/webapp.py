@@ -1007,7 +1007,8 @@ const KIND_LOGO={
   vmware:{bg:'#607d8b',fg:'#ffffff',txt:'vm'},
   solarwinds:{bg:'#f7941e',fg:'#1c1e24',txt:'SW'},
   tenable_sc:{bg:'#00447c',fg:'#ffffff',txt:'sc'},
-  assetexplorer:{bg:'#c1272d',fg:'#ffffff',txt:'AE'}
+  assetexplorer:{bg:'#c1272d',fg:'#ffffff',txt:'AE'},
+  active_directory:{bg:'#0078d4',fg:'#ffffff',txt:'AD'}
 };
 function kindMeta(kind){return KIND_LOGO[kind]||{bg:'#8a8f98',fg:'#ffffff',txt:String(kind||'?').slice(0,2)};}
 function kindName(kind){const k=(KINDS||[]).find(x=>x.kind===kind);return k?k.name:(kind||'');}
@@ -1394,21 +1395,23 @@ function applyKind(kind){
   const solarwinds = (kind==='solarwinds');
   const tenable_sc = (kind==='tenable_sc');
   const assetexplorer = (kind==='assetexplorer');
+  const active_directory = (kind==='active_directory');
   // Tufin uses an API base path; AssetExplorer reuses that field as its portal;
-  // Elasticsearch, VMware, and SolarWinds use a port; Tenable.sc / AssetExplorer
-  // use neither port.
+  // Active Directory reuses it as an optional Base DN; Elasticsearch, VMware,
+  // SolarWinds, and AD use a port; Tenable.sc / AssetExplorer use neither port.
   document.getElementById('f_port').classList.toggle('hidden', tufin||tenable_sc||assetexplorer);
-  document.getElementById('f_basepath').classList.toggle('hidden', !tufin && !assetexplorer);
+  document.getElementById('f_basepath').classList.toggle('hidden', !tufin && !assetexplorer && !active_directory);
   // AssetExplorer's OAuth client-secret / on-prem API-key fields ride only for it.
   document.getElementById('f_aesecret').classList.toggle('hidden', !assetexplorer);
   document.getElementById('f_aekey').classList.toggle('hidden', !assetexplorer);
-  // The base-path field is labeled "API base path" for Tufin and "Portal" for
-  // AssetExplorer; relabel its text node to match the current kind.
+  // The base-path field is labeled "API base path" for Tufin, "Portal" for
+  // AssetExplorer, and "Base DN" for Active Directory; relabel to match.
   document.getElementById('f_basepath').childNodes[0].nodeValue =
-    assetexplorer ? 'Portal ' : 'API base path ';
+    assetexplorer ? 'Portal ' : (active_directory ? 'Base DN ' : 'API base path ');
   // The (hidden) base-path field defaults to Tufin's value; clear it for kinds
-  // that don't use it so it isn't sent as a stray API prefix.
-  if(!tufin) document.getElementById('c_basepath').value='';
+  // that don't use it so it isn't sent as a stray API prefix. Tufin and AD keep
+  // it (AD's Base DN is user-supplied and optional).
+  if(!tufin && !active_directory) document.getElementById('c_basepath').value='';
   const remember='Credentials stay in this local server\'s memory unless you tick Remember (then stored in the local database). ';
   if(assetexplorer){
     document.getElementById('c_host').placeholder = 'assetexplorer.example.com  ·  sdpondemand.manageengine.com';
@@ -1448,6 +1451,22 @@ function applyKind(kind){
       '<code>https://host:17774/SolarWinds/InformationService/v3/Json/Query</code> and runs SWQL. '+
       'Fetches typed device inventory with custom properties (columns prefixed <code>custom.</code>); '+
       'NCM config posture, config-change, and compliance resources need NCM licensed.';
+    return;
+  }
+  if(active_directory){
+    document.getElementById('c_host').placeholder = 'dc01.corp.local  ·  10.0.0.1';
+    document.getElementById('c_user').placeholder = 'user@corp.local  ·  CORP\\\\user';
+    document.getElementById('c_port').placeholder = '636 (LDAPS) · 389 (LDAP)';
+    document.getElementById('c_basepath').placeholder = 'DC=corp,DC=local (optional — auto-detected)';
+    document.getElementById('c_timeout').value = '30';
+    document.getElementById('c_hint').innerHTML = remember+
+      'Connects to on-prem Active Directory (AD DS) over LDAP — <code>ldaps://host:636</code> '+
+      'by default (port <code>389</code> switches to plain LDAP). Bind with a read account '+
+      '(<code>user@domain</code> or <code>DOMAIN\\user</code>); the search base is auto-detected '+
+      'from the RootDSE unless you set a <code>Base DN</code>. Fetches users, groups, OUs, '+
+      'computers, job titles, the domain, managed service accounts, AD CS certificate '+
+      'templates / CAs / published certs, and AD-integrated DNS. Needs the <code>ldap3</code> '+
+      'package installed on the server.';
     return;
   }
   if(vmware){

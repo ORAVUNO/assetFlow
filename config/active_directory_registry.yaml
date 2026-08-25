@@ -1,0 +1,436 @@
+# =============================================================================
+# Microsoft Active Directory (AD DS) Asset Intelligence Registry
+# =============================================================================
+# Resource registry for the Active Directory adapter. Where the Elasticsearch
+# registry carries ES|QL query bodies, each entry here names a `resource` that
+# the AD runner maps to one or more LDAP searches and normalizes into the shared
+# column/row shape (see assetflow/active_directory_runner.py).
+#
+# Transport: on-prem AD DS over LDAP (ldap://dc:389 or ldaps://dc:636), bound
+# with a read account. The client discovers the directory's naming contexts from
+# the RootDSE (see assetflow/active_directory_client.py):
+#   - defaultNamingContext        -> users, groups, OUs, computers, MSAs, domain
+#   - configurationNamingContext  -> the PKI config (CN=Public Key Services):
+#                                     certificate templates + enterprise CAs
+#   - DomainDnsZones/ForestDnsZones application partitions -> AD-integrated DNS
+#
+# Certificate scope: over LDAP you get the PKI *config* (templates, CAs) plus
+# *published* end-entity certs (userCertificate). The full AD CS issued-cert
+# inventory lives in the CA database and is read from the CA itself
+# (certutil -view / PSPKI), NOT over LDAP — see the certificate resources below.
+#
+# DNS scope: only AD-integrated zones live in the directory. File-backed
+# standalone Windows DNS or third-party DNS (BIND/Infoblox) is not in AD.
+#
+# Status meanings match the other registries:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Attribute/filter mapping follows the documented AD
+#                              schema; needs confirming against a live directory.
+#   - investigation_required : Availability/shape varies by deployment (e.g. AD CS
+#                              or AD-integrated DNS not present, or naming varies).
+#   - not_validated          : Not yet exercised against live data.
+# =============================================================================
+
+metadata:
+  version: 1
+  description: >-
+    Microsoft Active Directory (AD DS) asset intelligence over LDAP — users,
+    groups, organizational units, computers, job titles, the domain, managed
+    service accounts, AD CS certificate templates / CAs / published certs, and
+    AD-integrated DNS zones and records. Attribute and filter mappings follow the
+    documented AD schema; binary attributes (SID, GUID, certificates, dnsRecord)
+    are decoded by the adapter.
+  query_language: LDAP
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Users
+    - Groups
+    - Organizational Units
+    - Computers
+    - Job Titles
+    - Accounts/Tenants
+    - Managed Identities
+    - Certificates
+    - DNS
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+feeds:
+  - id: FEED-AD-USERS
+    name: Users
+    category: Users
+    description: User accounts with UPN, email, title, department, manager, enabled state, and SID.
+    query_ids: [AD001]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AD-GROUPS
+    name: Groups
+    category: Groups
+    description: Security and distribution groups, their scope/category, and expanded membership edges.
+    query_ids: [AD002, AD003]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AD-OUS
+    name: Organizational Units
+    category: Organizational Units
+    description: The OU tree — the native AD organizing container.
+    query_ids: [AD004]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-AD-COMPUTERS
+    name: Computers
+    category: Computers
+    description: Computer accounts (devices) with OS name/version and last logon.
+    query_ids: [AD005]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-AD-JOBTITLES
+    name: Job Titles
+    category: Job Titles
+    description: Distinct job titles across users with a headcount per title.
+    query_ids: [AD006]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-AD-ACCOUNTS
+    name: Accounts / Tenants
+    category: Accounts/Tenants
+    description: The domain object — on-prem AD's single account/tenant, with SID and functional levels.
+    query_ids: [AD007]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-AD-MANAGED-IDENTITIES
+    name: Managed Identities
+    category: Managed Identities
+    description: Group/standalone Managed Service Accounts (gMSA/sMSA) — the on-prem managed identities.
+    query_ids: [AD008]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-AD-CERTIFICATES
+    name: Certificates
+    category: Certificates
+    description: >-
+      AD CS PKI config over LDAP — certificate templates (incl. which issue SSL /
+      Server Authentication certs) and enterprise CAs — plus certificates
+      published to AD. The full issued-cert inventory needs the CA database.
+    query_ids: [AD009, AD010, AD011]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-AD-DNS
+    name: DNS
+    category: DNS
+    description: AD-integrated DNS zones and records (dnsRecord blobs decoded to typed records).
+    query_ids: [AD012, AD013]
+    recommended_refresh_frequency: Daily
+
+# =============================================================================
+# QUERIES (resources)
+# =============================================================================
+queries:
+  - id: AD001
+    category: Users
+    name: Users
+    status: partially_validated
+    validated: false
+    resource: users
+    purpose: >-
+      Inventory every user account with the identity fields the unified Users
+      view keys on (sAMAccountName, UPN, email, SID) plus title, department,
+      company, manager, enabled state, creation and last-logon times.
+    expected_output_fields:
+      - user.name             # sAMAccountName (Users-inventory key)
+      - user.principal_name   # userPrincipalName / UPN (Users-inventory key)
+      - user.email            # mail (Users-inventory key)
+      - user.display_name     # displayName
+      - title                 # job title
+      - department            # department
+      - company               # company
+      - manager               # manager (CN)
+      - enabled               # from userAccountControl (ACCOUNTDISABLE bit)
+      - user.sid              # objectSid, decoded to S-1-5-… (Users-inventory key)
+      - when_created          # whenCreated
+      - last_logon            # lastLogonTimestamp (FILETIME, decoded)
+      - distinguished_name    # DN
+    notes: >-
+      LDAP filter (&(objectCategory=person)(objectClass=user)) under the
+      defaultNamingContext. objectSid is decoded from bytes; userAccountControl's
+      ACCOUNTDISABLE bit gives the enabled flag; lastLogonTimestamp is a Windows
+      FILETIME decoded to a date-time. Rows fold into the unified Users inventory.
+    recommended_refresh_frequency: Daily
+
+  - id: AD002
+    category: Groups
+    name: Groups
+    status: partially_validated
+    validated: false
+    resource: groups
+    purpose: >-
+      Inventory security and distribution groups with their scope
+      (Global/Domain Local/Universal) and category (Security/Distribution),
+      description, member count, SID, and owner.
+    expected_output_fields:
+      - group.name          # sAMAccountName / cn
+      - group.scope         # Global / Domain Local / Universal (from groupType)
+      - group.category      # Security / Distribution (from groupType)
+      - description
+      - member.count        # number of direct members
+      - group.sid           # objectSid, decoded
+      - managed_by          # managedBy (CN)
+      - when_created
+      - distinguished_name
+    notes: >-
+      LDAP filter (objectClass=group). groupType is a bit field: the sign bit
+      marks a security group, and the 0x2/0x4/0x8 bits give the scope.
+    recommended_refresh_frequency: Daily
+
+  - id: AD003
+    category: Groups
+    name: Group Memberships
+    status: partially_validated
+    validated: false
+    resource: group_members
+    purpose: >-
+      Expand each group's `member` attribute into one row per (group, member)
+      edge — the raw membership graph for access analysis.
+    expected_output_fields:
+      - group.name    # the group
+      - member.name   # member CN
+      - member.dn     # member distinguished name
+    notes: >-
+      LDAP filter (objectClass=group), reading the multi-valued `member`
+      attribute. Very large estates may want a size limit; nested membership is
+      not expanded here (this is the direct-member edge list).
+    recommended_refresh_frequency: Daily
+
+  - id: AD004
+    category: Organizational Units
+    name: Organizational Units
+    status: partially_validated
+    validated: false
+    resource: organizational_units
+    purpose: Inventory the OU tree — AD's native organizing container.
+    expected_output_fields:
+      - ou.name
+      - distinguished_name
+      - description
+      - managed_by
+      - when_created
+    notes: LDAP filter (objectClass=organizationalUnit) under the domain NC.
+    recommended_refresh_frequency: Weekly
+
+  - id: AD005
+    category: Computers
+    name: Computers
+    status: partially_validated
+    validated: false
+    resource: computers
+    purpose: >-
+      Inventory computer accounts as devices, with DNS hostname, operating
+      system and version, enabled state, and last logon — folding into the
+      unified Devices inventory.
+    expected_output_fields:
+      - host.name       # dNSHostName / name (Devices-inventory key)
+      - os.name         # operatingSystem (drives device categorization)
+      - os.version      # operatingSystemVersion
+      - dns.hostname    # dNSHostName
+      - enabled         # from userAccountControl
+      - host.id         # objectGUID, decoded
+      - when_created
+      - last_logon      # lastLogonTimestamp (FILETIME, decoded)
+      - distinguished_name
+    notes: >-
+      LDAP filter (objectClass=computer). host.name + os.name make these rows
+      fold into the cross-adapter Devices inventory (and get categorized as
+      servers/workstations from the OS string).
+    recommended_refresh_frequency: Daily
+
+  - id: AD006
+    category: Job Titles
+    name: Job Titles
+    status: partially_validated
+    validated: false
+    resource: job_titles
+    purpose: >-
+      Aggregate the distinct `title` values across users into a headcount per
+      job title (the same shape AD's own "job title" report shows).
+    expected_output_fields:
+      - title
+      - user.count    # how many users carry this title
+    notes: >-
+      Job title is a user attribute (`title`), not a separate object; this
+      resource groups users by it. LDAP filter
+      (&(objectCategory=person)(objectClass=user)(title=*)).
+    recommended_refresh_frequency: Weekly
+
+  - id: AD007
+    category: Accounts/Tenants
+    name: Domain (Account/Tenant)
+    status: partially_validated
+    validated: false
+    resource: domain
+    purpose: >-
+      The domain object — on-prem AD's single "account/tenant" — with its DNS
+      name, SID, forest, and domain/forest functional levels.
+    expected_output_fields:
+      - domain.dn
+      - domain.name               # DNS name derived from the DC= components
+      - domain.sid
+      - forest.dn                 # rootDomainNamingContext
+      - domain.functional_level   # RootDSE domainFunctionality
+      - forest.functional_level   # RootDSE forestFunctionality
+      - when_created
+    notes: >-
+      A base-scoped read of (objectClass=domainDNS) at the domain NC, enriched
+      with RootDSE functional-level values. "Tenant" is Entra ID (cloud)
+      language; on-prem the equivalent is this one domain.
+    recommended_refresh_frequency: Weekly
+
+  - id: AD008
+    category: Managed Identities
+    name: Managed Service Accounts
+    status: investigation_required
+    validated: false
+    resource: managed_service_accounts
+    purpose: >-
+      Inventory group and standalone Managed Service Accounts (gMSA/sMSA) — the
+      on-prem analogue of "managed identities".
+    expected_output_fields:
+      - msa.name
+      - msa.type          # gMSA / sMSA
+      - dns.hostname
+      - enabled
+      - when_created
+      - distinguished_name
+    notes: >-
+      LDAP filter matching msDS-GroupManagedServiceAccount /
+      msDS-ManagedServiceAccount. These normally live under
+      CN=Managed Service Accounts. Cloud "managed identities" are an Entra/Azure
+      concept and are NOT in on-prem AD — add an Entra adapter for those.
+    recommended_refresh_frequency: Weekly
+
+  - id: AD009
+    category: Certificates
+    name: Certificate Templates
+    status: investigation_required
+    validated: false
+    resource: certificate_templates
+    purpose: >-
+      List AD CS certificate templates from the Configuration NC, including which
+      templates issue SSL/TLS (Server Authentication) certificates.
+    expected_output_fields:
+      - template.name         # cn
+      - template.display_name # displayName
+      - schema_version        # msPKI-Template-Schema-Version
+      - key_usage             # pKIExtendedKeyUsage EKUs, mapped to names
+      - is_server_auth        # true when the Server Authentication EKU is present
+      - when_created
+    notes: >-
+      Read from CN=Certificate Templates,CN=Public Key Services,CN=Services under
+      the configurationNamingContext. is_server_auth = the SSL/TLS-issuing
+      templates (EKU 1.3.6.1.5.5.7.3.1). Returns no rows when AD CS is not
+      deployed in the forest.
+    recommended_refresh_frequency: Weekly
+
+  - id: AD010
+    category: Certificates
+    name: Certification Authorities
+    status: investigation_required
+    validated: false
+    resource: certificate_authorities
+    purpose: >-
+      List the enterprise CAs (enrollment services) published in AD, with each
+      CA's certificate subject/expiry and how many templates it offers.
+    expected_output_fields:
+      - ca.name
+      - dns.hostname          # dNSHostName of the CA
+      - ca.subject            # subject of the CA certificate (needs cryptography)
+      - ca.not_after          # CA certificate expiry
+      - templates.offered     # count of certificateTemplates published on the CA
+      - distinguished_name
+    notes: >-
+      Read from CN=Enrollment Services,CN=Public Key Services,CN=Services under
+      the configurationNamingContext (objectClass=pKIEnrollmentService). The CA
+      certificate subject/expiry are parsed from cACertificate when the optional
+      `cryptography` package is installed. This lists the CAs, not the certs they
+      issued — for the issued-cert inventory use the CA database (certutil/PSPKI).
+    recommended_refresh_frequency: Weekly
+
+  - id: AD011
+    category: Certificates
+    name: Published Certificates
+    status: investigation_required
+    validated: false
+    resource: published_certificates
+    purpose: >-
+      Enumerate end-entity certificates published to AD (the userCertificate
+      attribute on users/computers), decoded to subject/issuer/validity, and
+      flagged when they are SSL/TLS (Server Authentication) certificates.
+    expected_output_fields:
+      - owner              # sAMAccountName / dNSHostName / cn of the holder
+      - subject            # certificate subject (needs cryptography)
+      - issuer             # certificate issuer (needs cryptography)
+      - serial
+      - not_before
+      - not_after
+      - is_server_auth     # true when the Server Authentication EKU is present
+      - ekus               # decoded EKU names
+      - thumbprint_sha1    # always computed (hashlib), even without cryptography
+      - distinguished_name
+    notes: >-
+      LDAP filter (userCertificate=*). This is only the certs PUBLISHED to AD —
+      typically smartcard/user-auth certs; most server/SSL certs are not
+      published. The complete AD CS issued-certificate inventory (every issued /
+      revoked cert) lives in the CA database, which is not exposed over LDAP —
+      collect it from the CA with certutil -view / PSPKI as a separate feed.
+      Subject/issuer/validity/EKU parsing uses the optional `cryptography`
+      package; without it, each cert still surfaces with its SHA-1 thumbprint.
+    recommended_refresh_frequency: Weekly
+
+  - id: AD012
+    category: DNS
+    name: DNS Zones
+    status: investigation_required
+    validated: false
+    resource: dns_zones
+    purpose: List the AD-integrated DNS zones stored in the directory's DNS partitions.
+    expected_output_fields:
+      - zone.name
+      - dns.partition       # which application partition the zone lives in
+      - when_created
+      - distinguished_name
+    notes: >-
+      LDAP filter (objectClass=dnsZone) across the DomainDnsZones / ForestDnsZones
+      application partitions (and the legacy CN=MicrosoftDNS,CN=System container),
+      discovered from the RootDSE namingContexts. Returns no rows when DNS is not
+      AD-integrated (file-backed Windows DNS or third-party DNS is not in AD).
+    recommended_refresh_frequency: Daily
+
+  - id: AD013
+    category: DNS
+    name: DNS Records
+    status: investigation_required
+    validated: false
+    resource: dns_records
+    purpose: >-
+      Enumerate AD-integrated DNS records, decoding each dnsRecord blob into a
+      typed record (A, AAAA, CNAME, NS, PTR, MX, SRV, TXT, SOA). A/AAAA records
+      also emit host.name/host.ip so name→address records fold into Devices.
+    expected_output_fields:
+      - zone                # parent zone
+      - record.name         # dnsNode name (dc), '@' for the zone apex
+      - record.type         # A / AAAA / CNAME / NS / PTR / MX / SRV / TXT / SOA / …
+      - record.data         # decoded record data (IP, target name, etc.)
+      - ttl                 # record TTL in seconds
+      - host.name           # fqdn for A/AAAA records (Devices-inventory key)
+      - host.ip             # address for A/AAAA records (Devices-inventory key)
+    notes: >-
+      LDAP filter (objectClass=dnsNode) under the DNS partitions. The dnsRecord
+      attribute is a packed binary blob (fixed header + type-specific RDATA,
+      names as DNS_COUNT_NAME) decoded by the adapter; unknown record types fall
+      back to a hex dump so nothing is dropped. For typed records without blob
+      parsing, the Windows DnsServer PowerShell module is the alternative source.
+    recommended_refresh_frequency: Daily
