@@ -1008,7 +1008,8 @@ const KIND_LOGO={
   solarwinds:{bg:'#f7941e',fg:'#1c1e24',txt:'SW'},
   tenable_sc:{bg:'#00447c',fg:'#ffffff',txt:'sc'},
   assetexplorer:{bg:'#c1272d',fg:'#ffffff',txt:'AE'},
-  active_directory:{bg:'#0078d4',fg:'#ffffff',txt:'AD'}
+  active_directory:{bg:'#0078d4',fg:'#ffffff',txt:'AD'},
+  remedy:{bg:'#f26522',fg:'#ffffff',txt:'RM'}
 };
 function kindMeta(kind){return KIND_LOGO[kind]||{bg:'#8a8f98',fg:'#ffffff',txt:String(kind||'?').slice(0,2)};}
 function kindName(kind){const k=(KINDS||[]).find(x=>x.kind===kind);return k?k.name:(kind||'');}
@@ -1396,6 +1397,7 @@ function applyKind(kind){
   const tenable_sc = (kind==='tenable_sc');
   const assetexplorer = (kind==='assetexplorer');
   const active_directory = (kind==='active_directory');
+  const remedy = (kind==='remedy');
   // Tufin uses an API base path; AssetExplorer reuses that field as its portal;
   // Active Directory reuses it as an optional Base DN; Elasticsearch, VMware,
   // SolarWinds, and AD use a port; Tenable.sc / AssetExplorer use neither port.
@@ -1467,6 +1469,19 @@ function applyKind(kind){
       'computers, job titles, the domain, managed service accounts, AD CS certificate '+
       'templates / CAs / published certs, and AD-integrated DNS. Needs the <code>ldap3</code> '+
       'package installed on the server.';
+    return;
+  }
+  if(remedy){
+    document.getElementById('c_host').placeholder = 'remedy.example.com  ·  10.0.0.40';
+    document.getElementById('c_user').placeholder = 'svc-assetflow  ·  Demo';
+    document.getElementById('c_port').placeholder = '443  ·  8443 (on-prem)';
+    document.getElementById('c_timeout').value = '60';
+    document.getElementById('c_hint').innerHTML = remember+
+      'Connects to the BMC Remedy AR System REST API at <code>https://host/api</code> '+
+      '(username + password establishes a JWT via <code>/api/jwt/login</code>). Fetches CMDB '+
+      'computer systems (classified server / workstation), software, business services, and '+
+      'people, plus incidents and change requests. Site-defined custom fields ride along as '+
+      '<code>custom.</code> columns. The account needs read access to the relevant AR forms.';
     return;
   }
   if(vmware){

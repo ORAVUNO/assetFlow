@@ -4,9 +4,10 @@ Asset-intelligence tool that fetches assets from pluggable **adapters** (data
 sources), shows them in a local web UI, and persists every fetch to a local
 database. Elasticsearch is the first adapter, Tufin SecureTrack is the second,
 VMware vCenter is the third, SolarWinds Orion is the fourth, Tenable.sc
-(SecurityCenter) is the fifth, ManageEngine AssetExplorer is the sixth, and
-Microsoft Active Directory is the seventh; more sources plug in beside them,
-grouped by category, so results from many sources can later be merged.
+(SecurityCenter) is the fifth, ManageEngine AssetExplorer is the sixth,
+Microsoft Active Directory is the seventh, and BMC Remedy (AR System / CMDB) is
+the eighth; more sources plug in beside them, grouped by category, so results
+from many sources can later be merged.
 
 - **Adapters & connections:** each adapter *kind* (Elasticsearch, Tufin, VMware,
   SolarWinds, …) is a template with its own metadata and query registry. You can
@@ -22,9 +23,11 @@ grouped by category, so results from many sources can later be merged.
   [SolarWinds adapter](#solarwinds-orion-adapter)), **Tenable.sc (SecurityCenter)**
   (category *Vulnerability Management*), **ManageEngine AssetExplorer**
   (category *IT Asset Management / CMDB* — see
-  [AssetExplorer adapter](#manageengine-assetexplorer-adapter)), and **Microsoft
+  [AssetExplorer adapter](#manageengine-assetexplorer-adapter)), **Microsoft
   Active Directory** (category *Identity / Directory* — see
-  [Active Directory adapter](#microsoft-active-directory-adapter)).
+  [Active Directory adapter](#microsoft-active-directory-adapter)), and **BMC
+  Remedy (AR System / CMDB)** (category *IT Asset Management / CMDB* — see
+  [BMC Remedy adapter](#bmc-remedy-adapter)).
 - **Registry:** `config/asset_intelligence_registry.yaml` — the Elasticsearch
   adapter's 25 ES|QL queries grouped into 8 feeds (Identity, User Management,
   Service Change, Application Discovery, Database Discovery, File Integrity,
@@ -49,6 +52,11 @@ grouped by category, so results from many sources can later be merged.
   Titles, Accounts/Tenants, Managed Identities, Certificates, DNS): identity and
   infrastructure inventory over LDAP, with SID/GUID/certificate/`dnsRecord` blobs
   decoded by the adapter.
+  `config/remedy_registry.yaml` — the BMC Remedy adapter's 6 AR REST resources in
+  6 feeds (Computer Systems, Software, Business Services, People, Incidents,
+  Changes): CMDB computer systems (classified server / workstation), software,
+  business services, and people, plus the ITSM operational context (incidents and
+  change requests), with default + site-defined custom (`custom.`) fields.
 - **Database:** fetched results are saved to a local SQLite file
   (`assetflow.db`, gitignored). The newest run per query is the panel's saved
   view; older runs form the history. Real telemetry never leaves your machine.
@@ -66,7 +74,8 @@ correlation design, decisions & flow ·
 [`docs/solarwinds_integration.md`](docs/solarwinds_integration.md) ·
 [`docs/tenable_sc_integration.md`](docs/tenable_sc_integration.md) ·
 [`docs/assetexplorer_integration.md`](docs/assetexplorer_integration.md) ·
-[`docs/active_directory_integration.md`](docs/active_directory_integration.md).
+[`docs/active_directory_integration.md`](docs/active_directory_integration.md) ·
+[`docs/remedy_integration.md`](docs/remedy_integration.md).
 
 ## Requirements
 
@@ -98,6 +107,10 @@ correlation design, decisions & flow ·
   subject/issuer/validity parsing additionally uses **`cryptography`** when
   present (thumbprints work without it). AD CS certificate resources need AD CS
   deployed, and the DNS resources need DNS to be AD-integrated.
+- For the BMC Remedy adapter: network access to your BMC Remedy AR System host
+  and an AR account with read access to the relevant forms (host + username +
+  password). Everything is read over the AR System REST API (JWT auth); no extra
+  Python package is required.
 
 ## Setup
 
@@ -801,6 +814,68 @@ server.
 > forward and reverse zones). Environment-dependent resources return nothing
 > where the feature is absent (no AD CS, or DNS that isn't AD-integrated) — an
 > empty result, not a failure.
+
+## BMC Remedy adapter
+
+The **BMC Remedy** adapter (category *IT Asset Management / CMDB*) fetches asset
+and service inventory from **BMC Remedy AR System / Atrium CMDB** over the **AR
+System REST API** and folds it into the same host-keyed views as the other
+adapters. It answers "which of our CMDB CIs, software, services, and people — and
+the incidents/changes around them — can we actually pull from Remedy?"
+
+### What it fetches
+
+Six resources (`RMD001`–`RMD006`). The client authenticates with a JWT
+(`POST /api/jwt/login`) and reads each AR form with paged
+`GET /api/arsys/v1/entry/<form>` calls:
+
+| ID | Resource | Feed | `asset.type` | AR form |
+|---|---|---|---|---|
+| RMD001 | **Computer Systems** (`computer_systems`) | Computer Systems | `Server` / `Workstation` / `Computer System` | `BMC.CORE:BMC_ComputerSystem` — hostname, IP, make/model, serial, CTI, lifecycle, owner, + `custom.*` |
+| RMD002 | **Software** (`software`) | Software | `Software` | `BMC.CORE:BMC_Product` — version, manufacturer, CTI, lifecycle |
+| RMD003 | **Business Services** (`business_services`) | Business Services | `Business Service` | `BMC.CORE:BMC_BusinessService` — description, status, company, owner |
+| RMD004 | **People** (`people`) | People | `Person` | `CTM:People` — corporate id, email, phone, org, department, site |
+| RMD005 | **Incidents** (`incidents`) | Incidents | `Incident` | `HPD:Help Desk` — status, priority, impact/urgency, service, affected CI |
+| RMD006 | **Changes** (`changes`) | Changes | `Change Request` | `CHG:Infrastructure Change` — status, risk, priority, coordinator, schedule |
+
+Computer systems, software, business services, and people emit a `host.name`
+column (with `host.ip` on computer systems where the CMDB denormalizes it) so
+they fold into the unified **All Fetched Results** view alongside the other
+adapters. Computer systems are classified into `asset.type` from their
+`SystemRole`.
+
+### Custom fields
+
+AR forms routinely carry site-added fields. The entry `values` come back keyed by
+field label; any label the runner does not map to a standard column — and that is
+not AR plumbing (Request ID, Submitter, `z*` workflow fields, …) — is emitted as
+its own column prefixed **`custom.`** (e.g. `custom.Cost Center`), so
+system-provided fields and site-defined custom fields are never confused. The
+custom columns are discovered dynamically from the rows in scope.
+
+### Connecting
+
+In the web UI, open the **BMC Remedy (AR System / CMDB)** card and click
+**Connection**: enter the **host**, **username**, **password**, and optional
+**port** (443, or 8443/8008 on-prem). Toggle **Verify TLS certificate** (keep it
+on for production; disable only for a lab/self-signed environment). Or set
+`REMEDY_HOST` / `REMEDY_USERNAME` / `REMEDY_PASSWORD` in `.env` (see
+`.env.example`) to auto-connect on startup. Credentials entered in the form are
+held in the local server's memory only unless you tick **Remember**. No extra
+Python package is required — the REST client uses the standard library
+(`requests` is used automatically when installed). The account needs read access
+to the relevant AR forms.
+
+> **Developer guide.** For a full walkthrough — the JWT session, entry paging,
+> the field-label mapping, the `custom.*` discovery, and how to add a resource —
+> see [`docs/remedy_integration.md`](docs/remedy_integration.md).
+
+> **Validation status.** All resources are marked `partially_validated`: the AR
+> forms and REST endpoints follow BMC's AR System REST API and the Atrium CMDB
+> common data model, but the field-label mapping is best-effort and should be
+> confirmed against your Remedy/CMDB release (labels vary with localization,
+> normalization, and site customization). Fields that don't match simply come
+> back blank or as `custom.*`; they are not failures.
 
 ## CLI reference
 

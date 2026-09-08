@@ -1,0 +1,276 @@
+# =============================================================================
+# BMC Remedy (AR System / Atrium CMDB) Asset Intelligence Registry
+# =============================================================================
+# Resource registry for the BMC Remedy adapter. Where the Elasticsearch registry
+# carries ES|QL query bodies, each entry here names a `resource` that the Remedy
+# runner maps to a BMC Remedy AR *form* and normalizes into the same column/row
+# shape (see assetflow/remedy_runner.py).
+#
+# Transport (see assetflow/remedy_client.py): the BMC Remedy AR System REST API.
+#   - POST /api/jwt/login                      <- JWT auth (username + password)
+#   - GET  /api/arsys/v1/entry/<form>          <- paged entry read (offset/limit)
+#       BMC.CORE:BMC_ComputerSystem   <- CMDB computer systems (servers/clients)
+#       BMC.CORE:BMC_Product          <- installed software / products
+#       BMC.CORE:BMC_BusinessService  <- business service CIs
+#       CTM:People                    <- people (asset owners / support contacts)
+#       HPD:Help Desk                 <- incidents (operational context)
+#       CHG:Infrastructure Change     <- change requests (change history)
+#
+# Custom fields: AR forms routinely carry site-added fields. Any field label the
+# runner does not map to a standard column (and that is not AR plumbing) is
+# emitted as its own column prefixed `custom.` so system fields and site-defined
+# custom fields are never confused. Custom columns are discovered dynamically
+# (the union of extra fields on the rows in scope).
+#
+# Status meanings match the other registries:
+#   - validated              : Confirmed working against live data.
+#   - partially_validated    : Form/endpoint confirmed from BMC's AR REST docs;
+#                              field-label mapping is best-effort and needs
+#                              confirming against a live Remedy/CMDB release.
+#   - investigation_required : Form exists but response shape / field labels vary
+#                              by Remedy version, CMDB normalization, or licensing.
+#   - not_validated          : Not yet exercised against live data.
+# =============================================================================
+
+metadata:
+  version: 1
+  description: >-
+    BMC Remedy (AR System / Atrium CMDB) inventory and asset-intelligence
+    resources — CMDB computer systems (servers / workstations), installed
+    software, business services, people, and the ITSM operational context
+    (incidents and change requests) — enriched with site-defined custom fields
+    (prefixed `custom.`). Forms are read over the AR System REST API.
+  query_language: BMC Remedy AR REST
+  status_values:
+    - validated
+    - partially_validated
+    - investigation_required
+    - not_validated
+  categories:
+    - Computer Systems
+    - Software
+    - Business Services
+    - People
+    - Incidents
+    - Changes
+
+# =============================================================================
+# FEEDS
+# =============================================================================
+feeds:
+  - id: FEED-RMD-COMPUTERS
+    name: Computer Systems
+    category: Computer Systems
+    description: CMDB computer systems classified server / workstation, with hostname, IP, make/model, serial, CTI, lifecycle, and custom fields.
+    query_ids: [RMD001]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-RMD-SOFTWARE
+    name: Software
+    category: Software
+    description: Installed software / product CIs with version, manufacturer, CTI, and lifecycle.
+    query_ids: [RMD002]
+    recommended_refresh_frequency: Daily
+
+  - id: FEED-RMD-SERVICES
+    name: Business Services
+    category: Business Services
+    description: Business service CIs with status, owning company, and support ownership.
+    query_ids: [RMD003]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-RMD-PEOPLE
+    name: People
+    category: People
+    description: People records — asset owners and support contacts — with org, department, site, and email.
+    query_ids: [RMD004]
+    recommended_refresh_frequency: Weekly
+
+  - id: FEED-RMD-INCIDENTS
+    name: Incidents
+    category: Incidents
+    description: Help-desk incidents with status, priority, impact/urgency, service, and affected CI.
+    query_ids: [RMD005]
+    recommended_refresh_frequency: Hourly
+
+  - id: FEED-RMD-CHANGES
+    name: Changes
+    category: Changes
+    description: Infrastructure change requests with status, risk, priority, coordinator, and schedule.
+    query_ids: [RMD006]
+    recommended_refresh_frequency: Hourly
+
+# =============================================================================
+# QUERIES (resources)
+# =============================================================================
+queries:
+  - id: RMD001
+    category: Computer Systems
+    name: Computer Systems (CMDB CIs)
+    status: partially_validated
+    validated: false
+    resource: computer_systems
+    purpose: >-
+      Inventory every CMDB computer system (BMC.CORE:BMC_ComputerSystem),
+      classified via asset.type (Server / Workstation / Computer System) from its
+      SystemRole, with hostname, IP, make/model, serial number, CTI
+      (Category/Type/Item), asset lifecycle status, owning company/region/site,
+      and every site-defined custom field merged in under custom.* columns.
+    expected_output_fields:
+      - host.name          # CI Name (folds into the unified host view)
+      - asset.type         # Server / Workstation / Computer System
+      - host.hostname      # HostName
+      - host.ip            # IPAddress (when denormalized onto the CI)
+      - domain             # Domain
+      - manufacturer       # Manufacturer
+      - model              # Model
+      - serial_number      # SerialNumber
+      - category           # CTI Category
+      - type               # CTI Type
+      - item               # CTI Item
+      - lifecycle_status   # AssetLifecycleStatus (Deployed / In Inventory / ...)
+      - company            # Company
+      - region             # Region
+      - site               # Site
+      - owner              # OwnerName / SupportGroupName
+      - "custom.*"         # each site-added AR field, prefixed custom.
+    notes: >-
+      GET /api/arsys/v1/entry/BMC.CORE:BMC_ComputerSystem, paged by offset/limit.
+      asset.type is derived from SystemRole ("Server" -> Server;
+      client/workstation/desktop/laptop -> Workstation) falling back to the CTI
+      Item/Type, then "Computer System". Field labels follow the BMC_ComputerSystem
+      class attributes; confirm against the target Remedy/CMDB release.
+    recommended_refresh_frequency: Daily
+
+  - id: RMD002
+    category: Software
+    name: Software / Products
+    status: partially_validated
+    validated: false
+    resource: software
+    purpose: >-
+      Inventory installed software / product CIs (BMC.CORE:BMC_Product), tagged
+      asset.type "Software", with version, manufacturer, CTI, and lifecycle
+      status, plus any custom fields under custom.*.
+    expected_output_fields:
+      - host.name          # product / software name
+      - asset.type         # "Software"
+      - version            # MarketVersion / VersionNumber
+      - manufacturer       # Manufacturer
+      - category           # CTI Category
+      - type               # CTI Type
+      - item               # CTI Item
+      - lifecycle_status   # AssetLifecycleStatus
+      - company            # Company
+      - "custom.*"         # each site-added AR field, prefixed custom.
+    notes: >-
+      GET /api/arsys/v1/entry/BMC.CORE:BMC_Product. BMC_Product covers software
+      products / licensable items in the CMDB; version comes from MarketVersion,
+      falling back to VersionNumber.
+    recommended_refresh_frequency: Daily
+
+  - id: RMD003
+    category: Business Services
+    name: Business Services
+    status: partially_validated
+    validated: false
+    resource: business_services
+    purpose: >-
+      Inventory business service CIs (BMC.CORE:BMC_BusinessService), tagged
+      asset.type "Business Service", with description, status, owning company,
+      and support ownership, plus custom fields under custom.*.
+    expected_output_fields:
+      - host.name          # service name
+      - asset.type         # "Business Service"
+      - description        # Description
+      - status             # AssetLifecycleStatus / Status
+      - company            # Company
+      - owner              # OwnerName / SupportGroupName
+      - "custom.*"         # each site-added AR field, prefixed custom.
+    notes: >-
+      GET /api/arsys/v1/entry/BMC.CORE:BMC_BusinessService. Business services are
+      the top-level service CIs that computer systems and software support.
+    recommended_refresh_frequency: Weekly
+
+  - id: RMD004
+    category: People
+    name: People (Owners / Support Contacts)
+    status: partially_validated
+    validated: false
+    resource: people
+    purpose: >-
+      List the CTM:People records — asset owners and support contacts — tagged
+      asset.type "Person", with corporate id, email, phone, organization,
+      department, site, and company, plus custom fields under custom.*.
+    expected_output_fields:
+      - host.name          # Full Name (or First + Last)
+      - asset.type         # "Person"
+      - corporate_id       # Corporate ID
+      - email              # Internet E-mail
+      - phone              # Phone Number Business
+      - organization       # Organization
+      - department         # Department
+      - site               # Site
+      - company            # Company
+      - support_staff      # Support Staff (Yes/No)
+      - "custom.*"         # each site-added AR field, prefixed custom.
+    notes: >-
+      GET /api/arsys/v1/entry/CTM:People. host.name uses Full Name, falling back
+      to "First Name" + "Last Name". These records are the owners referenced by
+      the computer-system and business-service CIs.
+    recommended_refresh_frequency: Weekly
+
+  - id: RMD005
+    category: Incidents
+    name: Incidents
+    status: partially_validated
+    validated: false
+    resource: incidents
+    purpose: >-
+      Fetch help-desk incidents (HPD:Help Desk), tagged asset.type "Incident",
+      with summary, status, priority, impact/urgency, service, the affected CI,
+      assignee, and submit date — the operational context around the assets.
+    expected_output_fields:
+      - incident.id        # Incident Number
+      - asset.type         # "Incident"
+      - summary            # Description (one-line summary)
+      - status             # Status
+      - priority           # Priority
+      - impact             # Impact
+      - urgency            # Urgency
+      - service            # Service Type
+      - ci.name            # HPD_CI (affected configuration item)
+      - assignee           # Assignee
+      - submit_date        # Submit Date
+      - "custom.*"         # each site-added AR field, prefixed custom.
+    notes: >-
+      GET /api/arsys/v1/entry/HPD:Help Desk. The affected CI (HPD_CI) links an
+      incident back to a computer-system row for impact reasoning. Consider a
+      recent-only qualification for large volumes (the client paging cap applies).
+    recommended_refresh_frequency: Hourly
+
+  - id: RMD006
+    category: Changes
+    name: Change Requests
+    status: partially_validated
+    validated: false
+    resource: changes
+    purpose: >-
+      Fetch infrastructure change requests (CHG:Infrastructure Change), tagged
+      asset.type "Change Request", with summary, status, risk level, priority,
+      coordinator group, and schedule — the change history around the assets.
+    expected_output_fields:
+      - change.id          # Infrastructure Change ID / Change Request ID
+      - asset.type         # "Change Request"
+      - summary            # Description
+      - status             # Change Request Status
+      - risk_level         # Risk Level
+      - priority           # Priority
+      - coordinator_group  # Change Coordinator Group
+      - scheduled_start    # Scheduled Start Date
+      - scheduled_end      # Scheduled End Date
+      - "custom.*"         # each site-added AR field, prefixed custom.
+    notes: >-
+      GET /api/arsys/v1/entry/CHG:Infrastructure Change. Provides the change
+      history (who changed what, when) used to reason about asset drift and risk.
+    recommended_refresh_frequency: Hourly
