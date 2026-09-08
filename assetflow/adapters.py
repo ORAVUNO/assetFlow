@@ -21,6 +21,8 @@ from . import assetexplorer_client as assetexplorer_client_mod
 from . import assetexplorer_runner as assetexplorer_runner_mod
 from . import client as client_mod
 from . import db as db_mod
+from . import remedy_client as remedy_client_mod
+from . import remedy_runner as remedy_runner_mod
 from . import runner as runner_mod
 from . import solarwinds_client as solarwinds_client_mod
 from . import solarwinds_runner as solarwinds_runner_mod
@@ -794,6 +796,96 @@ class ActiveDirectoryAdapter(Adapter):
         )
 
 
+class RemedyAdapter(Adapter):
+    """BMC Remedy (AR System / Atrium CMDB) source: fetches CMDB computer systems
+    (classified server / workstation), installed software, business services,
+    people, and the ITSM operational context (incidents and change requests) over
+    the AR System REST API (JWT-authenticated). Each row carries its standard
+    fields plus every site-defined custom field under a ``custom.`` prefix."""
+
+    def connect(
+        self,
+        *,
+        host: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        port: int = 443,
+        verify_certs: bool = True,
+        request_timeout: int = 60,
+    ) -> dict:
+        candidate = remedy_client_mod.build_client(
+            host=host or "",
+            username=username or "",
+            password=password or "",
+            port=port or 443,
+            verify_certs=verify_certs,
+            request_timeout=request_timeout,
+        )
+        info = remedy_client_mod.ping(candidate)  # JWT login + probe read, raises on failure
+        self._client = candidate
+        self._conn_info = info
+        return info
+
+    def connect_form(self, form: dict) -> dict:
+        return self.connect(
+            host=(form.get("host") or form.get("url") or None),
+            username=(form.get("username") or None),
+            password=(form.get("password") or None),
+            port=int(form.get("port") or 443),
+            verify_certs=bool(form.get("verify_certs", True)),
+            request_timeout=max(1, int(form.get("request_timeout") or 60)),
+        )
+
+    def try_auto_connect(self) -> bool:
+        try:
+            candidate = remedy_client_mod.build_client_from_env()
+            info = remedy_client_mod.ping(candidate)
+        except Exception:
+            return False
+        self._client = candidate
+        self._conn_info = info
+        return True
+
+    def managed_env_keys(self) -> List[str]:
+        return [
+            "REMEDY_HOST", "REMEDY_USERNAME", "REMEDY_PASSWORD",
+            "REMEDY_PORT", "REMEDY_VERIFY_CERTS",
+        ]
+
+    def env_for_form(self, form: dict) -> Dict[str, str]:
+        host = (form.get("host") or form.get("url") or "").strip()
+        cleaned_host = remedy_client_mod.clean_host(host)
+        # Preserve an explicit http:// scheme (on-prem often runs plain HTTP on a
+        # custom port); https is the default and needs no prefix.
+        if remedy_client_mod.scheme_of(host) == "http" and cleaned_host:
+            cleaned_host = "http://" + cleaned_host
+        return {
+            "REMEDY_HOST": cleaned_host,
+            "REMEDY_USERNAME": str(form.get("username") or ""),
+            "REMEDY_PASSWORD": str(form.get("password") or ""),
+            "REMEDY_PORT": str(form.get("port") or 443),
+            "REMEDY_VERIFY_CERTS": "true" if form.get("verify_certs", True) else "false",
+        }
+
+    def ping(self) -> dict:
+        if self._client is None:
+            raise remedy_client_mod.RemedyConfigError("adapter is not connected")
+        info = remedy_client_mod.ping(self._client)
+        self._conn_info = info
+        return info
+
+    def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
+        if self._client is None:
+            raise remedy_client_mod.RemedyConfigError("adapter is not connected")
+        # A per-connection watermark store powers the ticket resources'
+        # incremental ("since last check") mode; it is ignored by the others.
+        store = db_mod.watermark_store(self.info.id)
+        return remedy_runner_mod.run_query(
+            self._client, query, limit=limit, time_range=time_range,
+            watermark_store=store,
+        )
+
+
 @dataclass
 class AdapterKind:
     """A *type* of data source (Elasticsearch, Tufin, …) — the template from
@@ -1031,6 +1123,24 @@ def available_kinds(registry_path: Optional[str] = None) -> Dict[str, AdapterKin
             ),
             registry=load_registry(active_directory_path),
             adapter_cls=ActiveDirectoryAdapter,
+        )
+
+    remedy_path = _find_registry("config/remedy_registry.yaml", "remedy_registry.yaml")
+    if remedy_path:
+        kinds["remedy"] = AdapterKind(
+            kind="remedy",
+            name="BMC Remedy (AR System / CMDB)",
+            category="IT Asset Management / CMDB",
+            description=(
+                "BMC Remedy (AR System / Atrium CMDB) — CMDB computer systems "
+                "classified server / workstation, installed software, business "
+                "services, and people, plus the ITSM operational context "
+                "(incidents and change requests) via the AR System REST API. "
+                "Rows carry every default field and every site-defined custom "
+                "field (extra fields prefixed 'custom.')."
+            ),
+            registry=load_registry(remedy_path),
+            adapter_cls=RemedyAdapter,
         )
     return kinds
 
