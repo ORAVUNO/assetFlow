@@ -556,6 +556,21 @@ def create_app(
         _get_adapter(adapter_id)
         return db.snapshot_change_log(adapter_id)
 
+    # --- BMC Remedy ticket sink (durable per-ticket state) + change log ------ #
+    @app.get("/api/adapters/{adapter_id}/remedy-tickets")
+    def api_remedy_tickets(
+        adapter_id: str, resource: Optional[str] = QueryParam(default=None)
+    ) -> dict:
+        _get_adapter(adapter_id)
+        return db.ticket_states(adapter_id, resource)
+
+    @app.get("/api/adapters/{adapter_id}/remedy-ticket-changes")
+    def api_remedy_ticket_changes(
+        adapter_id: str, resource: Optional[str] = QueryParam(default=None)
+    ) -> dict:
+        _get_adapter(adapter_id)
+        return db.ticket_change_log(adapter_id, resource)
+
     @app.get("/api/adapters/{adapter_id}/change-detail/{query_id}")
     def api_change_detail(adapter_id: str, query_id: str) -> dict:
         _get_adapter(adapter_id)
@@ -2183,6 +2198,40 @@ async function openDrift(){
   else t.innerHTML='<p class="hint">No drift recorded yet. Fetch an inventory query (e.g. AI011) at least twice — added/removed items land here.</p>';
 }
 
+async function openRemedyTickets(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovTickets'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading tickets…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/remedy-tickets'); }
+  catch(e){ m.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  let h='<h2>Tickets — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">The durable per-ticket record: one row per ticket ever fetched, upserted in place on '+
+    'every fetch (so re-fetching never duplicates it), with its current status and first/last-seen times.</div>'+
+    '<div class="meta">'+d.rows.length+' ticket(s)</div><div id="tktable"></div>';
+  m.innerHTML=h;
+  const t=document.getElementById('tktable');
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {pin:srcPin()});
+  else t.innerHTML='<p class="hint">No tickets yet. Fetch the Incidents or Changes feed — each ticket is upserted here.</p>';
+}
+
+async function openRemedyTicketChanges(){
+  CURRENT=null;
+  document.querySelectorAll('.q').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('ovTicketChanges'); if(el) el.classList.add('active');
+  const m=document.getElementById('main'); m.innerHTML='<p class="hint">Loading ticket change log…</p>';
+  let d; try{ d=await j('/api/adapters/'+ADAPTER+'/remedy-ticket-changes'); }
+  catch(e){ m.innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  let h='<h2>Ticket Change Log — '+esc(DETAIL.name)+'</h2>'+
+    '<div class="sub">Field changes detected on previously fetched tickets — one row per (ticket · field) '+
+    'transition (old → new), deduplicated so re-fetching an unchanged ticket records nothing.</div>'+
+    '<div class="meta">'+d.rows.length+' change(s)</div><div id="tctable"></div>';
+  m.innerHTML=h;
+  const t=document.getElementById('tctable');
+  if(d.rows.length) mountTable(t, d.columns.map(c=>c.name), d.rows, {pin:srcPin()});
+  else t.innerHTML='<p class="hint">No ticket changes recorded yet. Fetch Incidents/Changes at least twice — a status change (e.g. Assigned → Resolved) lands here.</p>';
+}
+
 async function openChangeDetail(qid){
   const out=document.getElementById('diffout'); if(!out) return;
   out.innerHTML='<p class="hint">Diffing the last two fetches…</p>';
@@ -2239,6 +2288,16 @@ function renderSidebar(){
   const dl=document.createElement('div'); dl.className='q ov'; dl.id='ovDrift';
   dl.innerHTML='<span class="qid">⇄ Drift Log</span>';
   dl.onclick=openDrift; side.appendChild(dl);
+  // BMC Remedy tickets: a durable per-ticket sink plus a deduplicated log of
+  // status/field changes on previously fetched tickets.
+  if(DETAIL.kind==='remedy'){
+    const tk=document.createElement('div'); tk.className='q ov'; tk.id='ovTickets';
+    tk.innerHTML='<span class="qid">🎫 Tickets</span>';
+    tk.onclick=openRemedyTickets; side.appendChild(tk);
+    const tc=document.createElement('div'); tc.className='q ov'; tc.id='ovTicketChanges';
+    tc.innerHTML='<span class="qid">⟳ Ticket Change Log</span>';
+    tc.onclick=openRemedyTicketChanges; side.appendChild(tc);
+  }
   // Raw per-resource feeds. For Tufin these are a power-user drill-down behind
   // an Advanced toggle (Discover is the primary view); other adapters show them
   // directly.
@@ -2280,7 +2339,7 @@ function select(id){
         ? '<button id="runbtn">Run</button>'+
           '<label class="hint">limit <input type="number" id="limit" min="1" value="100"></label>'+
           '<label class="hint">range <select id="range">'+
-            (q.resource==='change_detail'?'<option value="incremental">Since last check</option>':'')+
+            ((q.resource==='change_detail'||q.resource==='incidents'||q.resource==='changes')?'<option value="incremental">Since last check</option>':'')+
             '<option value="all">All time</option><option value="24h">Last 24h</option>'+
             '<option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>'+
             '<option value="90d">Last 90 days</option></select></label>'

@@ -9,10 +9,13 @@ from pathlib import Path
 import pytest
 
 from assetflow import adapters as adapters_mod
+from assetflow import db as db_mod
 from assetflow import remedy_client as remedy_client_mod
 from assetflow import remedy_runner as remedy_runner_mod
+from assetflow import service as service_mod
 from assetflow.models import Query, Status
 from assetflow.registry import load_registry
+from assetflow.runner import QueryResult
 
 REMEDY_REGISTRY = Path(__file__).resolve().parent.parent / "config" / "remedy_registry.yaml"
 
@@ -384,3 +387,202 @@ def test_remedy_adapter_connect_form(monkeypatch):
     )
     assert info["product"] == "BMC Remedy AR System"
     assert adapter.connected is True
+
+
+# --------------------------------------------------------------------------- #
+# Ticket sink (A) + change log (B) — deduplication and transitions
+# --------------------------------------------------------------------------- #
+
+def _incident_result(rows_by_field):
+    """Build a QueryResult shaped like the incidents collector output."""
+    cols = ["incident.id", "asset.type", "summary", "status", "priority",
+            "impact", "urgency", "service", "ci.name", "assignee",
+            "submit_date", "modified"]
+    rows = []
+    for r in rows_by_field:
+        rows.append([r.get(c, "") for c in cols])
+    return QueryResult(columns=[{"name": c} for c in cols], rows=rows)
+
+
+def _spec(resource):
+    return remedy_runner_mod.TICKET_SPECS[resource]
+
+
+def test_ticket_sink_upserts_one_row_per_ticket(tmp_path):
+    db_mod.init_engine(f"sqlite:///{tmp_path}/t.db")
+    spec = _spec("incidents")
+    res = _incident_result([
+        {"incident.id": "INC001", "status": "Assigned", "summary": "disk"},
+        {"incident.id": "INC002", "status": "New", "summary": "cpu"},
+    ])
+    stats = db_mod.record_ticket_states(
+        "remedy", "incidents", res, run_id=1,
+        id_col=spec["id_col"], tracked=spec["tracked"],
+    )
+    assert stats == {"new": 2, "updated": 0, "transitions": 0}
+
+    # Re-fetch the SAME data in a new run -> no new rows, no transitions.
+    stats2 = db_mod.record_ticket_states(
+        "remedy", "incidents", res, run_id=2,
+        id_col=spec["id_col"], tracked=spec["tracked"],
+    )
+    assert stats2["new"] == 0
+    assert stats2["transitions"] == 0
+    assert stats2["updated"] == 2
+
+    sink = db_mod.ticket_states("remedy")
+    cols = [c["name"] for c in sink["columns"]]
+    ids = [r[cols.index("ticket_id")] for r in sink["rows"]]
+    # Still exactly two tickets despite two fetches.
+    assert sorted(ids) == ["INC001", "INC002"]
+
+
+def test_ticket_change_log_records_status_transition_once(tmp_path):
+    db_mod.init_engine(f"sqlite:///{tmp_path}/t.db")
+    spec = _spec("incidents")
+    first = _incident_result([
+        {"incident.id": "INC001", "status": "Assigned", "priority": "High"},
+    ])
+    db_mod.record_ticket_states("remedy", "incidents", first, run_id=1,
+                                id_col=spec["id_col"], tracked=spec["tracked"])
+
+    # Status changes Assigned -> Resolved on the next fetch.
+    second = _incident_result([
+        {"incident.id": "INC001", "status": "Resolved", "priority": "High"},
+    ])
+    stats = db_mod.record_ticket_states("remedy", "incidents", second, run_id=2,
+                                        id_col=spec["id_col"], tracked=spec["tracked"])
+    assert stats["transitions"] == 1
+
+    log = db_mod.ticket_change_log("remedy")
+    cols = [c["name"] for c in log["columns"]]
+    assert len(log["rows"]) == 1
+    row = log["rows"][0]
+    assert row[cols.index("ticket_id")] == "INC001"
+    assert row[cols.index("field")] == "status"
+    assert row[cols.index("old_value")] == "Assigned"
+    assert row[cols.index("new_value")] == "Resolved"
+
+    # Re-processing the SAME run is idempotent (no duplicate transition).
+    again = db_mod.record_ticket_states("remedy", "incidents", second, run_id=2,
+                                        id_col=spec["id_col"], tracked=spec["tracked"])
+    assert again["transitions"] == 0
+    assert len(db_mod.ticket_change_log("remedy")["rows"]) == 1
+
+
+def test_ticket_change_log_tracks_multiple_fields(tmp_path):
+    db_mod.init_engine(f"sqlite:///{tmp_path}/t.db")
+    spec = _spec("incidents")
+    db_mod.record_ticket_states(
+        "remedy", "incidents",
+        _incident_result([{"incident.id": "INC1", "status": "Assigned",
+                           "priority": "Low", "assignee": "alice"}]),
+        run_id=1, id_col=spec["id_col"], tracked=spec["tracked"],
+    )
+    stats = db_mod.record_ticket_states(
+        "remedy", "incidents",
+        _incident_result([{"incident.id": "INC1", "status": "In Progress",
+                           "priority": "High", "assignee": "alice"}]),
+        run_id=2, id_col=spec["id_col"], tracked=spec["tracked"],
+    )
+    # status and priority changed; assignee did not.
+    assert stats["transitions"] == 2
+    fields = {r[[c["name"] for c in db_mod.ticket_change_log("remedy")["columns"]].index("field")]
+              for r in db_mod.ticket_change_log("remedy")["rows"]}
+    assert fields == {"status", "priority"}
+
+
+def test_save_result_feeds_ticket_sink(tmp_path, monkeypatch):
+    db_mod.init_engine(f"sqlite:///{tmp_path}/t.db")
+    manager = adapters_mod.default_manager()
+    adapter = manager.get("remedy")
+    q = adapter.registry.get_query("RMD005")  # incidents
+    res = _incident_result([{"incident.id": "INC9", "status": "New"}])
+    rec = service_mod.save_result(adapter, q, res, limit=None, time_range=None)
+    assert rec["ticket_changes"]["new"] == 1
+    assert db_mod.ticket_states("remedy")["rows"][0][0] == "INC9"
+
+
+# --------------------------------------------------------------------------- #
+# Incremental "since last check" (C)
+# --------------------------------------------------------------------------- #
+
+class RecordingClient:
+    """Captures the qualification/sort passed to get_entries per form."""
+
+    def __init__(self, entries_by_form):
+        self.entries_by_form = entries_by_form
+        self.host = "remedy.test"
+        self.calls = []
+
+    def get_entries(self, form, *, qualification=None, sort=None, limit=None):
+        self.calls.append({"form": form, "qualification": qualification,
+                           "sort": sort, "limit": limit})
+        return self.entries_by_form.get(form, [])
+
+
+class DictWatermarkStore:
+    def __init__(self):
+        self.data = {}
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+def test_incremental_first_run_has_no_qualification_and_sets_watermark():
+    client = RecordingClient({"HPD:Help Desk": _entries(
+        {"Incident Number": "INC1", "Last Modified Date": "2026-01-01T09:00:00"},
+        {"Incident Number": "INC2", "Last Modified Date": "2026-01-02T09:00:00"},
+    )})
+    store = DictWatermarkStore()
+    remedy_runner_mod.run_query(
+        client, _q("incidents"), time_range="incremental", watermark_store=store
+    )
+    # First run: no watermark yet -> no qualification, sorted by modified.
+    assert client.calls[0]["qualification"] is None
+    assert client.calls[0]["sort"] == remedy_runner_mod.MODIFIED_FIELD
+    # Watermark advanced to the newest modification seen.
+    assert store.get("incidents") == "2026-01-02T09:00:00"
+
+
+def test_incremental_second_run_filters_by_watermark():
+    client = RecordingClient({"HPD:Help Desk": _entries(
+        {"Incident Number": "INC3", "Last Modified Date": "2026-01-05T09:00:00"},
+    )})
+    store = DictWatermarkStore()
+    store.set("incidents", "2026-01-02T09:00:00")
+    remedy_runner_mod.run_query(
+        client, _q("incidents"), time_range="incremental", watermark_store=store
+    )
+    qual = client.calls[0]["qualification"]
+    assert qual == '\'Last Modified Date\' > "2026-01-02T09:00:00"'
+    assert store.get("incidents") == "2026-01-05T09:00:00"
+
+
+def test_non_incremental_range_does_not_filter_or_touch_watermark():
+    client = RecordingClient({"HPD:Help Desk": _entries(
+        {"Incident Number": "INC4", "Last Modified Date": "2026-01-06T09:00:00"},
+    )})
+    store = DictWatermarkStore()
+    remedy_runner_mod.run_query(
+        client, _q("incidents"), time_range="all", watermark_store=store
+    )
+    assert client.calls[0]["qualification"] is None
+    # Full read leaves the watermark untouched.
+    assert store.get("incidents") is None
+
+
+def test_incremental_only_applies_to_ticket_resources():
+    # A non-ticket resource ignores the incremental token entirely.
+    client = RecordingClient({"BMC.CORE:BMC_ComputerSystem": _entries(
+        {"Name": "srv1"},
+    )})
+    store = DictWatermarkStore()
+    remedy_runner_mod.run_query(
+        client, _q("computer_systems"), time_range="incremental", watermark_store=store
+    )
+    assert client.calls[0]["qualification"] is None
+    assert store.data == {}

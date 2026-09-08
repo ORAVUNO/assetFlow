@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from sqlalchemy import (
     Boolean,
@@ -293,6 +293,98 @@ class SnapshotChange(Base):
 
 
 _DRIFT_COLUMNS = ["host.name", "query", "attribute", "change_type", "value", "detected_at"]
+
+
+class RemedyTicket(Base):
+    """Durable per-ticket record — the BMC Remedy ticket *system of record*.
+
+    Unlike the per-fetch snapshots in ``fetch_runs`` (which keep every fetch as
+    history), this table holds **one row per ticket**, keyed by
+    ``(adapter, resource, ticket_id)`` and upserted in place on every fetch. It
+    is how an operator sees the current state of every ticket ever fetched, with
+    ``first_seen`` / ``last_seen`` bookends, regardless of how many times the
+    ticket has been re-fetched. Status/field transitions are logged separately in
+    ``remedy_ticket_changes`` (see :class:`RemedyTicketChange`)."""
+
+    __tablename__ = "remedy_tickets"
+    __table_args__ = (
+        UniqueConstraint("adapter", "resource", "ticket_id", name="uq_remedy_ticket"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(96), index=True)
+    resource: Mapped[str] = mapped_column(String(64), index=True)
+    ticket_id: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(64), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    modified: Mapped[str] = mapped_column(String(64), default="")
+    state_json: Mapped[str] = mapped_column(Text, default="{}")
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def to_record(self) -> dict:
+        return {
+            "ticket_id": self.ticket_id,
+            "resource": self.resource,
+            "status": self.status,
+            "summary": self.summary,
+            "modified": self.modified,
+            "first_seen": _iso(self.first_seen),
+            "last_seen": _iso(self.last_seen),
+            "updated_at": _iso(self.updated_at),
+        }
+
+
+class RemedyTicketChange(Base):
+    """Deduplicated log of field transitions on BMC Remedy tickets.
+
+    Each row is one tracked field changing on one ticket between fetches — e.g.
+    ``INC001 status "Assigned" → "Resolved"``. Keyed so re-fetching the same
+    unchanged ticket never re-logs a transition, while a genuine flip-flop across
+    runs is preserved (``run_id`` is part of the key). This is the "what changed
+    on previously fetched tickets" feed the operator watches."""
+
+    __tablename__ = "remedy_ticket_changes"
+    __table_args__ = (
+        UniqueConstraint(
+            "adapter", "resource", "ticket_id", "field", "old_value", "new_value",
+            "run_id", name="uq_remedy_ticket_change",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(96), index=True)
+    resource: Mapped[str] = mapped_column(String(64), index=True)
+    ticket_id: Mapped[str] = mapped_column(String(128), index=True)
+    field: Mapped[str] = mapped_column(String(64), default="")
+    old_value: Mapped[str] = mapped_column(Text, default="")
+    new_value: Mapped[str] = mapped_column(Text, default="")
+    run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    def to_record(self) -> dict:
+        return {
+            "ticket_id": self.ticket_id,
+            "resource": self.resource,
+            "field": self.field,
+            "old_value": self.old_value,
+            "new_value": self.new_value,
+            "detected_at": _iso(self.detected_at),
+        }
+
+
+_TICKET_COLUMNS = [
+    "ticket_id", "resource", "status", "summary", "modified",
+    "first_seen", "last_seen", "updated_at",
+]
+_TICKET_CHANGE_COLUMNS = [
+    "ticket_id", "resource", "field", "old_value", "new_value", "detected_at",
+]
+
+
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if dt else None
 
 
 def _aware(dt: Optional[datetime]) -> Optional[datetime]:
@@ -582,6 +674,146 @@ def snapshot_change_log(adapter: str, limit: int = 1000) -> dict:
     return {
         "columns": [{"name": c} for c in _DRIFT_COLUMNS],
         "rows": [[rec[c] for c in _DRIFT_COLUMNS] for rec in rows],
+    }
+
+
+def record_ticket_states(
+    adapter: str,
+    resource: str,
+    result,
+    run_id: Optional[int] = None,
+    id_col: str = "",
+    tracked: Sequence[str] = (),
+) -> dict:
+    """Upsert a ticket fetch into the durable ticket sink and change log.
+
+    ``result`` is a ``QueryResult`` for a ticket resource (incidents / changes).
+    For each row keyed by ``id_col`` (e.g. ``incident.id``):
+
+    * **A — durable sink** (:class:`RemedyTicket`): the ticket is inserted the
+      first time it is seen and updated in place thereafter (status/summary/
+      modified/full-state + ``last_seen``), so there is exactly one row per
+      ticket no matter how many times it is fetched.
+    * **B — change log** (:class:`RemedyTicketChange`): every ``tracked`` field
+      whose stored value differs from the incoming value is logged as one
+      transition (old → new), deduplicated so re-fetching an unchanged ticket
+      records nothing.
+
+    Returns ``{"new": …, "updated": …, "transitions": …}``.
+    """
+    rows = result.to_dicts()
+    if not rows:
+        return {"new": 0, "updated": 0, "transitions": 0}
+    ids = {str(r.get(id_col, "")) for r in rows if str(r.get(id_col, ""))}
+    now = datetime.now(timezone.utc)
+    new = updated = transitions = 0
+    with _session() as s:
+        existing = {
+            t.ticket_id: t
+            for t in s.scalars(
+                select(RemedyTicket).where(
+                    RemedyTicket.adapter == adapter,
+                    RemedyTicket.resource == resource,
+                    RemedyTicket.ticket_id.in_(ids),
+                )
+            )
+        }
+        # Change keys already recorded for this run, so re-processing the same
+        # run (idempotency) never double-logs a transition.
+        seen_changes = {
+            (c.ticket_id, c.field, c.old_value, c.new_value)
+            for c in s.scalars(
+                select(RemedyTicketChange).where(
+                    RemedyTicketChange.adapter == adapter,
+                    RemedyTicketChange.resource == resource,
+                    RemedyTicketChange.run_id == run_id,
+                )
+            )
+        }
+        for r in rows:
+            tid = str(r.get(id_col, ""))
+            if not tid:
+                continue
+            state = {k: ("" if v is None else str(v)) for k, v in r.items()}
+            status = str(r.get("status", ""))
+            summary = str(r.get("summary", ""))
+            modified = str(r.get("modified", ""))
+            ticket = existing.get(tid)
+            if ticket is None:
+                ticket = RemedyTicket(
+                    adapter=adapter, resource=resource, ticket_id=tid,
+                    status=status, summary=summary, modified=modified,
+                    state_json=json.dumps(state, default=str),
+                    first_seen=now, last_seen=now, updated_at=now,
+                )
+                s.add(ticket)
+                existing[tid] = ticket  # guard against the same id twice in a batch
+                new += 1
+                continue
+            try:
+                old_state = json.loads(ticket.state_json or "{}")
+            except ValueError:
+                old_state = {}
+            changed = False
+            for field in tracked:
+                ov = str(old_state.get(field, ""))
+                nv = str(r.get(field, "") or "")
+                if ov == nv:
+                    continue
+                changed = True
+                key = (tid, field, ov, nv)
+                if key in seen_changes:
+                    continue
+                seen_changes.add(key)
+                s.add(
+                    RemedyTicketChange(
+                        adapter=adapter, resource=resource, ticket_id=tid,
+                        field=field, old_value=ov, new_value=nv,
+                        run_id=run_id, detected_at=now,
+                    )
+                )
+                transitions += 1
+            ticket.status = status
+            ticket.summary = summary
+            ticket.modified = modified
+            ticket.state_json = json.dumps(state, default=str)
+            ticket.last_seen = now
+            if changed:
+                ticket.updated_at = now
+            updated += 1
+        s.commit()
+    return {"new": new, "updated": updated, "transitions": transitions}
+
+
+def ticket_states(
+    adapter: str, resource: Optional[str] = None, limit: int = 5000
+) -> dict:
+    """Return the durable ticket sink for an adapter (most-recently-updated first)."""
+    with _session() as s:
+        stmt = select(RemedyTicket).where(RemedyTicket.adapter == adapter)
+        if resource:
+            stmt = stmt.where(RemedyTicket.resource == resource)
+        stmt = stmt.order_by(desc(RemedyTicket.updated_at)).limit(limit)
+        rows = [t.to_record() for t in s.scalars(stmt)]
+    return {
+        "columns": [{"name": c} for c in _TICKET_COLUMNS],
+        "rows": [[rec[c] for c in _TICKET_COLUMNS] for rec in rows],
+    }
+
+
+def ticket_change_log(
+    adapter: str, resource: Optional[str] = None, limit: int = 1000
+) -> dict:
+    """Return the deduplicated ticket change log for an adapter (newest first)."""
+    with _session() as s:
+        stmt = select(RemedyTicketChange).where(RemedyTicketChange.adapter == adapter)
+        if resource:
+            stmt = stmt.where(RemedyTicketChange.resource == resource)
+        stmt = stmt.order_by(desc(RemedyTicketChange.id)).limit(limit)
+        rows = [c.to_record() for c in s.scalars(stmt)]
+    return {
+        "columns": [{"name": c} for c in _TICKET_CHANGE_COLUMNS],
+        "rows": [[rec[c] for c in _TICKET_CHANGE_COLUMNS] for rec in rows],
     }
 
 

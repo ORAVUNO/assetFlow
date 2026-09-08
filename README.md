@@ -853,6 +853,25 @@ its own column prefixed **`custom.`** (e.g. `custom.Cost Center`), so
 system-provided fields and site-defined custom fields are never confused. The
 custom columns are discovered dynamically from the rows in scope.
 
+### Tickets: no duplicates, and change tracking
+
+The ticket resources (**incidents** and **changes**) are fetched repeatedly, so
+they get special handling on top of the normal per-fetch snapshot:
+
+- **Durable ticket sink (one row per ticket).** Each fetch **upserts** tickets
+  into a `remedy_tickets` table keyed by ticket id — re-fetching updates the row
+  in place rather than duplicating it, with `first_seen` / `last_seen` bookends.
+  See the **🎫 Tickets** view.
+- **Deduplicated change log.** When a tracked field changes on a
+  previously-fetched ticket (e.g. status `Assigned → Resolved`), it's logged once
+  as an `old → new` transition; re-fetching an unchanged ticket records nothing.
+  See the **⟳ Ticket Change Log** view.
+- **Incremental "Since last check" (opt-in).** Pick the **Since last check** range
+  on a ticket query to fetch only records modified since the last run (via an AR
+  `'Last Modified Date' > …` qualification and a per-connection watermark), so you
+  don't re-pull the whole ticket history each time. Full ranges still work and
+  leave the watermark untouched.
+
 ### Connecting
 
 In the web UI, open the **BMC Remedy (AR System / CMDB)** card and click

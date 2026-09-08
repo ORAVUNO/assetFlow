@@ -14,6 +14,7 @@ the site-defined custom fields fit together.
 - [The registry](#the-registry)
 - [The runner and collectors](#the-runner-and-collectors)
 - [Standard fields vs. custom fields](#standard-fields-vs-custom-fields)
+- [Tickets: dedup, change log, and incremental fetch](#tickets-dedup-change-log-and-incremental-fetch)
 - [How to add a new Remedy resource](#how-to-add-a-new-remedy-resource)
 
 ## Where Remedy fits
@@ -132,6 +133,66 @@ custom columns meaningful:
 Everything else surfaces as `custom.<label>` (e.g. `custom.Cost Center`), so a
 site's added fields ride along without ever being confused with system fields —
 the same convention the VMware and AssetExplorer adapters use.
+
+## Tickets: dedup, change log, and incremental fetch
+
+The ticket resources — **incidents** (`HPD:Help Desk`) and **changes**
+(`CHG:Infrastructure Change`) — are special: an operator needs to see how a
+*previously fetched* ticket changes (e.g. status `Assigned → Resolved`), and
+re-fetching must not create duplicates. Three cooperating pieces handle this.
+Which resources are tickets, their id column, and their change-tracked fields are
+declared in `remedy_runner.TICKET_SPECS`.
+
+Every fetch still writes a full `FetchRun` snapshot as before; the pieces below
+sit *on top* of that via `service.save_result`, which routes ticket resources to
+`db.record_ticket_states` (the analogue of the Tufin `change_detail` →
+`record_changes` path).
+
+### A. Durable ticket sink — one row per ticket
+
+`db.RemedyTicket` holds **one row per ticket**, keyed by
+`(adapter, resource, ticket_id)` and upserted in place on every fetch. It is the
+system of record: current status/summary/modified time, the full row as
+`state_json`, and `first_seen` / `last_seen` bookends. Re-fetching the same
+ticket updates the row rather than adding another — so there are never
+duplicates, regardless of how many fetches run. Read it via
+`db.ticket_states(adapter)` (UI: the **🎫 Tickets** view).
+
+### B. Deduplicated change log — what changed on known tickets
+
+`db.RemedyTicketChange` logs one row per **tracked field transition** on a ticket
+(`old → new`). On each upsert, `record_ticket_states` compares the incoming row's
+tracked fields against the stored `state_json` and appends only genuine changes.
+A `UniqueConstraint` keyed on `(adapter, resource, ticket_id, field, old, new,
+run_id)` makes re-processing a run idempotent, while a real flip-flop across
+different runs is preserved (`run_id` differs). Read it via
+`db.ticket_change_log(adapter)` (UI: the **⟳ Ticket Change Log** view).
+
+Together A + B answer "show me every ticket and its current state" and "show me
+what changed on tickets we'd already seen."
+
+### C. Incremental "since last check" fetch (opt-in)
+
+Full re-fetches work fine for A + B, but tickets are high-volume. The incremental
+mode reuses the existing time-range convention: selecting **Since last check**
+(token `incremental` / `since` / `new`) on a ticket query makes the runner pull
+only records modified after a stored watermark.
+
+- The watermark is per `(connection, resource)`, stored via the shared
+  `db.watermark_store(connection_id)` (same store the Tufin change monitor uses),
+  keyed by the resource name.
+- `run_query` builds an AR qualification `'Last Modified Date' > "<watermark>"`,
+  orders by `Last Modified Date`, fetches, then advances the watermark to the
+  newest `modified` value returned. The first run (no watermark) pulls
+  everything and just establishes the baseline.
+- It is opt-in and ticket-only: without the token, or on a non-ticket resource,
+  a full read is returned and the watermark is untouched.
+
+> **Date formats.** AR qualification date literals are environment-dependent
+> (localization / server settings). The watermark is stored as the raw
+> `Last Modified Date` string the REST API returns and echoed back into the
+> qualification; confirm the comparison behaves against your instance. If the
+> format needs massaging, that belongs in `run_query`'s qualification builder.
 
 ## How to add a new Remedy resource
 

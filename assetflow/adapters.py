@@ -877,8 +877,12 @@ class RemedyAdapter(Adapter):
     def run(self, query: Query, limit=None, time_range=None) -> QueryResult:
         if self._client is None:
             raise remedy_client_mod.RemedyConfigError("adapter is not connected")
+        # A per-connection watermark store powers the ticket resources'
+        # incremental ("since last check") mode; it is ignored by the others.
+        store = db_mod.watermark_store(self.info.id)
         return remedy_runner_mod.run_query(
-            self._client, query, limit=limit, time_range=time_range
+            self._client, query, limit=limit, time_range=time_range,
+            watermark_store=store,
         )
 
 

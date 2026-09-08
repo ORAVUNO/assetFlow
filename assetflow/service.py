@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from . import db
+from . import remedy_runner
 from . import snapshotdiff
 from .adapters import Adapter
 
@@ -24,8 +25,20 @@ def save_result(
     """Persist an already-computed result, feeding the change log for
     change_detail. Use this when the caller has already run the query."""
     rec = db.save_fetch(adapter.info.id, query, result, limit, time_range)
-    if getattr(query, "resource", "") == "change_detail":
+    resource = getattr(query, "resource", "")
+    if resource == "change_detail":
         rec["new_changes"] = db.record_changes(adapter.info.id, result)
+    elif adapter.info.kind == "remedy" and resource in remedy_runner.TICKET_RESOURCES:
+        # Ticket resources upsert into the durable ticket sink (one row per
+        # ticket) and log field transitions, so status changes on previously
+        # fetched tickets are captured even though each fetch is a snapshot.
+        spec = remedy_runner.TICKET_SPECS[resource]
+        rec["ticket_changes"] = db.record_ticket_states(
+            adapter.info.id, resource, result,
+            run_id=rec.get("run_id"),
+            id_col=spec["id_col"],
+            tracked=spec["tracked"],
+        )
     else:
         drift = _record_drift(adapter, query, result)
         if drift is not None:

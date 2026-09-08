@@ -294,15 +294,20 @@ def _collect_people(client, form: str) -> Tuple[List[str], List[List[Any]]]:
     return _build(entries, columns, row)
 
 
-def _collect_incidents(client, form: str) -> Tuple[List[str], List[List[Any]]]:
+def _collect_incidents(
+    client, form: str, *, qualification=None, sort=None, limit=None
+) -> Tuple[List[str], List[List[Any]]]:
     columns = [
         "incident.id", "asset.type", "summary", "status", "priority", "impact",
-        "urgency", "service", "ci.name", "assignee", "submit_date",
+        "urgency", "service", "ci.name", "assignee", "submit_date", "modified",
     ]
-    entries = client.get_entries(form)
+    entries = client.get_entries(
+        form, qualification=qualification, sort=sort, limit=limit
+    )
     consumed = {
         "Incident Number", "Description", "Status", "Priority", "Impact",
         "Urgency", "Service Type", "HPD_CI", "Assignee", "Submit Date",
+        "Last Modified Date",
     }
 
     def row(values: dict) -> Tuple[List[Any], Set[str]]:
@@ -318,21 +323,27 @@ def _collect_incidents(client, form: str) -> Tuple[List[str], List[List[Any]]]:
             g(values, "HPD_CI"),
             g(values, "Assignee"),
             g(values, "Submit Date"),
+            g(values, "Last Modified Date"),
         ], consumed
 
     return _build(entries, columns, row)
 
 
-def _collect_changes(client, form: str) -> Tuple[List[str], List[List[Any]]]:
+def _collect_changes(
+    client, form: str, *, qualification=None, sort=None, limit=None
+) -> Tuple[List[str], List[List[Any]]]:
     columns = [
         "change.id", "asset.type", "summary", "status", "risk_level", "priority",
-        "coordinator_group", "scheduled_start", "scheduled_end",
+        "coordinator_group", "scheduled_start", "scheduled_end", "modified",
     ]
-    entries = client.get_entries(form)
+    entries = client.get_entries(
+        form, qualification=qualification, sort=sort, limit=limit
+    )
     consumed = {
         "Infrastructure Change ID", "Change Request ID", "Description",
         "Change Request Status", "Risk Level", "Priority",
         "Change Coordinator Group", "Scheduled Start Date", "Scheduled End Date",
+        "Last Modified Date",
     }
 
     def row(values: dict) -> Tuple[List[Any], Set[str]]:
@@ -346,6 +357,7 @@ def _collect_changes(client, form: str) -> Tuple[List[str], List[List[Any]]]:
             g(values, "Change Coordinator Group"),
             g(values, "Scheduled Start Date"),
             g(values, "Scheduled End Date"),
+            g(values, "Last Modified Date"),
         ], consumed
 
     return _build(entries, columns, row)
@@ -383,16 +395,69 @@ def form_for_resource(resource: str) -> str:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Ticket subsystem: which resources are change-tracked tickets, and how.
+# --------------------------------------------------------------------------- #
+
+# Resources whose fetches are upserted into the durable ticket sink + change log
+# (see db.record_ticket_states) and which support the incremental fetch mode.
+TICKET_RESOURCES = {"incidents", "changes"}
+
+# Time-range tokens (from the UI's range selector) that select the incremental
+# "since last check" mode — the same convention the Tufin adapter uses.
+INCREMENTAL_TOKENS = {"incremental", "since", "new"}
+
+# The AR field carrying a record's last-modification time. Used both to order an
+# incremental fetch and to advance the per-resource watermark.
+MODIFIED_FIELD = "Last Modified Date"
+
+# Per ticket resource: the id column (dedup key) and the normalized columns whose
+# changes are logged as transitions. Column names match the runner's output, so
+# db.record_ticket_states can read them straight from the QueryResult rows.
+TICKET_SPECS: Dict[str, Dict[str, Any]] = {
+    "incidents": {
+        "id_col": "incident.id",
+        "tracked": ["status", "priority", "impact", "urgency", "assignee",
+                    "service", "ci.name"],
+    },
+    "changes": {
+        "id_col": "change.id",
+        "tracked": ["status", "risk_level", "priority", "coordinator_group",
+                    "scheduled_start", "scheduled_end"],
+    },
+}
+
+
+def _max_modified(columns: List[str], rows: List[List[Any]]) -> str:
+    """The largest ``modified`` cell across rows (used to advance the watermark)."""
+    if "modified" not in columns:
+        return ""
+    idx = columns.index("modified")
+    best = ""
+    for row in rows:
+        if idx < len(row):
+            val = "" if row[idx] is None else str(row[idx])
+            if val > best:
+                best = val
+    return best
+
+
 def run_query(
     client,
     query: Query,
     limit: Optional[int] = None,
     time_range: Optional[str] = None,
+    watermark_store=None,
 ) -> QueryResult:
     """Fetch a Remedy registry query's resource and normalize the response.
 
-    ``time_range`` is accepted for interface parity with the other adapters but
-    Remedy inventory is a point-in-time read, so it does not filter rows.
+    Most resources are point-in-time reads, so ``time_range`` does not filter
+    them. For ticket resources (incidents / changes) an incremental token
+    (``since`` / ``new`` / ``incremental``) together with a ``watermark_store``
+    selects the **since-last-check** mode: only records modified after the stored
+    watermark are fetched (ordered by ``Last Modified Date``), and the watermark
+    is then advanced to the newest modification seen — so re-fetching pulls only
+    what changed. Without the token (or the store) a full read is returned.
     """
     resource = (query.resource or "").strip()
     if not resource:
@@ -406,5 +471,24 @@ def run_query(
             f"known resources: {', '.join(sorted(_COLLECTORS))}"
         )
     form = form_for_resource(resource)
+
+    incremental = (
+        resource in TICKET_RESOURCES
+        and (time_range or "").lower() in INCREMENTAL_TOKENS
+        and watermark_store is not None
+    )
+    if incremental:
+        watermark = watermark_store.get(resource)
+        qualification = (
+            f'\'{MODIFIED_FIELD}\' > "{watermark}"' if watermark else None
+        )
+        columns, rows = collector(
+            client, form, qualification=qualification, sort=MODIFIED_FIELD, limit=limit
+        )
+        newest = _max_modified(columns, rows)
+        if newest and newest != watermark:
+            watermark_store.set(resource, newest)
+        return _result(columns, rows, limit)
+
     columns, rows = collector(client, form)
     return _result(columns, rows, limit)
